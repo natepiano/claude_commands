@@ -361,7 +361,7 @@ The default remains three measured rounds.
 The reserved box lifetime includes both warm-up runs and all measured rounds.
 The guest divides the available time across warm-up runs and measured rounds.
 Odd rounds run base first; even rounds run changed first.
-The installed guest supplies the environment and memory sampler.
+The changed candidate supplies the supervisor, environment, and memory sampler.
 Each tested tree supplies `module_run.py` and the test module.
 Periodic log transfers stop before measurement.
 The guest transfers each sample between measurements.
@@ -447,6 +447,19 @@ Reconciliation and the expiry sweep retain their existing end times.
 Results include `kernel_boot_at` from `/proc/stat` and `user_data_started_at` from the first user data command.
 Each timestamp is a UTC epoch time from the box.
 Results include `instance_running_at` when a cached instance identity document supplies `pendingTime`.
+The live `gate_box.GUEST` program contains the bootstrap code.
+The bootstrap downloads or clones the candidate and verifies its requested tree.
+It prepares the environment and calls the candidate's `scripts.aws_target.gate_box.run_guest` entry point.
+The entry point accepts the box directory, links, and mutable result dictionary.
+The candidate supplies its own suite, timing, and record code.
+The guest installs no signal handler.
+The module time limit and process groups stop the gate.
+The bootstrap names no `merge_gate` attribute and copies no host function source.
+A paired trial uses the changed candidate's entry point to supervise both verified trees.
+A candidate without the entry point publishes `candidate predates guest entry point` through the existing boot error link.
+The controller then uses the normal natedev fallback.
+The result fields and transfer links keep their existing format.
+
 The guest reads the NixOS metadata cache or the cloud-init metadata cache without network requests.
 It omits `instance_running_at` when the cache is absent or invalid.
 The current source checkout occurs after `nix_ready_at`, so results omit `source_ready_at`.
@@ -509,6 +522,21 @@ The existing `prices` array keeps its ranking format: `region`, `zone`, `instanc
 The new `regions` array stores `region`, `read_at`, `standard_vcpus`, and `gpu_vcpus`.
 A regional failure preserves that region's previous prices, quotas, and read time.
 Other regions still refresh, and the command returns a failure status.
+Each failure logs the region, the failed read, the error class, and a redacted reason on one line.
+The read name is `price`, `Standard quota`, or `G and VT quota`.
+The shared `admin_secrets.redact` helper removes AWS account ids, ARNs, access key ids, and instance, subnet, AMI, volume, and snapshot ids.
+The helper first removes credential field values and all following text, including wrapped values.
+It preserves credential fields that already contain `[redacted]`, so repeated redaction keeps appended deployment reports.
+It then removes known credentials and AWS identifiers, including wrapped account ids, access key ids, and ARNs.
+The snapshot first removes request dumps, response dumps, headers, structured dump lines, and all lines after each dump marker.
+It redacts the remaining raw text and selects the first AWS or CLI error line that matches `SNAPSHOT_ERROR_PATTERNS`.
+Every pattern matches only at the start of a line.
+The patterns accept both CLI error formats, `aws: error:` and `aws: [ERROR]:`, with any letter case for `error`.
+They also accept standalone `Invalid choice` and `Parameter validation failed` lines.
+If no line matches, it selects the first non-empty line.
+It discards all other lines, including usage text and request dumps.
+It normalizes that line's whitespace and redacts it again.
+`snapshot_error_reason_max_chars=240` limits the reason after both redaction passes.
 A successful regional read removes previous prices for types or zones absent from the new reply.
 The snapshot does not change `controller.json`.
 
@@ -524,6 +552,12 @@ The box counts divide the quota by the existing type-size vCPU calculation and r
 An absent snapshot shows unknown quotas and box counts without creating files.
 
 A new gate ranks only variants from its deployment.
+`deploy.py up` saves the deployed `instance_types` in `gate-deployment.json`.
+A gate skips a configured type that this list does not name, and prints `Run deploy.py up`.
+When the list names no configured type, the gate falls back to natedev before any launch.
+A manifest without the list keeps every configured type.
+An `UnauthorizedOperation` refusal skips that type for the rest of the launch while another type remains.
+`launch.json` saves the skipped types in `unauthorized_types`.
 Before its first ranking, it reads live Spot prices in parallel from each deployed region.
 Each region receives one Linux/UNIX request for all configured `instance_types`.
 `spot_price_live_read_timeout_s=3` bounds the whole parallel read in seconds.
@@ -597,10 +631,17 @@ The external administrator IAM policy also needs `servicequotas:ListRequestedSer
 Both quota codes use these same three IAM actions.
 `python3 scripts/aws_target/deploy.py quota-status` reads both quotas and their request history through the same administrator executor.
 It shares the quota codes and region lists with `quota-request`.
-It groups the reads by region and prints progress and a final completion time.
-Each request row shows the region, quota name, asked value, current applied value, status, case ID, and date.
+Each region starts one terminal block with its name as the heading.
+Each quota shows its applied vCPUs once, above an aligned request table.
+The table shows asked vCPUs, status, case ID, and update time, with the newest requests first.
 Dates use the user's zone and the last update time, with the creation time as a fallback.
-A quota with no requests prints one row with status `none`.
+A quota with no requests prints `No requests.`
+The final summary lists regions whose applied GPU quota fits the trial and requests that remain open.
+The summary uses the trial's shared vCPU calculation over `gpu_size_trial_spot_max_usd_per_hour`.
+It does not use the requested quota as proof of an applied quota.
+When every applied quota is too small, the summary says `no region has enough applied quota`.
+An unread applied GPU quota adds `unknown for <regions>` after the regions that fit.
+An unread request history makes the summary say `open requests: unknown` and name the unavailable region and quota.
 The report omits account IDs, ARNs, and request IDs.
 Regional failures print the AWS error code or Python error class and allow the remaining regions to continue.
 Any regional failure makes the command exit with status 1.

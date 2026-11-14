@@ -4,7 +4,7 @@ import json
 import os
 import shutil
 import tempfile
-from collections.abc import Callable, Generator, Mapping
+from collections.abc import Callable, Generator, Iterable, Mapping
 from contextlib import contextmanager
 from pathlib import Path
 from typing import cast
@@ -13,6 +13,7 @@ from unittest.mock import patch
 from scripts.accounts import accounts
 from scripts.production.showrunner_registry_test_support import scratch_showrunner_registry
 from scripts.whoami import note_file
+from scripts.whoami.credit_accounts_test_support import TEST_CREDIT_ACCOUNTS, set_credits
 
 
 def clear_notes_directory_cache() -> None:
@@ -31,12 +32,31 @@ def write_account_settings(
     )
 
 
+def write_credit_accounts(config: Path, labels: Iterable[str]) -> None:
+    """Name the Codex accounts that may spend paid credits in a scratch configuration."""
+    lines = [line for line in config.read_text(encoding="utf-8").splitlines()
+             if not line.startswith("codex_credit_accounts=")]
+    _ = config.write_text("\n".join([*lines, f"codex_credit_accounts={' '.join(sorted(labels)) or 'none'}"]) + "\n",
+                          encoding="utf-8")
+
+
+def set_config_credits(label: str, setting: str) -> None:
+    """Apply a test's "on" or "off" for one account in the scratch configuration."""
+    config = Path(os.environ["CONF_DIR"]) / "accounts.conf"
+    held = {line.removeprefix("codex_credit_accounts=") for line in config.read_text(encoding="utf-8").splitlines()
+            if line.startswith("codex_credit_accounts=")}
+    labels = set(" ".join(held).split())
+    set_credits(labels, label, setting)
+    write_credit_accounts(config, labels)
+
+
 @contextmanager
 def scratch_accounts_config() -> Generator[Path]:
     """Use a scratch copy of the account configuration."""
     with tempfile.TemporaryDirectory(prefix="accounts-config-") as temporary:
         config = Path(temporary)
         _ = shutil.copyfile(Path(__file__).resolve().parents[2] / "config/accounts.conf", config / "accounts.conf")
+        write_credit_accounts(config / "accounts.conf", TEST_CREDIT_ACCOUNTS)
         clear_notes_directory_cache()
         try:
             with patch.dict(os.environ, {"CONF_DIR": str(config)}):

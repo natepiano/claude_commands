@@ -41,7 +41,7 @@ from contextvars import ContextVar
 from threading import RLock
 from functools import cache, cached_property
 from importlib import import_module
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import Enum, StrEnum
 from datetime import datetime, timezone
 from pathlib import Path
@@ -329,6 +329,14 @@ class OpeningPrompt:
     before_prompt: Callable[[SessionTranscript], object] = _no_staff_publication
     cursor: TranscriptCursor | UnspecifiedPromptTranscript = UnspecifiedPromptTranscript()
 
+    def prepare_for_launch(self, since: datetime) -> OpeningPrompt:
+        """Keep a supplied cursor or position a new cursor before the agent starts."""
+        if isinstance(self.cursor, TranscriptCursor) or not isinstance(self.transcript, SessionTranscript):
+            return self
+        cursor = TranscriptCursor(self.transcript, since)
+        cursor.skip_existing_turns()
+        return replace(self, cursor=cursor)
+
 
 @dataclass(frozen=True)
 class NoOpeningPrompt:
@@ -370,6 +378,17 @@ class TranscriptCursor:
     current_paths: tuple[Path, ...] = field(default=(), init=False)
     turns: dict[Path, list[tuple[datetime, dict[str, object]]]] = field(default_factory=dict)
     readability: TranscriptReadable | TranscriptUnreadable = field(default_factory=TranscriptReadable)
+
+    def bind_transcript(self, transcript: SessionTranscript) -> None:
+        """Read a changed native transcript from zero and retain the launch time filter."""
+        if transcript == self.transcript:
+            return
+        self.transcript = transcript
+        self.offsets.clear()
+        self.sizes.clear()
+        self.turns.clear()
+        self.current_paths = ()
+        self.readability = TranscriptReadable()
 
     def skip_existing_turns(self) -> None:
         """Skip complete rows before launch without parsing historical JSON."""
@@ -783,6 +802,14 @@ class PaneRunning:
     commands: tuple[str, ...]
 
 
+class OwnPaneNotAtShell(HerdrFailure):
+    """A restart refused: the session's own pane did not reach the shell in time."""
+
+    def __init__(self, name: str, session: str, pane: str, seconds: float) -> None:
+        super().__init__(f"{name}: restart refused: own pane {pane} is not at the shell after {seconds:g} s; "
+                         + f"session {session} stays stopped; when that pane is at the shell, run: agents resume {name}")
+
+
 @dataclass(frozen=True)
 class ProcessGenerationUnavailable:
     """The process start time cannot prove its generation."""
@@ -1027,6 +1054,31 @@ def herdr_binary() -> str:
     if not binary:
         raise HerdrMissing("herdr is not installed")
     return binary
+
+
+def own_pane_columns(timeout: float) -> int | None:
+    """Return the width in columns of the pane that runs this process, or None when herdr cannot tell in time."""
+    pane = os.environ.get("HERDR_PANE_ID")
+    path = os.environ.get("HERDR_SOCKET_PATH")
+    if not pane or not path:
+        return None
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as stream:
+            stream.settimeout(timeout)
+            stream.connect(path)
+            stream.sendall((json.dumps({"id": "pane-columns", "method": "pane.layout",
+                                        "params": {"pane_id": pane}}) + "\n").encode())
+            with stream.makefile("r", encoding="utf-8") as reply:
+                response = decode_object(reply.readline(), "herdr pane.layout")
+        layout = json_object(json_object(response.get("result"), "herdr pane.layout").get("layout"), "herdr pane.layout")
+        for item in json_items(layout.get("panes"), "herdr pane.layout"):
+            row = json_object(item, "herdr pane")
+            width = json_object(row.get("rect"), "herdr pane rect").get("width")
+            if row.get("pane_id") == pane and isinstance(width, int):
+                return width
+    except (OSError, HerdrFailure):
+        return None
+    return None
 
 
 # A tab or workspace gone from the shared session keeps its saved place this long, so a restart
@@ -1789,38 +1841,72 @@ class Herdr:
             _ = _bind_row_tab(saved, workspace, row_id, target, max(0, index - 1))
             _write_layout(self.session, saved)
 
-    def saved_row_tab(self, row_id: str, title: str, fallback_workspace: str) -> NewTab | SplitPane | ExistingPane:
-        """Select current native placement and leave an unowned shell unowned."""
-        record = _tab_staff()
+    def saved_row_tab(self, row_id: str, title: str, fallback_workspace: str,
+                      *, record: staff.StaffSnapshot | ReadStaffAtUse = _READ_STAFF_AT_USE) -> NewTab | ExistingPane:
+        """Reuse the member's own pane once it is at the shell; open a tab only when it has none."""
+        record = _tab_staff() if isinstance(record, ReadStaffAtUse) else record
         member = record.by_id(staff.StaffId(row_id))
         if member is None:
             return NewTab(fallback_workspace, title)
-        if not any(tab["staff_id"] == row_id for space in saved_layout(self.session)["workspaces"] for tab in space["tabs"]):
+        own = self._own_pane(member, record)
+        if own is None:
             return NewTab(row_workspace(member, record, fallback_workspace), title)
+        return self._own_pane_at_shell(member, own)
+
+    def _own_pane(self, member: staff.StaffRow, record: staff.StaffSnapshot) -> dict[str, object] | None:
+        """The pane that runs the member, else the newest pane launched for it that no other member runs in."""
         panes = self.listed("pane")
         scan = self.scan_row_panes(record, panes)
         entries = pane_launch.read(pane_launch.record_directory() / f"{self.session}.json")
-        matches = pane_launch.reference_panes(pane_launch.StaffLaunchReference(member.id), record, self, entries,
-                                             evidence=pane_launch.NativePaneEvidence(panes, scan))
-        for pane in matches:
-            identity = json_text(pane.get("pane_id"), "pane id")
-            if isinstance(self.pane_activity(identity), PaneAtShell):
-                return ExistingPane(identity, json_text(pane.get("terminal_id"), "terminal id"))
-        tabs = {pane.get("tab_id") for pane in matches}
-        children = {row.id for row in record.find(parent=member.id)}
-        siblings = [pane for identity, found in scan.found.items() for pane in found
-                    if (pane.get("tab_id") in tabs and pane not in matches) or identity in children]
-        if siblings:
-            return SplitPane(json_text(siblings[0].get("pane_id"), "pane id"), "right", 0.5, title)
-        return NewTab(row_workspace(member, record, fallback_workspace), title)
+        reference = pane_launch.StaffLaunchReference(member.id)
+        own = pane_launch.reference_panes(reference, record, self, entries, evidence=pane_launch.NativePaneEvidence(panes, scan))
+        if own:
+            return own[0]
+        others = [pane for owner, found in scan.found.items() if owner != member.id for pane in found]
+        launched = [pane for pane in panes if pane not in others
+                    and (entry := entries.get(str(pane.get("pane_id")))) is not None
+                    and pane_launch.launch_reference(entry, record) == reference]
+        return max(launched, key=lambda pane: entries[str(pane.get("pane_id"))]["written_at"], default=None)
+
+    def _own_pane_at_shell(self, member: staff.StaffRow, pane: dict[str, object]) -> ExistingPane:
+        """Wait for the own pane to reach the shell; refuse the start when the time passes first."""
+        identity = json_text(pane.get("pane_id"), "pane id")
+        if not isinstance(self.pane_activity(identity), PaneAtShell):
+            limit = conf.read("shutdown").number("OWN_PANE_SHELL_SECONDS")
+            if not self._shell_within(identity, limit):
+                raise OwnPaneNotAtShell(member.name, str(member.current_session), identity, limit)
+        return ExistingPane(identity, json_text(pane.get("terminal_id"), "terminal id"))
+
+    def _shell_within(self, pane: str, seconds: float) -> bool:
+        """Read the pane until it is at the shell or the time passes."""
+        end = time.monotonic() + operation_deadline.remaining(seconds)
+        while not isinstance(self.pane_activity(pane), PaneAtShell):
+            remaining = end - time.monotonic()
+            if remaining <= 0:
+                return False
+            time.sleep(min(0.1, remaining))
+        return True
 
     def producer_row_tab(self, row_id: str, title: str, workspace: str,
                          *, record: staff.StaffSnapshot | ReadStaffAtUse = _READ_STAFF_AT_USE) -> NewTab | ExistingPane:
         """Reuse a producer's shell only in its own tab in the configured workspace."""
-        destination = self.saved_row_tab(row_id, title, workspace)
-        if isinstance(destination, ExistingPane) and self.producer_pane(destination.pane, row_id, workspace, record=record):
+        membership = _tab_staff() if isinstance(record, ReadStaffAtUse) else record
+        member = membership.by_id(staff.StaffId(row_id))
+        own = self._own_pane(member, membership) if member is not None else None
+        if member is None or own is None or not self._producer_place(own, workspace):
+            return NewTab(workspace, title)
+        destination = self._own_pane_at_shell(member, own)
+        if self.producer_pane(destination.pane, row_id, workspace, record=membership):
             return destination
         return NewTab(workspace, title)
+
+    def _producer_place(self, pane: dict[str, object], workspace: str) -> bool:
+        """The pane is alone in its tab, and the tab is in the producer workspace."""
+        panes = self.listed("pane")
+        tab = next((tab for tab in self.listed("tab") if tab.get("tab_id") == pane.get("tab_id")), None)
+        return (tab is not None and sum(item.get("tab_id") == tab.get("tab_id") for item in panes) == 1
+                and any(space.get("label") == workspace and space.get("workspace_id") == tab.get("workspace_id")
+                        for space in self.listed("workspace")))
 
     def producer_pane(self, pane_id: str, row_id: str, workspace: str,
                       *, record: staff.StaffSnapshot | ReadStaffAtUse = _READ_STAFF_AT_USE) -> bool:
@@ -1833,10 +1919,7 @@ class Herdr:
         own = next((pane for pane in panes if pane.get("pane_id") == pane_id), None)
         if own is None or not isinstance(self.pane_activity(pane_id), PaneAtShell):
             return False
-        tab = next((tab for tab in self.listed("tab") if tab.get("tab_id") == own.get("tab_id")), None)
-        if (tab is None or sum(pane.get("tab_id") == tab.get("tab_id") for pane in panes) != 1
-                or not any(space.get("label") == workspace and space.get("workspace_id") == tab.get("workspace_id")
-                           for space in self.listed("workspace"))):
+        if not self._producer_place(own, workspace):
             return False
         entries = pane_launch.read(pane_launch.record_directory() / f"{self.session}.json")
         scan = self.scan_row_panes(record, panes)
@@ -2344,6 +2427,8 @@ class Herdr:
         launched_at = datetime.now(timezone.utc)
         deadline = time.monotonic() + operation_deadline.remaining(timeout_ms / 1000)
         attempt_timeout_ms = min(timeout_ms, _AGENT_START_TIMEOUT_MAXIMUM_MS)
+        if isinstance(opening, OpeningPrompt):
+            opening = opening.prepare_for_launch(launched_at)
         try:
             while True:
                 result = self.start_command(
@@ -2398,12 +2483,14 @@ class Herdr:
                     print(f"herdr {name}:{pane}: native session is unavailable: {error}; pane retained", file=sys.stderr)
                     return PromptNotSubmitted("native session is unavailable; pane retained")
                 transcript = SessionTranscript(transcript.config_dir, identity)
+                if isinstance(opening.cursor, TranscriptCursor):
+                    opening.cursor.bind_transcript(transcript)
                 try:
                     _ = opening.before_prompt(transcript)
                 except Exception as error:
                     print(f"herdr {transcript.session_id}: staff publication failed: {error}", file=sys.stderr)
                     return PromptNotSubmitted(f"staff publication failed: {error}")
-                opening = OpeningPrompt(opening.text, transcript)
+                opening = replace(opening, transcript=transcript)
             return self.submit_opening_prompt(pane, opening, launched_at,
                                               max(0, int((deadline - time.monotonic()) * 1000)))
         return PromptSubmissionNotRequired()
@@ -3722,7 +3809,7 @@ def stop_session(name: str) -> None:
                                 f"stop {server_unit(name)}")
 
 
-def _proc_root() -> Path:
+def proc_root() -> Path:
     return Path(os.environ.get("HERDR_PROC", "/proc"))
 
 
@@ -3832,7 +3919,7 @@ def _codex_launch_argument(pid: int) -> LaunchArgument | StartingCodexPane | Cod
             return unknown
         arguments = list(process.arguments.argv)
     else:
-        arguments = _process_arguments(_proc_root() / str(pid))
+        arguments = _process_arguments(proc_root() / str(pid))
     if is_codex_process(arguments):
         options = iter(arguments[2:] if Path(arguments[0]).name in {"node", "nodejs"} else arguments[1:])
         fresh = True
@@ -4151,7 +4238,7 @@ def codex_conversations(*, wanted: str = "") -> CodexConversations:
 
     candidates: list[tuple[int, list[str]]] = []
     unknown: list[tuple[int, str] | str] = []
-    process_root = _proc_root()
+    process_root = proc_root()
     process_paths: list[Path] = []
 
     @cache
@@ -4293,7 +4380,7 @@ def process_environment(pid: int) -> dict[str, str]:
     """Read a process even outside herdr; a failed observation remains an error."""
     if _platform() == "darwin":
         return darwin_process_environment(pid)
-    return _process_environment(_proc_root() / str(pid))
+    return _process_environment(proc_root() / str(pid))
 
 
 def _process_arguments(process: Path) -> list[str]:
@@ -4392,7 +4479,7 @@ class _LinuxStartupProcesses:
     """Read startup facts from Linux process files."""
 
     def __init__(self) -> None:
-        self.root: Path = _proc_root()
+        self.root: Path = proc_root()
 
     def identity(self, pid: int) -> AgentProcessIdentity:
         stat = (self.root / str(pid) / "stat").read_text().rsplit(")", 1)[1].split()
@@ -4593,7 +4680,7 @@ def attached_clients(name: str) -> ClientsAttached | NoClientAttached | ClientsU
     if _platform() == "darwin":
         return _darwin_attached_clients(name)
     try:
-        processes = list(_proc_root().iterdir())
+        processes = list(proc_root().iterdir())
     except OSError as error:
         return ClientsUnreadable(str(error))
     count = 0
@@ -4728,7 +4815,7 @@ def server_environment(name: str) -> dict[str, str]:
         except (HerdrFailure, subprocess.TimeoutExpired) as error:
             raise HerdrFailure(f"{context}: {error}") from error
     try:
-        sockets = _proc_root().joinpath("net", "unix").read_text().splitlines()
+        sockets = proc_root().joinpath("net", "unix").read_text().splitlines()
     except (OSError, UnicodeError) as error:
         raise HerdrFailure(f"{context}: cannot read listening sockets") from error
     listening_inodes: list[str] = []
@@ -4741,7 +4828,7 @@ def server_environment(name: str) -> dict[str, str]:
         raise HerdrFailure(f"{context}: expected one listening socket, found {len(listening_inodes)}")
     listener = f"socket:[{listening_inodes[0]}]"
     try:
-        candidates = list(_proc_root().iterdir())
+        candidates = list(proc_root().iterdir())
     except OSError as error:
         raise HerdrFailure(f"{context}: cannot read process directory") from error
     matches: list[Path] = []
@@ -4842,7 +4929,7 @@ def pane_snapshot() -> Generator[Callable[[str], list[PaneIdentity]]]:
 
 def linux_process_parent(pid: int) -> int:
     """Read the parent pid from the Linux process root."""
-    stat = (_proc_root() / str(pid) / "stat").read_text()
+    stat = (proc_root() / str(pid) / "stat").read_text()
     return int(stat[stat.rindex(")") + 1:].split()[1])
 
 
@@ -4851,13 +4938,13 @@ def herdr_place_of(pid: int) -> HerdrPlace | NotInHerdr:
     if _platform() == "darwin":
         return next((process.place for process in herdr_processes() if process.pid == pid), NotInHerdr())
     try:
-        environment = _process_environment(_proc_root() / str(pid))
+        environment = _process_environment(proc_root() / str(pid))
         if environment.get("TMUX_PANE"):
             return NotInHerdr()
         pane = environment.get("HERDR_PANE_ID", "")
         if not pane:
             return NotInHerdr()
-        candidates = [path for path in _proc_root().iterdir() if path.name.isdecimal()]
+        candidates = [path for path in proc_root().iterdir() if path.name.isdecimal()]
     except OSError:
         return NotInHerdr()
     session = _process_sessions(candidates, _live_server_processes(candidates)).get(pid, "")
@@ -4871,13 +4958,13 @@ def herdr_places() -> dict[int, HerdrPlace]:
     if _platform() == "darwin":
         return {process.pid: process.place for process in herdr_processes()}
     try:
-        candidates = [path for path in _proc_root().iterdir() if path.name.isdecimal()]
+        candidates = [path for path in proc_root().iterdir() if path.name.isdecimal()]
     except OSError:
         return {}
     places: dict[int, HerdrPlace] = {}
     for pid, session in _process_sessions(candidates, _live_server_processes(candidates)).items():
         try:
-            environment = _process_environment(_proc_root() / str(pid))
+            environment = _process_environment(proc_root() / str(pid))
         except OSError:
             continue
         place = _live_pane_reader.get()(session).place(pid, environment, linux_process_parent)
@@ -4890,7 +4977,7 @@ def _live_server_processes(candidates: list[Path]) -> dict[int, str]:
     """Identify servers by listening socket ownership, independent of argv."""
     config = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config") / "herdr"
     try:
-        lines = _proc_root().joinpath("net", "unix").read_text().splitlines()
+        lines = proc_root().joinpath("net", "unix").read_text().splitlines()
     except OSError:
         return {}
     listeners: dict[str, str] = {}
@@ -4958,7 +5045,7 @@ def _add_scope_owners(owners: dict[tuple[str, Path], set[str]], pids: Sequence[i
                       sessions: dict[int, str], slice_name: str) -> None:
     """Record the session of each matched process in its pane scope."""
     for pid in pids:
-        for scope in pane_scopes(_systemd_cgroups(_proc_root() / str(pid)), slice_name):
+        for scope in pane_scopes(_systemd_cgroups(proc_root() / str(pid)), slice_name):
             owners.setdefault(scope, set()).add(sessions[pid])
 
 
@@ -4974,7 +5061,7 @@ def _process_sessions(candidates: list[Path], servers: dict[int, str]) -> dict[i
             unit = server_unit(session)
         except ValueError:
             continue
-        for hierarchy, path in _systemd_cgroups(_proc_root() / str(pid)):
+        for hierarchy, path in _systemd_cgroups(proc_root() / str(pid)):
             if unit in path.parts:
                 root = Path(*path.parts[:path.parts.index(unit) + 1])
                 unit_groups[hierarchy, root] = session
@@ -5037,7 +5124,7 @@ def _process_sessions(candidates: list[Path], servers: dict[int, str]) -> dict[i
         # shared cgroup or HERDR_SESSION, this identifies the actual pane shell.
         for session in shared_sessions:
             for shell in _pane_shell_pids(session):
-                descendants = [(_proc_root() / str(shell), session)]
+                descendants = [(proc_root() / str(shell), session)]
                 while descendants:
                     process, owner = descendants.pop()
                     pid = int(process.name)
@@ -5280,12 +5367,12 @@ def _scan_herdr_processes() -> list[HerdrProcess]:
         return _darwin_herdr_processes()
     processes: list[HerdrProcess] = []
     try:
-        candidates = [path for path in _proc_root().iterdir() if path.name.isdecimal()]
+        candidates = [path for path in proc_root().iterdir() if path.name.isdecimal()]
     except OSError:
         return processes
     sessions = _process_sessions(candidates, _live_server_processes(candidates))
     for pid, session in sessions.items():
-        process = _proc_root() / str(pid)
+        process = proc_root() / str(pid)
         try:
             if process.stat().st_uid != os.getuid():
                 continue

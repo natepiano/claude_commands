@@ -783,21 +783,33 @@ class ScratchRootTests(TmpSweepCase):
         self.assertTrue(row.is_dir())
 
 
+def created_in_ended_process(requests: list[tuple[str, str]]) -> list[Path]:
+    """Allocate (prefix, parent) maker folders in a child; each lease is free once the child exits."""
+    code = ("import json, sys\nfrom pathlib import Path\nfrom scripts.lib import build_folders\n"
+            "for prefix, parent in json.loads(sys.argv[1]):\n"
+            "    print(build_folders.create_build_folder(build_folders.UniqueBuildFolder(\n"
+            "        prefix, build_folders.ExplicitBuildParent(Path(parent)))))\n")
+    child = subprocess.run([sys.executable, "-c", code, json.dumps(requests)], text=True, capture_output=True,
+                           check=True, cwd=Path(__file__).resolve().parents[2], timeout=test_hang_guard.TEST_HANG_GUARD_SECS)
+    return [Path(line) for line in child.stdout.splitlines()]
+
+
 class TempParentTests(TmpSweepCase):
     def test_common_session_owner_keeps_its_root_and_sweeps_only_idle_entries(self) -> None:
         session_parent = self.tmp / "session"
         owner = build_folders.create_build_folder(build_folders.StableOwnerFolder(
             LIVE_SESSION, build_folders.ExplicitBuildParent(session_parent), mode=0o700))
-        idle = build_folders.create_build_folder(build_folders.UniqueBuildFolder(
-            "tmp", build_folders.ExplicitBuildParent(owner)))
-        recent = build_folders.create_build_folder(build_folders.UniqueBuildFolder(
-            "tmp", build_folders.ExplicitBuildParent(owner)))
+        idle, recent = created_in_ended_process([("tmp", str(owner)), ("tmp", str(owner))])
         _ = write(idle / "output")
         self.recent(write(recent / "output"))
-        _ = self.sweep()
+        result = self.sweep()
         self.assertTrue(owner.is_dir())
         self.assertFalse(idle.exists())
         self.assertTrue(recent.is_dir())
+        # The live owner's lease records stay; a free lease's records are free residue.
+        busy = result.kept["busy: .claude-busy is locked"]
+        for name in (LIVE_SESSION + ".lock", LIVE_SESSION + ".lease.json"):
+            self.assertIn(str(session_parent / name), busy)
 
     def test_entries_in_a_live_sessions_temp_root_and_a_run_temp_go_after_4_h(self) -> None:
         live_root = self.tmp / "session" / LIVE_SESSION
@@ -854,14 +866,15 @@ class TempFolderTests(TmpSweepCase):
     def test_every_common_prefix_keeps_its_sweep_classification(self) -> None:
         pairs: list[tuple[str, Path, Path]] = []
         parents: list[str] = []
+        requests: list[tuple[str, str]] = []
         for kind, template in build_folders.FOLDER_PREFIXES.items():
             parent = self.tmp.parent / "common-prefixes" / kind
             parent.mkdir(parents=True)
             parents.append(str(parent))
-            prefix = template.format(owner="123")
-            allocated = build_folders.create_build_folder(build_folders.UniqueBuildFolder(
-                prefix, build_folders.ExplicitBuildParent(parent)))
-            previous = parent / (prefix + "Ab12Cd")
+            requests.append((template.format(owner="123"), str(parent)))
+        for kind, (prefix, _), allocated in zip(build_folders.FOLDER_PREFIXES, requests,
+                                                created_in_ended_process(requests), strict=True):
+            previous = allocated.parent / (prefix + "Ab12Cd")
             previous.mkdir()
             _ = write(allocated / "Cargo.toml")
             _ = write(previous / "Cargo.toml")
@@ -1451,7 +1464,7 @@ with copies.standing("verify-unit", source, copies.WorktreeSource("HEAD", source
 '''
         environment = {**os.environ, **copies_environment(self.tmp.parent / "fresh-settings"),
                        "SCRATCH_ROOT": str(self.tmp / "scratch"), "TMPDIR": str(self.tmp),
-                       "PYTHONPATH": str(Path(__file__).resolve().parents[2])}
+                       "PYTHONPATH": str(Path(__file__).resolve().parents[1] / "lib/python_startup")}
         for cargo in (False, True):
             if cargo:
                 _ = write(source / "Cargo.toml", "[workspace]\n")

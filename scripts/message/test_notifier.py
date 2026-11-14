@@ -24,6 +24,7 @@ from scripts.message.process_test_support import OwnedTestProcesses
 from scripts.direct.wait_for_test_state import wait_until
 from scripts.lib.socket_test_support import short_socket_directory
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.lib.checkout_test_support import copy_runtime
 
 
 SCRIPT = Path(__file__).with_name("notifier.sh")
@@ -466,9 +467,9 @@ finally:
         template = self.root / "commands/showrunner/produce.md"
         template.parent.mkdir(parents=True)
         _ = template.write_text("The prompt:\n\n> \n>\n\n**A tick**\n")
+        copy_runtime(self.root)
         python = scripts / "lib/py"
         wrapper = ("#!/bin/sh\n"
-                   + f"export PYTHONPATH={shlex.quote(str(source.parent))}\n"
                    + f'exec {shlex.quote(str(source / "lib/py"))} "$@"\n')
         _ = python.write_text(wrapper)
         python.chmod(0o755)

@@ -34,7 +34,7 @@ from typing import Literal, NoReturn, Protocol, TypedDict, cast
 from scripts.agents import worker_lifecycle  # noqa: E402
 from scripts.direct import plan_history, recorder_state  # noqa: E402
 from scripts.direct.recorder_state import OPEN_PHASES_KEY as OPEN_PHASES_KEY  # noqa: E402
-from scripts.lib import conf_reads, models_registry, unit_runs  # noqa: E402
+from scripts.lib import conf_reads, git_files, models_registry, unit_runs  # noqa: E402
 from scripts.lib.atomic_file import write_text_atomic  # noqa: E402
 from scripts.lib.intervals import merged_spans  # noqa: E402
 from scripts.lib.probe_session import PROBE_ENV  # noqa: E402
@@ -521,6 +521,11 @@ def _refresh_phase_table(session_dir: Path) -> None:
             return
     except (OSError, UnicodeError, SystemExit) as error:
         print(f"phase table not written: {error}", file=sys.stderr)
+        return
+    from scripts.direct import phase_table
+
+    # Without a vault the refresh writes nothing; skip its process start.
+    if not phase_table.vault_present():
         return
 
     command = [
@@ -1223,6 +1228,15 @@ def _park_current(state: dict[str, object], current: dict[str, object]) -> None:
     _parked_phases(state).append(current)
 
 
+def _report_unclosed_phase(state: dict[str, object], phase: dict[str, object]) -> None:
+    """Name a phase set aside with no open pass: its director never closed it."""
+    identity = resolve_production_unit(state)
+    unit = identity.unit if isinstance(identity, ProductionUnitIdentity) else f"unit not recorded ({identity.reason})"
+    started = datetime.fromtimestamp(_number(phase.get("started_at")), user_zone())
+    print(f"anomaly: start-phase: {unit}: phase {_string(phase.get('id'))} set aside unclosed, "
+          + f"started {started:%Y-%m-%d %H:%M %Z}", file=sys.stderr)
+
+
 def _unpark_newest(state: dict[str, object]) -> None:
     """Make the most recently started older open phase current again."""
     parked = _parked_phases(state)
@@ -1665,6 +1679,9 @@ def _start_phase(args: argparse.Namespace) -> None:
     active = _object_dict(state.get("phase"))
     if active is not None and _string(active.get("status")) == "active":
         _park_current(state, active)
+        if not any(_string((_object_dict(record.get("phase")) or {}).get("instance_id"))
+                   == _string(active.get("instance_id")) for record in _open_passes(state).values()):
+            _report_unclosed_phase(state, active)
     else:
         state["pass"] = {}
     phase: dict[str, object] = {
@@ -1832,10 +1849,29 @@ class NoMatchedDispatch:
     pass
 
 
+@dataclass(frozen=True)
+class ActiveDispatchPromptConflict:
+    """The same assignment names an active pass with different prompt content."""
+
+    worker_name: str
+    instance_id: str
+
+
+class DispatchPromptRefused(RuntimeError):
+    """The locked recorder refuses a changed prompt for an active pass."""
+
+    def __init__(self, conflict: ActiveDispatchPromptConflict) -> None:
+        self.conflict: ActiveDispatchPromptConflict = conflict
+        super().__init__(f"Active pass {conflict.instance_id} has different prompt content")
+
+
 def _dispatch_match(active: dict[str, object] | None, phase: dict[str, object],
                     fields: dict[str, object], launcher_command: list[str], *,
-                    dispatch_owned: bool, allow_stage_two: bool = False) -> MatchedDispatch | NoMatchedDispatch:
+                    dispatch_owned: bool, allow_stage_two: bool = False,
+                    ) -> MatchedDispatch | NoMatchedDispatch | ActiveDispatchPromptConflict:
     if active is None or _pass_phase_instance(active) != _string(phase.get("instance_id")):
+        return NoMatchedDispatch()
+    if active.get("kind", "") != fields.get("kind", ""):
         return NoMatchedDispatch()
     saved_command = active.get("launcher_command")
     current_command: object = (_worker_launcher(cast(list[str], saved_command), _string(active.get("worker_name")))
@@ -1843,10 +1879,21 @@ def _dispatch_match(active: dict[str, object] | None, phase: dict[str, object],
                        else cast(object, saved_command))
     same_launcher = bool(launcher_command) and (launcher_command == saved_command or (
         active.get("status") in ("active", "refused") and launcher_command == current_command))
+    stage_two = (allow_stage_two and same_launcher
+                 and fields.get("prompt_file") != active.get("prompt_file"))
+    if dispatch_owned and not stage_two:
+        try:
+            digest = hashlib.sha256(Path(_string(fields.get("prompt_file"))).read_bytes()).hexdigest()
+        except OSError:
+            return NoMatchedDispatch()
+        if active.get("prompt_digest") != digest:
+            if active.get("status") == "active":
+                return ActiveDispatchPromptConflict(_string(active.get("worker_name")), _string(active.get("instance_id")))
+            return NoMatchedDispatch()
     if launcher_command and saved_command and not same_launcher:
         return NoMatchedDispatch()
     if not all(active.get(key, "") == value for key, value in fields.items()
-               if key != "prompt_file" or not (allow_stage_two and same_launcher)):
+               if key != "prompt_file" or not stage_two):
         return NoMatchedDispatch()
     if active.get("status") not in ("active", "refused") and not (
             dispatch_owned and active.get("status") == "completed" and same_launcher):
@@ -1871,7 +1918,8 @@ def _launch_slot(passes: dict[str, dict[str, object]], slot: str, launcher_comma
 
 
 def dispatch_worker(session_dir: Path, *, slot: str, phase: str, role: staff.WorkerRole,
-                    prompt: Path, launcher_command: list[str]) -> MatchedDispatch | NoMatchedDispatch:
+                    prompt: Path, launcher_command: list[str],
+                    ) -> MatchedDispatch | NoMatchedDispatch | ActiveDispatchPromptConflict:
     """Find the worker for this dispatch retry without changing recorder state."""
     if not _state_path(session_dir).is_file():
         return NoMatchedDispatch()
@@ -1936,6 +1984,8 @@ def _start_pass(args: argparse.Namespace) -> None:
     match = _dispatch_match(active, phase, dispatch_fields, launcher_command,
                             dispatch_owned=bool(getattr(args, "dispatch_owned", False)),
                             allow_stage_two=bool(getattr(args, "dispatch_owned", False)))
+    if isinstance(match, ActiveDispatchPromptConflict):
+        raise DispatchPromptRefused(match)
     if active is not None and isinstance(match, MatchedDispatch):
         changed = inferred_owner or active.get("launcher_pid") != launcher_pid
         active["launcher_pid"] = launcher_pid
@@ -1968,6 +2018,8 @@ def _start_pass(args: argparse.Namespace) -> None:
         "phase": _phase_stamp(phase),
         "status": "active",
     }
+    if getattr(args, "dispatch_owned", False):
+        current_pass["prompt_digest"] = hashlib.sha256(Path(_optional_arg(args, "prompt_file")).read_bytes()).hexdigest()
     slots = _pass_slots(state)
     slots[team_slot] = current_pass
     _write_state(session_dir, state)
@@ -2016,8 +2068,12 @@ class DispatchRunNotRecorded(Enum):
     MISSING = "the worker has no dispatch state link"
 
 
+def _dispatch_state_links() -> Path:
+    return staff.record_path().parent / "dispatches"
+
+
 def _dispatch_state_link(worker_id: staff.StaffId) -> Path:
-    return staff.record_path().parent / "dispatches" / str(worker_id)
+    return _dispatch_state_links() / str(worker_id)
 
 
 def recorded_dispatch_run(worker_id: staff.StaffId) -> RecordedDispatchRun | DispatchRunNotRecorded:
@@ -2027,6 +2083,27 @@ def recorded_dispatch_run(worker_id: staff.StaffId) -> RecordedDispatchRun | Dis
     except FileNotFoundError:
         return DispatchRunNotRecorded.MISSING
     return RecordedDispatchRun(path.parent)
+
+
+def recorded_dispatch_runs() -> dict[staff.StaffId, RecordedDispatchRun]:
+    """Map each linked worker to its pass state run with one read of the link folder."""
+    try:
+        with os.scandir(_dispatch_state_links()) as entries:
+            links = {entry.name: (entry.path, os.readlink(entry.path)) for entry in entries if entry.is_symlink()}
+    except FileNotFoundError:
+        return {}
+    # Many workers link to one run; resolve each target once.
+    runs: dict[str, RecordedDispatchRun | DispatchRunNotRecorded] = {}
+    found: dict[staff.StaffId, RecordedDispatchRun] = {}
+    for name, (path, target) in links.items():
+        if target not in runs:
+            try:
+                runs[target] = RecordedDispatchRun(Path(path).resolve(strict=True).parent)
+            except FileNotFoundError:
+                runs[target] = DispatchRunNotRecorded.MISSING
+        if isinstance(run := runs[target], RecordedDispatchRun):
+            found[staff.StaffId(name)] = run
+    return found
 
 
 def _link_dispatch_state(worker_id: staff.StaffId, session_dir: Path) -> None:
@@ -2213,6 +2290,17 @@ def mark_pass_refused(session_dir: Path, worker_name: str) -> None:
                 passed["status"] = "refused"
                 _write_state(session_dir, state)
                 _append_event(state, _event(state, "pass_refused", plan_history.now_epoch(), passed))
+
+
+def cancel_worker_passes(session_dir: Path, worker_id: staff.StaffId) -> int:
+    """End each open pass of a stopped worker as canceled. Return the number of passes ended."""
+    if not _state_path(session_dir).is_file():
+        return 0
+    with (session_dir / ".progress_history.lock").open("a+", encoding="utf-8") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        state = _read_state(session_dir)
+        slots = [slot for slot, passed in _open_passes(state).items() if passed.get("worker_id") == worker_id]
+        return sum(_close_slot_pass(session_dir, state, slot, "canceled", plan_history.now_epoch()) for slot in slots)
 
 
 def _finish_pass(args: argparse.Namespace) -> None:
@@ -5666,27 +5754,11 @@ def _phase_repository(working_dir: str) -> RecordedPhaseMetadata | PhaseMetadata
     worktree = Path(working_dir).expanduser()
     if not worktree.is_dir():
         return PhaseMetadataNotRecorded("phase working directory is unavailable")
-    for directory in (worktree, *worktree.parents):
-        marker = directory / ".git"
-        if marker.is_dir():
-            return RecordedPhaseMetadata(directory.name)
-        if not marker.is_file():
-            continue
-        try:
-            location = marker.read_text(encoding="utf-8").strip()
-            if not location.startswith("gitdir:") or not location.removeprefix("gitdir:").strip():
-                break
-            git_directory = (directory / location.removeprefix("gitdir:").strip()).resolve()
-            common = (git_directory / "commondir").read_text(encoding="utf-8").strip()
-            if not common:
-                break
-            repository = (git_directory / common).resolve()
-            if not repository.is_dir():
-                break
-            return RecordedPhaseMetadata(repository.parent.name if repository.name == ".git" else repository.name)
-        except (OSError, ValueError):
-            break
-    return PhaseMetadataNotRecorded("repository common directory is unavailable")
+    try:
+        repository = git_files.locate(worktree).common_dir
+    except git_files.GitFilesError:
+        return PhaseMetadataNotRecorded("repository common directory is unavailable")
+    return RecordedPhaseMetadata(repository.parent.name if repository.name == ".git" else repository.name)
 
 
 def _phase_plan_names(state: Mapping[str, object]) -> tuple[

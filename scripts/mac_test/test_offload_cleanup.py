@@ -16,7 +16,7 @@ import io
 from pathlib import Path
 from typing import cast, override
 from unittest import mock
-from scripts.mac_test import offload, mac_test
+from scripts.mac_test import eligibility, offload, mac_test
 from scripts.mac_test.offload_test_commands import ACTIVITY_SELECTOR_STUB, write_shell
 from scripts.mac_test.offload_test_support import HANA, HANA_COMMAND_PATTERN, SelectorEvent
 from scripts.lib import test_hang_guard
@@ -99,7 +99,7 @@ class MacTargetCleanupShellTests(unittest.TestCase):
     def setUp(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         self.home_directory = self.root / "home with spaces"
-        self.mirror = self.home_directory / offload.remote_mirror(offload.KnownRepository("hana's project"))
+        self.mirror = self.home_directory / offload.remote_mirror(eligibility.KnownRepository("hana's project"))
         self.mirror.mkdir(parents=True)
         self.temporary_directory = self.root / "tmp"
         self.temporary_directory.mkdir()
@@ -144,20 +144,20 @@ exit "$CLEANUP_TEST_STATUS"
         budget_values: tuple[tuple[str, str], ...] = (),
     ) -> subprocess.CompletedProcess[str]:
         request = offload.OffloadRequest(self.root, "hana", "cleanup-call", offload.NO_RESULT_FILE, words, owner="verify", holder_session="fixture-session")
-        config = offload.OffloadConfig(
-            enabled=True, connection=offload.SshConnectionSettings("unused-host", 6, 10), probe_timeout_s=1,
+        config = eligibility.OffloadConfig(
+            enabled=True, connection=eligibility.SshConnectionSettings("unused-host", 6, 10), probe_timeout_s=1,
             unreachable_backoff_s=300, free_floor_gib=free_floor_gib,
             default_target_budget_gib=budget_gib,
             values={"abandoned_session_minutes": str(abandoned_session_minutes), **dict(budget_values)},
         )
         text = (
             '[ "$(command -v df)" = ' + shlex.quote(str(self.bin_directory / "df")) + ' ] || exit 99\n'
-            + offload.remote_test_command(config, request, offload.KnownRepository("hana's project"))
+            + offload.remote_test_command(config, request, eligibility.KnownRepository("hana's project"))
         )
         return subprocess.run(
             [*shell, "-c", text], cwd=self.home_directory,
             env={**os.environ, **self.configuration_environment,
-                 "PYTHONPATH": str(Path(__file__).resolve().parents[2]),
+                 "PYTHONPATH": str(Path(__file__).resolve().parents[1] / "lib/python_startup"),
                  "HOME": str(self.home_directory), "TMPDIR": str(self.temporary_directory),
                  "PATH": str(self.bin_directory) + os.pathsep + os.environ["PATH"],
                  "CLEANUP_TEST_DIR": str(self.root), "CLEANUP_TEST_STATUS": str(status),

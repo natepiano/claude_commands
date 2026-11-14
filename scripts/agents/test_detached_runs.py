@@ -10,13 +10,14 @@ import math
 import multiprocessing
 import os
 import select
+import signal
 import socket
 import subprocess
 import sys
 import tempfile
 import time
 import unittest
-from collections.abc import Generator, Iterator
+from collections.abc import Callable, Generator, Iterator
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
@@ -33,16 +34,16 @@ from scripts.agents.detached_runs import deliver_in_fresh_process
 from scripts.buildlog import treekey
 from scripts.build_hold import build_hold, hold_enforcer
 from scripts.direct import progress_history
-from scripts.lib import conf, unit_runs
+from scripts.lib import conf, process_group, process_start, unit_runs
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.herdr import turn_end, worker_panes
 from scripts.herdr.worker_panes import worker_run
 from scripts.herdr import test_worker_panes as pane_support
 from scripts.message import send
-from scripts.lib.test_hang_guard import LauncherHangGuard
+from scripts.lib.test_hang_guard import LauncherHangGuard, TEST_HANG_GUARD_SECS
 from scripts.lib.fork_test_support import ForkChild, ForkChildren
 from scripts.lib.socket_test_support import short_socket_directory
-from scripts.message.repeat_guard_test_support import install_guard_test_budget
+from scripts.message.repeat_guard_test_support import install_guard_test_budget, wait_for_notice_exit
 from scripts.production import staff, session_staff, test_worker, worker_admission
 from scripts.production.staff_test_support import StaffTestCase, fixture_runtime_id, fixture_session
 
@@ -229,7 +230,14 @@ class DetachedRunsTests(unittest.TestCase):
     def start(self, command: list[str], to: str = WORKER) -> tuple[MagicMock, str]:
         """Start command for seat `to`; the Popen mock and what start printed."""
         popen = MagicMock(return_value=SimpleNamespace(pid=4321))
-        with patch.object(subprocess, "Popen", popen), contextlib.redirect_stdout(io.StringIO()) as output:
+        real_popen = cast(Callable[..., subprocess.Popen[bytes]], subprocess.Popen)
+
+        def spawn(arguments: list[str], **options: object) -> subprocess.Popen[bytes]:
+            if "supervise" in arguments:
+                return cast(subprocess.Popen[bytes], popen(arguments, **options))
+            return real_popen(arguments, **options)
+
+        with patch.object(subprocess, "Popen", side_effect=spawn), contextlib.redirect_stdout(io.StringIO()) as output:
             code = detached_runs.main(["start", "--session-dir", str(self.session), "--to", to, "--", *command])
         self.assertEqual(code, 0)
         return popen, output.getvalue()
@@ -330,9 +338,57 @@ class DetachedRunsTests(unittest.TestCase):
         self.update_record(paths[0], status="finished", exit_code=0)
         popen, _ = self.start(["new-check"])
         popen.assert_called_once()
-        self.assertEqual(len(list(paths[0].parent.glob("*.json"))), 4)
+        # The start also deletes the finished run: its worker has no open pass.
+        self.assertEqual(len(list(paths[0].parent.glob("*.json"))), 3)
+        self.assertFalse(paths[0].exists())
+
+    def finished_run(self, run_id: str, worker: str = WORKER, **fields: object) -> Path:
+        """A finished record with its log and lock files."""
+        path = self.record(["fixture", run_id]).replace(self.session / detached_runs.DETACHED_RUNS_DIR / f"{run_id}.json")
+        self.update_record(path, **{"run_id": run_id, "worker": worker, "status": "finished", "exit_code": 0,
+                                    "log": str(path.with_suffix(".log")), **fields})
+        for name in (f"{run_id}.log", f"{run_id}.record.lock", f".{run_id}.delivery.lock"):
+            _ = (path.parent / name).write_text("output", encoding="utf-8")
+        return path
+
+    def set_pass(self, status: str, started_at: float) -> None:
+        """Give the worker a pass in the run state."""
+        write_text_atomic(self.session / unit_runs.STATE_FILE, json.dumps({
+            "owner_staff_id": self.unit.id, "pass": {WORKER: {
+                "instance_id": "pass-1", "worker_id": self.worker_id, "status": status, "started_at": started_at}}}))
+
+    def run_files(self, run_id: str) -> list[str]:
+        folder = self.session / detached_runs.DETACHED_RUNS_DIR
+        return sorted(path.name for path in folder.iterdir() if path.name.lstrip(".").startswith(run_id + "."))
+
+    def test_prune_keeps_only_the_finished_runs_that_a_reader_needs(self) -> None:
+        runs = self.session / detached_runs.DETACHED_RUNS_DIR
+        opened = time.time()
+        self.set_pass("active", opened)
+        _ = self.finished_run("before-pass", started_at=opened - 10)
+        _ = self.finished_run("in-pass", started_at=opened + 1)
+        _ = self.finished_run("pending", started_at=opened - 10, completion_pending=True)
+        _ = self.finished_run("running", started_at=opened - 10, status="running")
+        _ = self.finished_run("director-old", worker="director", staff_id="", started_at=opened)
+        _ = self.finished_run("director-new", worker="director", staff_id="", started_at=opened + 5)
+        _ = self.finished_run("owner-gone", worker="gone", staff_id="00000000-0000-4000-8000-000000000000")
+        self.assertEqual(sorted(detached_runs.prune_finished(runs)), ["before-pass", "director-old", "owner-gone"])
+        for removed in ("before-pass", "director-old", "owner-gone"):
+            self.assertEqual(self.run_files(removed), [])
+        for kept in ("in-pass", "pending", "running", "director-new"):
+            self.assertEqual(self.run_files(kept), [f".{kept}.delivery.lock", f"{kept}.json", f"{kept}.log", f"{kept}.record.lock"])
+        # The pass end frees the runs that the pass read.
+        self.set_pass("completed", opened)
+        self.assertEqual(detached_runs.prune_finished(runs), ["in-pass"])
+        self.assertEqual(detached_runs.prune_finished(self.session / "absent"), [])
+
+    def test_a_start_deletes_the_owners_earlier_finished_runs(self) -> None:
+        _ = self.finished_run("director-done", worker="director", staff_id="")
+        _ = self.start(["new-check"], to="director")
+        self.assertEqual(self.run_files("director-done"), [])
 
     def test_a_gone_supervisor_holds_no_place_at_the_limit(self) -> None:
+        self.set_pass("active", 0.0)  # The open pass keeps the ended run for its reader.
         paths = self.seat_runs(3)
         self.update_record(paths[0], pid=DEAD_PID)
         popen, _ = self.start(["new-check"])
@@ -534,7 +590,8 @@ sys.exit(1)
             popen.assert_called_once()
         records = [cast(dict[str, object], json.loads(path.read_text(encoding="utf-8")))
                    for path in (self.session / detached_runs.DETACHED_RUNS_DIR).glob("*.json")]
-        self.assertEqual(sorted(str(record.get("tree_key")) for record in records), ["", "key-1", "key-2"])
+        # The key-2 run has no live supervisor, so the last start reaps it and deletes it: its worker has no open pass.
+        self.assertEqual(sorted(str(record.get("tree_key")) for record in records), ["", "key-1"])
 
     def test_another_command_seat_or_folder_starts_a_new_run(self) -> None:
         command = ["bash", "verify.sh", "lint", "hana"]
@@ -560,6 +617,7 @@ sys.exit(1)
     # On 2026-10-22 a unit stopped 23 queued runs by their process group: a supervisor that dies
     # delivers nothing, and its worker waits for a result that never comes.
     def test_a_start_ends_a_run_whose_supervisor_is_gone_with_a_failure_result(self) -> None:
+        self.set_pass("active", 0.0)  # The open pass keeps the ended run for its reader.
         path = self.record(["bash", "verify.sh", "test", "hana"])
         self.update_record(path, pid=DEAD_PID)
         popen, _ = self.start(["bash", "verify.sh", "lint", "hana"])
@@ -663,6 +721,100 @@ sys.exit(1)
         with patch("shutil.which", return_value=None):
             self.assertEqual(detached_runs.scope_prefix(marker, on), [])
 
+    def test_group_stop_ends_the_supervisor_and_command_and_reaps_the_result(self) -> None:
+        child_source = """import json, os, socket, sys
+with socket.socket(socket.AF_UNIX) as connection:
+    connection.connect(sys.argv[1])
+    connection.sendall((json.dumps(dict(role='command', pid=os.getpid(), group=os.getpgrp())) + '\\n').encode())
+    connection.recv(1)
+"""
+        supervisor_source = """import json, os, runpy, signal, socket, subprocess, sys
+from unittest.mock import patch
+from scripts.agents import detached_runs
+from scripts.lib.cancellation import CANCELLATION_SIGNALS
+wait = subprocess.Popen.wait
+address = sys.argv[4]
+def checked_wait(process, *args, **kwargs):
+    with socket.socket(socket.AF_UNIX) as connection:
+        connection.connect(address)
+        defaults = all(signal.getsignal(number) == signal.SIG_DFL for number in CANCELLATION_SIGNALS)
+        connection.sendall((json.dumps(dict(role='supervisor', defaults=defaults, group=os.getpgrp())) + '\\n').encode())
+    return wait(process, *args, **kwargs)
+with patch.object(subprocess.Popen, 'wait', checked_wait):
+    sys.argv = sys.argv[1:4]
+    runpy.run_path(detached_runs.__file__, run_name='__main__')
+"""
+        with short_socket_directory() as socket_root:
+            address = Path(socket_root) / "ready.sock"
+            runtime = Path(socket_root) / "runtime"
+            (runtime / "systemd").mkdir(parents=True)
+            tools = self.root / "tools"
+            tools.mkdir()
+            scope = tools / "systemd-run"
+            _ = scope.write_text('#!/bin/sh\nwhile [ "$1" != "--" ]; do shift; done\nshift\nexec "$@"\n')
+            scope.chmod(0o755)
+            with socket.socket(socket.AF_UNIX) as manager:
+                manager.bind(str(runtime / "systemd/private"))
+                for scoped in (False, True):
+                    for number in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+                        with self.subTest(scoped=scoped, signal=number), socket.socket(socket.AF_UNIX) as ready:
+                            guard = LauncherHangGuard("detached process group stop")
+                            ready.bind(str(address))
+                            ready.listen(2)
+                            path = self.record([sys.executable, "-c", child_source, str(address)])
+                            environment = {**os.environ, "BUILDLOG_SCOPE": "1" if scoped else "0",
+                                           "XDG_RUNTIME_DIR": str(runtime), "PATH": str(tools) + os.pathsep + os.environ["PATH"]}
+                            with (Path(self.root / "supervisor.log").open("ab") as output,
+                                  subprocess.Popen([sys.executable, "-c", supervisor_source, "detached_runs.py",
+                                                    "supervise", str(path), str(address)], env=environment,
+                                                   stdout=output, stderr=subprocess.STDOUT,
+                                                   start_new_session=True) as supervisor,
+                                  contextlib.ExitStack() as connections):
+                                self.update_record(path, pid=supervisor.pid)
+                                try:
+                                    observed: dict[str, dict[str, object]] = {}
+                                    command_connection: socket.socket | None = None
+                                    for _ in range(2):
+                                        self.assertTrue(select.select([ready], [], [], guard.remaining())[0],
+                                                        "the run did not report readiness")
+                                        connection = ready.accept()[0]
+                                        _ = connections.enter_context(connection)
+                                        connection.settimeout(guard.remaining())
+                                        stream = connections.enter_context(connection.makefile("rb"))
+                                        row = cast(dict[str, object], json.loads(stream.readline()))
+                                        observed[str(row["role"])] = row
+                                        if row["role"] == "command":
+                                            command_connection = connection
+                                    self.assertEqual(observed["supervisor"]["defaults"], True)
+                                    self.assertEqual(observed["supervisor"]["group"], supervisor.pid)
+                                    self.assertEqual(observed["command"]["group"], supervisor.pid)
+                                    saved = cast(detached_runs.RunRecord, json.loads(path.read_text()))
+                                    self.assertEqual(process_start.process_start(supervisor.pid),
+                                                     process_start.Started(saved.get("supervisor_started", "")))
+                                    self.assertEqual(saved.get("command_pid"), observed["command"]["pid"])
+                                    self.assertEqual(process_start.process_start(saved.get("command_pid", 0)),
+                                                     process_start.Started(saved.get("command_started", "")))
+                                    self.assertEqual(path.with_suffix(".scope").exists(), scoped)
+                                    process_group.send_process_group(supervisor.pid, number)
+                                    self.assertEqual(supervisor.wait(timeout=guard.remaining()), -number)
+                                    assert command_connection is not None
+                                    self.assertEqual(command_connection.recv(1), b"")
+                                finally:
+                                    with contextlib.suppress(ProcessLookupError):
+                                        process_group.send_process_group(supervisor.pid, signal.SIGKILL)
+                                    _ = supervisor.wait(timeout=guard.remaining())
+                            address.unlink()
+                            before = len(self.sent)
+                            self.assertEqual(detached_runs.live_runs(path.parent, WORKER), [])
+                            wait_for_notice_exit(saved.get("command_pid", 0))
+                            self.assertEqual(detached_runs.reap_orphans(str(self.session)), ["r1"])
+                            record = cast(detached_runs.RunRecord, json.loads(path.read_text()))
+                            self.assertEqual((record["status"], record.get("ended")), ("finished", "supervisor gone"))
+                            self.assertNotIn("exit_code", record)
+                            self.assertEqual(len(self.sent), before + 1)
+                            self.assertIn("FAIL (no exit status)", self.sent[-1])
+                            self.assertEqual(detached_runs.reap_orphans(str(self.session)), [])
+
     def test_command_receives_the_recorded_staff_owner_without_a_session_environment(self) -> None:
         command = [sys.executable, "-c", "import os; print(os.environ['BUILDLOG_OWNER_STAFF_ID'])"]
         path = self.record(command)
@@ -672,6 +824,42 @@ sys.exit(1)
             record = self.supervise(path)
         self.assertEqual(record.get("exit_code"), 0)
         self.assertEqual(Path(record["log"]).read_text().strip(), str(self.worker_id))
+
+    def test_plain_python_command_uses_its_copy_and_keeps_startup_hooks(self) -> None:
+        selected, other, startup = (self.root / name for name in ("copy", "other", "startup"))
+        for root in (selected, other):
+            (root / "scripts/lib").mkdir(parents=True)
+            _ = (root / "scripts/lib/py").write_text("# Checkout marker.\n")
+            _ = (root / "scripts/value.py").write_text("VALUE = 1\n")
+        _ = (other / "scripts/__init__.py").write_text("")
+        startup.mkdir()
+        _ = (startup / "sitecustomize.py").write_text("import os; os.environ['COPY_STARTUP'] = 'loaded'\n")
+        command = [sys.executable, "-c",
+                   "import json, os; from scripts import value; "
+                   + "print(json.dumps([value.__file__, os.environ['PYTHONPATH'], os.environ['COPY_STARTUP']]))"]
+        path = self.record(command)
+        with (contextlib.chdir(selected), patch.dict(os.environ, {
+                "PYTHONPATH": os.pathsep.join((str(other), str(selected), str(startup))),
+              })):
+            record = self.supervise(path)
+        self.assertEqual(record.get("exit_code"), 0, Path(record["log"]).read_text())
+        self.assertEqual(json.loads(Path(record["log"]).read_text()),
+                         [str(selected / "scripts/value.py"), str(startup), "loaded"])
+
+    def test_repeat_budget_hook_selects_the_test_copy_without_exporting_it(self) -> None:
+        result = subprocess.run(
+            [sys.executable, "-c", "import json, os; from scripts.message import repeat_guard; "
+             + "print(json.dumps([repeat_guard.__file__, repeat_guard.GUARD_IO_CEILING_SECONDS, "
+             + "os.environ['PYTHONPATH']]))"],
+            cwd=self.root, capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        filename, budget, inherited = cast(tuple[str, int, str], json.loads(result.stdout))
+        root = Path(__file__).resolve().parents[2]
+        self.assertEqual(Path(filename).resolve(), root / "scripts/message/repeat_guard.py")
+        self.assertEqual(budget, TEST_HANG_GUARD_SECS)
+        self.assertFalse(any((Path(entry or os.curdir) / "scripts/lib/py").is_file()
+                             for entry in inherited.split(os.pathsep)))
 
     def test_a_scope_runs_the_command_once_and_a_failed_scope_runs_it_plainly(self) -> None:
         count = self.root / "count"
@@ -688,6 +876,141 @@ sys.exit(1)
         with patch.object(detached_runs, "scope_prefix", return_value=["/bin/sh", "-c", "exit 1", "scope"]):
             record = self.supervise(self.record(command))
         self.assertEqual((record.get("exit_code"), count.read_text(encoding="utf-8")), (0, "run\n"))
+
+    def test_record_exit_keeps_the_run_pending_until_orphan_reaping(self) -> None:
+        path = self.record(["bash", "verify.sh", "lint", "sample"])
+        owner = os.getpid()
+        started = process_start.process_start(owner)
+        assert isinstance(started, process_start.Started)
+        self.update_record(path, pid=DEAD_PID, stop_reason="fixture group stop",
+                           command_pid=owner, command_started=started.start)
+        with patch.object(os, "getppid", return_value=DEAD_PID):
+            self.assertEqual(detached_runs.main(["record-exit", str(path), "143"]), 0)
+        self.assertNotIn("exit_code", cast(detached_runs.RunRecord, json.loads(path.read_text())))
+        with patch.object(os, "getppid", return_value=owner):
+            self.assertEqual(detached_runs.main(["record-exit", str(path), "143"]), 0)
+        record = cast(detached_runs.RunRecord, json.loads(path.read_text()))
+        self.assertEqual((record["status"], record.get("exit_code"), record.get("stop_reason")),
+                         ("running", 143, "fixture group stop"))
+        self.assertEqual(self.pending(), {})
+        with patch.object(process_start, "process_start", return_value=process_start.Gone()):
+            self.assertEqual(detached_runs.reap_orphans(str(self.session)), ["r1"])
+        self.assertEqual(json.loads(path.read_text())["status"], "finished")
+        messages = cast(list[str], self.pending()["messages"])
+        self.assertEqual(len(messages), 1)
+        self.assertIn("FAIL (exit 143)", messages[0])
+        self.assertEqual(detached_runs.reap_orphans(str(self.session)), [])
+
+    def test_record_exit_rejects_a_reused_pid_and_a_finished_record(self) -> None:
+        path = self.record(["bash", "verify.sh"])
+        owner = os.getpid()
+        started = process_start.process_start(owner)
+        assert isinstance(started, process_start.Started)
+        self.update_record(path, command_pid=owner, command_started=started.start + "-previous")
+        with patch.object(os, "getppid", return_value=owner):
+            self.assertEqual(detached_runs.main(["record-exit", str(path), "0"]), 0)
+            self.assertNotIn("exit_code", cast(detached_runs.RunRecord, json.loads(path.read_text())))
+            self.update_record(path, status="finished", command_started=started.start, exit_code=143)
+            saved = path.read_bytes()
+            self.assertEqual(detached_runs.main(["record-exit", str(path), "0"]), 0)
+        self.assertEqual(path.read_bytes(), saved)
+
+    def test_a_nested_command_cannot_publish_the_owners_exit_status(self) -> None:
+        script = self.root / "verify.sh"
+        _ = script.write_text('''#!/bin/bash
+if [ "${1:-}" = nested ]; then
+    "$TEST_PYTHON" "$TEST_DETACHED_SCRIPT" record-exit "$UNIT_DETACHED_RECORD" 0
+    cp "$UNIT_DETACHED_RECORD" "$TEST_NESTED_RECORD"
+    exit 0
+fi
+bash "$0" nested
+"$TEST_PYTHON" "$TEST_DETACHED_SCRIPT" record-exit "$UNIT_DETACHED_RECORD" 143
+cp "$UNIT_DETACHED_RECORD" "$TEST_OWNER_RECORD"
+exit 143
+''')
+        nested, owner = self.root / "nested.json", self.root / "owner.json"
+        checkout = Path(__file__).resolve().parents[2]
+        with patch.dict(os.environ, {
+                "TEST_PYTHON": str(checkout / "scripts/lib/py"),
+                "TEST_DETACHED_SCRIPT": str(checkout / "scripts/agents/detached_runs.py"),
+                "TEST_NESTED_RECORD": str(nested), "TEST_OWNER_RECORD": str(owner)}):
+            record = self.supervise(self.record(["bash", str(script)]))
+        self.assertNotIn("exit_code", cast(detached_runs.RunRecord, json.loads(nested.read_text())))
+        self.assertEqual(json.loads(owner.read_text())["exit_code"], 143)
+        self.assertEqual(record.get("exit_code"), 143)
+
+    def test_orphan_reaping_waits_for_live_group_members_and_ignores_zombies(self) -> None:
+        path = self.record(["bash", "verify.sh"])
+        self.update_record(path, pid=DEAD_PID, supervisor_started="fixture-start")
+        _ = self.stack.enter_context(patch.object(process_start, "process_start",
+                                                 return_value=process_start.Zombie("fixture-start")))
+        listing = subprocess.CompletedProcess(["ps"], 0, f"{DEAD_PID} S\n", "")
+        with patch.object(subprocess, "run", return_value=listing):
+            self.assertEqual(detached_runs.reap_orphans(str(self.session)), [])
+        self.assertEqual(self.pending(), {})
+        self.assertEqual(json.loads(path.read_text())["status"], "running")
+        listing = subprocess.CompletedProcess(["ps"], 0, f"{DEAD_PID} Z\n", "")
+        with patch.object(subprocess, "run", return_value=listing):
+            self.assertEqual(detached_runs.reap_orphans(str(self.session)), ["r1"])
+        self.assertEqual(json.loads(path.read_text())["status"], "finished")
+
+    def test_orphan_reaping_keeps_the_run_pending_when_the_group_is_unreadable(self) -> None:
+        path = self.record(["bash", "verify.sh"])
+        self.update_record(path, pid=DEAD_PID, supervisor_started="fixture-start")
+        _ = self.stack.enter_context(patch.object(process_start, "process_start",
+                                                 return_value=process_start.Zombie("fixture-start")))
+        with patch.object(subprocess, "run", side_effect=OSError("unreadable process table")):
+            self.assertEqual(detached_runs.reap_orphans(str(self.session)), [])
+        self.assertEqual(self.pending(), {})
+        self.assertEqual(json.loads(path.read_text())["status"], "running")
+
+    def test_orphan_reaping_waits_for_a_command_in_a_new_session(self) -> None:
+        path = self.record(["bash", "verify.sh"])
+        checkout = Path(__file__).resolve().parents[2]
+        child = subprocess.Popen([
+            sys.executable, "-c",
+            "import os, subprocess, sys; os.setsid(); print('ready', flush=True); "
+            + "sys.stdin.readline(); subprocess.run(sys.argv[1:], check=True); sys.exit(143)",
+            str(checkout / "scripts/lib/py"), str(checkout / "scripts/agents/detached_runs.py"),
+            "record-exit", str(path), "143"], stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+        guard = LauncherHangGuard("command in a new session")
+        self.addCleanup(child.wait, timeout=guard.remaining())
+        self.addCleanup(child.kill)
+        assert child.stdin is not None and child.stdout is not None
+        self.addCleanup(child.stdin.close)
+        self.addCleanup(child.stdout.close)
+        self.assertTrue(select.select([child.stdout], [], [], guard.remaining())[0])
+        self.assertEqual(child.stdout.readline(), "ready\n")
+        started = process_start.process_start(child.pid)
+        assert isinstance(started, process_start.Started)
+        self.update_record(path, pid=DEAD_PID, command_pid=child.pid, command_started=started.start)
+        self.assertNotEqual(os.getpgid(child.pid), DEAD_PID)
+        self.assertEqual(detached_runs.reap_orphans(str(self.session)), [])
+        self.assertEqual(self.pending(), {})
+        self.assertEqual(json.loads(path.read_text())["status"], "running")
+        output, _ = child.communicate("finish\n", timeout=guard.remaining())
+        self.assertEqual(child.returncode, 143, output)
+        self.assertEqual(detached_runs.reap_orphans(str(self.session)), ["r1"])
+        finished = cast(detached_runs.RunRecord, json.loads(path.read_text()))
+        self.assertEqual((finished["status"], finished.get("exit_code")), ("finished", 143))
+        messages = cast(list[str], self.pending()["messages"])
+        self.assertEqual(len(messages), 1)
+        self.assertIn("FAIL (exit 143)", messages[0])
+        self.assertEqual(detached_runs.reap_orphans(str(self.session)), [])
+
+    def test_orphan_reaping_ignores_a_group_without_its_saved_owner(self) -> None:
+        for observed in (process_start.Started("reused-start"), process_start.Gone()):
+            with self.subTest(observed=type(observed).__name__):
+                path = self.record(["bash", "verify.sh"])
+                self.update_record(path, pid=DEAD_PID, supervisor_started="original-start",
+                                   command_pid=DEAD_PID + 1, command_started="original-command-start")
+                listing = subprocess.CompletedProcess(["ps"], 0, f"{DEAD_PID} S\n", "")
+                with (patch.object(process_start, "process_start", return_value=observed),
+                      patch.object(subprocess, "run", return_value=listing) as group_scan):
+                    self.assertEqual(detached_runs.reap_orphans(str(self.session)), ["r1"])
+                    group_scan.assert_not_called()
+                self.assertEqual(json.loads(path.read_text())["status"], "finished")
+                self.assertEqual(detached_runs.reap_orphans(str(self.session)), [])
 
     def test_failure_and_done_message_rules(self) -> None:
         path = self.record([sys.executable, "-c", "raise SystemExit(4)"])
@@ -723,7 +1046,10 @@ sys.exit(1)
             sender_pid = self.root / "sender-pid"
             _ = (startup / "sitecustomize.py").write_text('''
 import os
+import sys
 from pathlib import Path
+import runpy
+runpy.run_path(CHECKOUT_STARTUP, run_name='_delivery_python_startup')["select_checkout"](sys.argv)
 from scripts.message import send
 from scripts.production import staff
 
@@ -733,7 +1059,7 @@ def fake_sender(*arguments, **options):
 
 staff.local_snapshot = staff.initial_snapshot
 send.deliver_worker_text = fake_sender
-''')
+'''.replace("CHECKOUT_STARTUP", repr(str(Path(__file__).resolve().parents[1] / 'lib/python_startup/sitecustomize.py'))))
             path = self.record([sys.executable, "-c", "pass"])
             with (patch.dict(os.environ, {
                     "PYTHONPATH": str(startup) + os.pathsep + os.environ.get("PYTHONPATH", ""),
@@ -1083,6 +1409,31 @@ class PaneRunDeliveryTests(unittest.TestCase):
                 self.assertEqual((caller.session_dir, caller.name, caller.staff_id), (str(self.run_dir), row.name, row.id))
                 with patch.dict(os.environ, {"CODEX_THREAD_ID": row.id}):
                     self.assertIsInstance(detached_runs.caller_from_environment({variable: row.id}), detached_runs.NotDetachedWorker)
+
+    def test_a_unit_director_with_a_run_folder_owns_its_run_and_hears_its_result(self) -> None:
+        director = self.fixture.parent
+        self.assertEqual(director.kind, "unit")
+        runs = self.run_dir / detached_runs.DETACHED_RUNS_DIR
+        with (patch.dict(os.environ, {"CODEX_THREAD_ID": "", "CLAUDE_CODE_SESSION_ID": director.current_session}),
+              patch.object(treekey, "tree_key", return_value="private-tree"),
+              patch.object(subprocess, "Popen", return_value=SimpleNamespace(pid=0)) as spawn,
+              contextlib.redirect_stdout(io.StringIO()) as output):
+            self.assertEqual(detached_runs.main(["start", "--", "private-land"]), detached_runs.NOT_A_DETACHED_WORKER)
+            spawn.assert_not_called()
+            self.assertEqual(detached_runs.main(["start", "--session-dir", str(self.run_dir), "--", "private-land"]), 0,
+                             output.getvalue())
+        spawn.assert_called_once()
+        path, = runs.glob("*.json")
+        record = cast(detached_runs.RunRecord, json.loads(path.read_text()))
+        self.assertEqual((record["session_dir"], record["worker"], record["staff_id"]),
+                         (str(self.run_dir), director.name, director.id))
+        write_text_atomic(Path(record["log"]), "Private land completed.\n")
+        self.assertIn("sent", detached_runs.deliver(record, detached_runs.CompletedCommand(0)))
+        self.assertEqual(self.inputs, [])
+        target, text = self.notices[-1]
+        self.assertEqual((len(self.notices), target), (1, director.id))
+        self.assertIn(f"Detached run: {record['run_id']}", text)
+        self.assertIn("Private land completed.", text)
 
     def test_a_pane_workers_run_keeps_its_owner_when_options_name_another_worker(self) -> None:
         row = self.fixture.worker("TEST-command-owner", family="codex")

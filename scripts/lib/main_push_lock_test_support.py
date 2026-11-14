@@ -30,7 +30,7 @@ def observe(file, operation):
 fcntl.flock = observe
 ''')
     return {**environment, "MAIN_PUSH_TEST_ATTEMPT": str(root / "attempted"),
-            "PYTHONPATH": str(root) + os.pathsep + str(Path(__file__).resolve().parents[2])
+            "PYTHONPATH": str(Path(__file__).resolve().parent / "python_startup") + os.pathsep + str(root)
             + os.pathsep + environment.get("PYTHONPATH", "")}
 
 

@@ -86,6 +86,13 @@ class PromptSource(Enum):
 
 
 @dataclass(frozen=True)
+class ScheduledTaskPrompt:
+    id: str
+    prompt: str
+    recurring: bool
+
+
+@dataclass(frozen=True)
 class Replying:
     user_wrote_at: int
 
@@ -304,7 +311,15 @@ def scheduled_senders() -> frozenset[str]:
     return frozenset(senders)
 
 
-def record_scheduled_prompts(session_id: str, prompts: tuple[str, ...]) -> None:
+def record_scheduled_prompts(session_id: str, prompts: tuple[ScheduledTaskPrompt, ...]) -> None:
+    """Retain missing one-shot tasks until their prompts arrive."""
+    current_ids = {task.id for task in prompts}
+    pending = tuple(task for task in read_scheduled_task_prompts(session_id)
+                    if not task.recurring and task.id not in current_ids)
+    write_scheduled_task_prompts(session_id, prompts + pending)
+
+
+def write_scheduled_task_prompts(session_id: str, prompts: tuple[ScheduledTaskPrompt, ...]) -> None:
     destination = scheduled_prompts_path(session_id)
     if not prompts:
         destination.unlink(missing_ok=True)
@@ -320,7 +335,8 @@ def record_scheduled_prompts(session_id: str, prompts: tuple[str, ...]) -> None:
             delete=False,
             encoding="utf-8",
         ) as temporary:
-            json.dump(list(prompts), temporary)
+            json.dump([{"id": task.id, "prompt": task.prompt, "recurring": task.recurring}
+                       for task in prompts], temporary)
             _ = temporary.write("\n")
             temporary.flush()
             os.fsync(temporary.fileno())
@@ -332,7 +348,7 @@ def record_scheduled_prompts(session_id: str, prompts: tuple[str, ...]) -> None:
             temporary_path.unlink(missing_ok=True)
 
 
-def read_scheduled_prompts(session_id: str) -> tuple[str, ...]:
+def read_scheduled_task_prompts(session_id: str) -> tuple[ScheduledTaskPrompt, ...]:
     try:
         raw = cast(object, json.loads(
             scheduled_prompts_path(session_id).read_text(encoding="utf-8")
@@ -342,22 +358,53 @@ def read_scheduled_prompts(session_id: str) -> tuple[str, ...]:
     if not isinstance(raw, list):
         return ()
     items = cast(list[object], raw)
-    if not all(isinstance(item, str) for item in items):
-        return ()
-    return tuple(cast(list[str], items))
+    prompts: list[ScheduledTaskPrompt] = []
+    for item in items:
+        if not isinstance(item, dict):
+            return ()
+        fields = cast(dict[str, object], item)
+        task_id, prompt, recurring = fields.get("id"), fields.get("prompt"), fields.get("recurring")
+        if not isinstance(task_id, str) or not isinstance(prompt, str) or not isinstance(recurring, bool):
+            return ()
+        prompts.append(ScheduledTaskPrompt(task_id, prompt, recurring))
+    return tuple(prompts)
 
 
-def _is_recorded_scheduled_prompt(prompt: str, recorded: tuple[str, ...]) -> bool:
+def read_scheduled_prompts(session_id: str) -> tuple[str, ...]:
+    return tuple(task.prompt for task in read_scheduled_task_prompts(session_id))
+
+
+def consume_scheduled_prompt(session_id: str, prompt: str) -> None:
+    """Prefer exact matches. Retain recurring tasks and consume one-shot tasks."""
+    prompts = read_scheduled_task_prompts(session_id)
+    for allow_prefix in (False, True):
+        matched_recurring = False
+        for index, task in enumerate(prompts):
+            if not _is_recorded_scheduled_prompt(
+                prompt, (task.prompt,), allow_prefix=allow_prefix,
+            ):
+                continue
+            if task.recurring:
+                matched_recurring = True
+                continue
+            write_scheduled_task_prompts(session_id, prompts[:index] + prompts[index + 1:])
+            return
+        if matched_recurring:
+            return
+
+
+def _is_recorded_scheduled_prompt(prompt: str, recorded: tuple[str, ...], *, allow_prefix: bool = True) -> bool:
     prompt = prompt.strip()
     for scheduled in recorded:
         scheduled = scheduled.strip()
         if prompt == scheduled:
             return True
-        marker = CLIPPED_PROMPT_MARKER.search(scheduled)
-        if marker is not None:
-            prefix = scheduled[:marker.start()]
-            if prefix and prompt.startswith(prefix):
-                return True
+        if allow_prefix:
+            marker = CLIPPED_PROMPT_MARKER.search(scheduled)
+            if marker is not None:
+                prefix = scheduled[:marker.start()]
+                if prefix and prompt.startswith(prefix):
+                    return True
     return False
 
 

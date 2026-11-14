@@ -10,7 +10,8 @@ description: Read agent message rules and delivery.
 - **A held message is not delivered.** A session in a different permission mode holds a message for its user's approval, and a `[Cross-session delivery notice]` says so. Count a held or refused message as not delivered. Send it again with `send.py` and read the outcome line.
 - **Everything else: `send.py`.** Use `~/.claude/scripts/lib/py ~/.claude/scripts/message/send.py` (usage in its docstring) for a peer on the other machine, a Codex worker, morty and every script or hook. A `Remote Control` row is on another machine. Do not use `SendMessage` for it: Remote Control gives no delivery report.
   `send.py` delivers by session name and keeps what does not arrive under the recipient's session id, so a rename loses nothing (`send.py pending` prints and clears what is kept for your own session, whatever it is called now). It reaches a Codex worker by its `worker:` address or worker name.
-  For the other machine pass `--machine` (`mac` from natedev, `natedev` from the Mac). A name resolves on this machine first, so a same-name local session gets the message without `--machine`.
+  A `session:`, `codex:`, or staff address finds its machine without `--machine`.
+  A name resolves on this machine first, then on the other machine.
   For Claude recipients, `send.py` tries the running postmaster session first and relays otherwise.
 - **The first line stands alone.** It is the recipient's preview and the inbox log entry. If it would open mid-thought or with a bare name, open with `Message from <your name>: <gist>`.
 - **Carry the context.** The recipient shares no memory with you: name the repo, worktree, branch, paths, commit or test. No tokens or secrets.
@@ -24,7 +25,7 @@ description: Read agent message rules and delivery.
 - Send to a roster address with `send.py --to <address> --from "<your session name>" --text "<message>"`.
   Use `session:<id>` for Claude, `worker:<unit>/<short name>` for staff workers, or `codex:<thread id>` for Codex daemon sessions.
   A unique name also works.
-  Resolution tries this machine first, then the other; `--machine HOST` selects that host.
+  Addresses find their machine without `--machine`.
   A `uds:<path>` always selects this machine's socket.
 - For many at once, run `~/.claude/scripts/lib/py ~/.claude/scripts/production/broadcast.py --from "<your session name>" --all "<message>"`. Groups are `--showrunners`, `--units` (unit directors), `--agents` (workers and freestanding Claude/Codex sessions), `--workers`, `--top-level` (Claude sessions except workers and unit directors under a showrunner), and `--all` (every role). Put `--of <unit, director name, or session: address>` before `--workers` for one unit. Each recipient gets the last selecting flag's text once. The sender is excluded by `CODEX_THREAD_ID`, else `CLAUDE_CODE_SESSION_ID`.
 
@@ -56,7 +57,10 @@ Filing a question alone never sends a push.
 - `send.py: <name> matches <N> sessions:` (exit 2) lists their addresses; send again with one listed address.
 - `send.py: no roster session has address <address>` returns exit 2; read the roster again.
 - `FAILED: <why>` (exit 3): report the failure. Repair the registered send before another attempt.
-- `send.py: absence of <name> here is not proven; use an address or --machine` (exit 2): this machine's roster had problems, so the other machine was not asked and nothing was sent; send again with an address or `--machine HOST`.
+- `send.py: absence of <name> here is not proven; use an address or --machine` (exit 2): this machine's roster had problems.
+  The command did not ask the other machine or send the message.
+  Send again with an address, or select the other machine with `--machine HOST` for a name there.
+  `HOST` accepts the SSH alias or a configured host name, including the roster's machine value.
 - With `--machine HOST`, recipient refusals and ambiguous-name errors there return as `FAILED: ssh <host>: <reason>` (exit 3); recover from the reason as for that refusal here.
 - `broadcast: <unit> matches more than one unit director:` (exit 2) lists addresses, including matches across machines; nothing was delivered. Send again with `--of <one listed address>` before `--workers`.
 

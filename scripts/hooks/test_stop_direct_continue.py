@@ -103,6 +103,19 @@ class DirectorStopTests(unittest.TestCase):
                 self.assertIn(f"/unit:{unit_type} run active", result.stderr)
                 self.assertIn(f"commands/unit/{unit_type}.md", result.stderr)
 
+    def test_merge_gate_with_no_open_order_phase_stops_without_a_wake(self) -> None:
+        with director_stop_fixture() as fixture:
+            document = cast(dict[str, object], json.loads(fixture.staff_file.read_text()))
+            rows = cast(list[dict[str, object]], document["rows"])
+            rows[0].update(kind="unit", unit_type="merge")
+            _ = fixture.staff_file.write_text(json.dumps(document))
+            state_path = fixture.run / "progress_history_state.json"
+            state = cast(dict[str, object], json.loads(state_path.read_text()))
+            state["phase"] = {"id": "1", "instance_id": "fixture-phase", "status": "completed"}
+            _ = state_path.write_text(json.dumps(state))
+            self.assert_allowed(fixture.call(last_assistant_message="— holding: queue empty"))
+            self.assertFalse((fixture.run / "compaction_wake_line").exists())
+
     def assert_blocked(self, result: subprocess.CompletedProcess[str]) -> None:
         self.assertEqual((result.returncode, result.stdout), (2, ""))
         self.assertIn(

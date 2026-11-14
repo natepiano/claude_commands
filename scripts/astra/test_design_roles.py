@@ -387,7 +387,7 @@ class HeldRolePaneTests(HeldRolePaneCase):
             "--role", "implement", "--target", "durable-design-role", "--policy", "astra-designer",
             "--parent", str(self.panes.command_case.fixture.parent.id), "--to", instance.name,
             "--session-dir", str(self.panes.command_case.run_dir), "--phase", "8",
-            "--prompt", str(self.panes.command_case.prompt), "--summary", str(reply),
+            "--prompt", str(self.panes.command_case.prompt), "--reply-file", str(reply),
             "--cwd", str(self.panes.root),
         ])
         self.assertEqual(result.returncode, 0, result.stderr)

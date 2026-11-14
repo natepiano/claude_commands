@@ -146,10 +146,8 @@ class GitRunner:
     def run_bytes(self, repo: Path, *arguments: str, input: bytes | None = None,
                   environment: dict[str, str] | None = None) -> subprocess.CompletedProcess[bytes]:
         # Always read mutable refs and ancestry again.
-        immutable = (len(arguments) == 3 and arguments[:2] in (("cat-file", "blob"), ("cat-file", "-e"))
-                     and re.fullmatch(r"[0-9a-f]{40}(?:[0-9a-f]{24})?(?:\^\{commit\})?", arguments[2]) is not None
-                     or len(arguments) == 5 and arguments[:2] == ("ls-tree", "-z")
-                     and re.fullmatch(r"[0-9a-f]{40}(?:[0-9a-f]{24})?", arguments[2]) is not None)
+        immutable = (len(arguments) == 3 and arguments[:2] == ("cat-file", "-e")
+                     and re.fullmatch(r"[0-9a-f]{40}(?:[0-9a-f]{24})?\^\{commit\}", arguments[2]) is not None)
         cacheable = self._cache_objects and immutable and environment is None and input is None
         key = (repo, arguments)
         if cacheable and key in self._objects:
@@ -244,13 +242,12 @@ def patch_counts(runner: GitRunner, repo: Path, patch: bytes) -> list[tuple[str,
     return counts
 
 
-def check_size(runner: GitRunner, repo: Path, paths: list[str], patch: bytes, config: FastTrackLimits) -> None:
-    counts = patch_counts(runner, repo, patch)
+def check_size(runner: GitRunner, repo: Path, counts: list[tuple[str, int, int]], config: FastTrackLimits) -> None:
     if sum(added + removed for _, added, removed in counts) > config.max_changed_lines:
         raise Refused("max_changed_lines exceeded")
     if len(counts) > config.max_files:
         raise Refused("max_files exceeded")
-    check_paths(runner, repo, paths, config)
+    check_paths(runner, repo, [path for path, _, _ in counts], config)
 
 
 def refused_path(path: str, config: FastTrackLimits) -> bool:
@@ -461,7 +458,6 @@ def fast_check(runner: GitRunner, repo: Path, paths: list[str], config: FastTrac
             modules.update(p.relative_to(repo) for p in (repo / path.parent).glob(pattern))
     environment = {key: value for key, value in os.environ.items()
                    if key not in ("PYTHONUNBUFFERED", "REFUSAL_WATCH_INVENTORY", "STAFF_OPERATION_FD")}
-    environment["HERDR_BIN"] = "/nonexistent/herdr"
     with build_folders.temporary_build_folder(build_folders.UniqueBuildFolder(prefix=build_folders.FOLDER_PREFIXES["fast-track-check"])) as temporary:
         for number, module in enumerate(sorted(modules)):
             root = temporary / str(number)
@@ -483,8 +479,11 @@ def fast_check(runner: GitRunner, repo: Path, paths: list[str], config: FastTrac
 
 
 def drop_recovery_refs(runner: GitRunner, repo: Path, prefix: str) -> None:
-    commands = "".join(f"delete {prefix}/{name}\n" for name in ("head", "index", "worktree", "commit"))
-    _ = runner.git(repo, "update-ref", "--stdin", input=commands.encode())
+    _ = runner.git(repo, "update-ref", "--stdin", input=recovery_ref_deletes(prefix).encode())
+
+
+def recovery_ref_deletes(prefix: str) -> str:
+    return "".join(f"delete {prefix}/{name}\n" for name in ("head", "index", "worktree", "commit"))
 
 
 @contextmanager
@@ -493,9 +492,9 @@ def select_patch(runner: GitRunner, repo: Path, paths: list[str]) -> Generator[S
     prefix = f"refs/fast-track/selections/{uuid4().hex}"
     try:
         head = runner.git(repo, "rev-parse", "HEAD").strip()
-        _ = runner.git(repo, "update-ref", prefix + "/head", head)
         index = runner.git(repo, "write-tree").strip()
-        _ = runner.git(repo, "update-ref", prefix + "/index", index)
+        commands = f"update {prefix}/head {head}\nupdate {prefix}/index {index}\n"
+        _ = runner.git(repo, "update-ref", "--stdin", input=commands.encode())
         patch = patch_for(runner, repo, paths)
         if runner.git(repo, "rev-parse", "HEAD").strip() != head:
             raise Refused("HEAD changed while selecting the patch; retry the command")
@@ -520,7 +519,9 @@ def prepare_attempt(runner: GitRunner, repo: Path, row: PushRecord, selection: S
     path = state_file().parent / "attempts" / (hashlib.sha256(identity).hexdigest() + ".json")
     with record_lock():
         # Retrying this candidate must retain its original restore snapshot.
-        if not path.exists():
+        new = not path.exists()
+        commands = ""
+        if new:
             prefix = f"refs/fast-track/attempts/{path.stem}"
             # Retain the candidate before the attempt becomes durable.
             _ = runner.git(repo, "fetch", "--no-tags", str(candidate_source),
@@ -528,25 +529,37 @@ def prepare_attempt(runner: GitRunner, repo: Path, row: PushRecord, selection: S
             snapshots = (("head", selection.worktree_head), ("index", selection.index_tree),
                          ("worktree", selection.worktree_tree))
             commands = "".join(f"update {prefix}/{name} {target}\n" for name, target in snapshots)
-            _ = runner.git(repo, "update-ref", "--stdin", input=commands.encode())
+        # The attempt refs take over from the selection refs in one transaction.
+        commands += recovery_ref_deletes(selection.recovery_ref_prefix)
+        _ = runner.git(repo, "update-ref", "--stdin", input=commands.encode())
+        if new:
             attempt = PushAttempt(restore=intent, base=base, production=production,
                                   publication="prepared", restored=False, restore_closed="", promoted=False)
             save_attempt(path, attempt)
-        drop_recovery_refs(runner, repo, selection.recovery_ref_prefix)
     return path
 
 
-def file_at(runner: GitRunner, repo: Path, tree: str, path: str) -> FileState:
-    entry = runner.git(repo, "ls-tree", "-z", tree, "--", path).split("\0", 1)[0]
-    if not entry:
-        return FileState()
-    mode, kind, blob = entry.split("\t", 1)[0].split()
-    if kind == "tree":
-        return FileState(mode)
-    result = runner.run_bytes(repo, "cat-file", "blob", blob)
+def files_at(runner: GitRunner, repo: Path, trees: list[str], paths: list[str]) -> dict[tuple[str, str], FileState]:
+    """Read each path in each tree with one Git process."""
+    names = [(tree, path) for tree in dict.fromkeys(trees) for path in paths]
+    request = b"".join(os.fsencode(f"{tree}:{path}") + b"\0" for tree, path in names)
+    result = runner.run_bytes(repo, "cat-file", "--batch=%(objectmode) %(objecttype) %(objectsize)", "-z", input=request)
     if result.returncode:
         raise Refused(result.stderr.decode(errors="replace"))
-    return FileState(mode, result.stdout)
+    output, offset = result.stdout, 0
+    states: dict[tuple[str, str], FileState] = {}
+    for name in names:
+        end = output.index(b"\n", offset)
+        header, offset = output[offset:end], end + 1
+        if header.endswith(b" missing"):
+            states[name] = FileState()
+            continue
+        mode, kind, size = header.decode().split()
+        content, offset = output[offset:offset + int(size)], offset + int(size) + 1
+        if kind not in ("tree", "blob"):
+            raise Refused(f"cannot restore {kind} entry {name[1]}")
+        states[name] = FileState(mode) if kind == "tree" else FileState(mode, content)
+    return states
 
 
 def worktree_file(path: Path) -> FileState:
@@ -570,14 +583,15 @@ def restore_prepared(runner: GitRunner, repo: Path, intent: PushIntent) -> None:
     index = runner.git(repo, "write-tree").strip()
     restore: list[str] = []
     remove: list[str] = []
+    states = files_at(runner, repo, [head, intent["worktree_tree"], index, intent["index_tree"]], row["paths"])
     # Validate the whole restore before changing a path. A prior stop may have
     # restored any subset; a later edit must stay in both the index and worktree.
     for path in row["paths"]:
-        baseline = file_at(runner, repo, head, path)
-        published = file_at(runner, repo, intent["worktree_tree"], path)
+        baseline = states[head, path]
+        published = states[intent["worktree_tree"], path]
         current = worktree_file(repo / path)
-        staged = file_at(runner, repo, index, path)
-        original_index = file_at(runner, repo, intent["index_tree"], path)
+        staged = states[index, path]
+        original_index = states[intent["index_tree"], path]
         allowed_worktree = (baseline, published, FileState()) if baseline.mode == "040000" else (baseline, published)
         if current not in allowed_worktree or staged not in (baseline, published, original_index):
             raise PublishedFailure(f"pushed patch, but {path} changed; kept worktree edits")
@@ -730,6 +744,21 @@ def promote(runner: GitRunner, production: str, repo: Path, commit: str, unit: s
         raise PublishedFailure(str(error)) from error
 
 
+def commit_identity(runner: GitRunner, repo: Path) -> list[str]:
+    """Read the checkout's author name and email with one Git process, as options for the copy's commit."""
+    result = runner.run(repo, "config", "--get-regexp", r"^user\.(name|email)$")
+    if result.returncode not in (0, 1):
+        raise Refused(failure_detail(result))
+    # The last value wins, as with `git config --get`.
+    values = dict(line.split(" ", 1) for line in result.stdout.splitlines() if " " in line)
+    options: list[str] = []
+    for key in ("user.name", "user.email"):
+        if not values.get(key, "").strip():
+            raise Refused(f"git config {key} is not set")
+        options += ["-c", f"{key}={values[key].strip()}"]
+    return options
+
+
 def push_patch(runner: GitRunner, repo: Path, production: str, unit: str, why: str, paths: list[str],
                selection: SelectedPatch, config: FastTrackLimits, settings_read: conf.ConfigRead) -> str:
     patch = selection.patch
@@ -738,9 +767,7 @@ def push_patch(runner: GitRunner, repo: Path, production: str, unit: str, why: s
         fetch_main(runner, repo, settings_read)
         with copies.standing(copies.source_owner(repo), repo, copies.CommittedSource("origin/main")) as copy:
             _ = runner.git(copy, "remote", "set-url", "origin", runner.git(repo, "remote", "get-url", "origin").strip())
-            for key in ("user.name", "user.email"):
-                value = runner.git(repo, "config", "--get", key).strip()
-                _ = runner.git(copy, "config", key, value)
+            identity = commit_identity(runner, repo)
             patch_file = temporary / "fix.patch"
             _ = patch_file.write_bytes(patch)
             for _attempt in range(config.max_push_attempts):
@@ -751,7 +778,7 @@ def push_patch(runner: GitRunner, repo: Path, production: str, unit: str, why: s
                 _ = runner.git(copy, "clean", "-ffdq")
                 _ = runner.git(copy, "apply", "--3way", str(patch_file))
                 fast_check(runner, copy, paths, config)
-                _ = runner.git(copy, "commit", "-m", f"fast-track({unit}): {why}\n\nFast-Track: {unit}")
+                _ = runner.git(copy, *identity, "commit", "-m", f"fast-track({unit}): {why}\n\nFast-Track: {unit}")
                 commit = runner.git(copy, "rev-parse", "HEAD").strip()
                 row = PushRecord(patch_sha256=digest, unit=unit, commit=commit, why=why,
                                  time=datetime.now(UTC).isoformat(), review="pending", repo=str(repo),
@@ -823,8 +850,9 @@ def main(argv: list[str] | None = None) -> int:
                 return 0
             if not patch:
                 raise Refused("no change")
-            paths = [path for path, _, _ in patch_counts(runner, repo, patch)]
-            check_size(runner, repo, paths, patch, config)
+            counts = patch_counts(runner, repo, patch)
+            paths = [path for path, _, _ in counts]
+            check_size(runner, repo, counts, config)
             commit = push_patch(runner, repo, args.production, args.unit, args.why.strip(), paths, selection, config, settings_read)
         print(f"fast-track {args.unit} pushed main at {commit[:12]}")
         return 0

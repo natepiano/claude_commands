@@ -24,7 +24,7 @@ For `**Kind:** style`, that procedure takes precedence over `commands/showrunner
 | `scripts/style/style_rules.py` | Frontmatter reading, `NATE_STYLE_DIR`, `HISTORY_DIR`, `Unit`, `focused-eval` CLI |
 | `scripts/style/candidate_generators.py` | `CandidatesSpec`, 15 generator kinds, `enumerate_candidates` (no cap) |
 | `scripts/style/style_ledger.py` | The ledger: cells, judgments, lint runs, tickets, hand-offs, held findings, declaration follow, CLI |
-| `scripts/style/finding_sites.py` | Site evidence for an open finding after its file changed: `UnchangedSite`, `NeedsJudgment`; cached source, item and owner indexes per blob |
+| `scripts/style/finding_sites.py` | Site evidence: `UnchangedSite`, `NeedsJudgment`; source lines per blob; parsed indexes remain live during their source work |
 | `scripts/style/style_plan.py` | Refill (`next-phase`), publication coordinator (`checkpoint`), ticket gate (`gate`), `queue`, ticket selection, phase text |
 | `scripts/style/style_config.py` | `Style units` reader, family ownership, ticket capacity and merge route |
 | `scripts/style/mechanical_classes.toml`, `mechanical_classes.py` | The classes of change a unit applies without the user (`pure-move`, `stale-allow-lint`, `binding-rename`): name, proof, rules, summary; the loader `classes()` and `explained_files` |
@@ -138,7 +138,7 @@ A version that the script does not support raises `CheckCouldNotRun`. Current ta
 
 **Read files.** `record --reads <path> [<path> ...]` names the other files a rule-scope verdict rests on. The ledger accepts it only with `--input-scope rule`, a verdict in `SCOPED_VERDICTS` (`clean`, `exception`, `held`), and a crate or module cell of an included Rust file. It normalizes each path like `--path`, then sorts the paths and removes duplicates; the cell's own path changes nothing. A judgment has one of two shapes: `ReadFiles(paths)` (an empty tuple is refused) or `NoReadFiles` (`NO_READ_FILES`). `Judgment` and `TicketJudgment` carry it in `reads`. `_read_fingerprint(tip, path, reads)` is SHA-256 over the sorted `(path, blob)` pairs of the cell file plus the read files, from `tip.blobs`. `record` stores this digest as the judgment's `input_fingerprint`, and refuses a path with no file at the commit (`<path>: no file at <commit>`). Without `--reads`, a rule-scope verdict uses the whole crate or module fingerprint, so the cell comes back after any change in its crate or module. The ticket text tells a unit to use `--input-scope rule --reads <files>`, and tells it that a cell without `--reads` comes back after any change in its crate or module.
 
-**Input comparison.** `_judgment_inputs_match(row, tip, scope, path, family)` is the one comparison of a judgment with a tip. A judgment with reads compares only by `_read_fingerprint` at the checked tip, and a read file that is missing at the tip is a mismatch. A judgment without reads compares its declared scope's fingerprint (`_comparison_scope`). When the fingerprints differ and `family` is `modules`, `_only_comments_changed` compares the `TreeEntry(mode, kind, object)` maps at the judged commit and at the tip (`Ledger._scope_inputs` over `_inputs`, or `_read_inputs` for a judgment with reads; `RepositoryTip.entries` holds every `ls-tree -r` entry, submodules included, read once per commit): the same paths, and each changed entry is a `.rs` regular file (`REGULAR_FILE_MODES`) with the same mode at both commits and an equal `RustCode`. `RustCode` is the code tokens from `style_footprint.tokens` plus each `//!` and `/*!` doc keyed by the count of code tokens before it, so a doc that moves to another `mod` block differs. A changed mode, a changed submodule, a changed non-`.rs` blob, a blob that is not UTF-8 or that `token_spans` cannot place (`NotTokenized`), and a fingerprint change with no changed entry do not match. `Ledger._rust_code` reads each blob once. Callers pass the rule's family (`Cell.family` in `style_merge_changes`). Current state, awaiting merge, `_repeated_judgments`, `judged_at_base` and the decline cell check all go through it.
+**Input comparison.** `_judgment_inputs_match(row, tip, scope, path, family)` is the one comparison of a judgment with a tip. A judgment with reads compares only by `_read_fingerprint` at the checked tip, and a read file that is missing at the tip is a mismatch. A judgment without reads compares its declared scope's fingerprint (`_comparison_scope`). When the fingerprints differ and `family` is `modules`, `_only_comments_changed` compares the `TreeEntry(mode, kind, object)` maps at the judged commit and at the tip (`Ledger._scope_inputs` over `_inputs`, or `_read_inputs` for a judgment with reads; `RepositoryTip.entries` holds every `ls-tree -r` entry, submodules included, retained while the commit remains in use): the same paths, and each changed entry is a `.rs` regular file (`REGULAR_FILE_MODES`) with the same mode at both commits and an equal `RustCode`. `RustCode` stores a digest of token values, token kinds, and inner docs at their code positions. Moving an inner doc changes the digest. A changed mode, a changed submodule, a changed non-`.rs` blob, a blob that is not UTF-8 or that `token_spans` cannot place (`NotTokenized`), and a fingerprint change with no changed entry do not match. `Ledger._rust_code` reads each blob once. Callers pass the rule's family (`Cell.family` in `style_merge_changes`). Current state, awaiting merge, `_repeated_judgments`, `judged_at_base` and the decline cell check all go through it.
 
 **Cell state** comes from the newest judgment rows (`ORDER BY recorded_at DESC, id DESC`) whose `rule_blob` equals the rule's current blob and whose declared scope equals the newest row's. "The inputs match" below means `_judgment_inputs_match` is true:
 
@@ -751,8 +751,71 @@ A crate plan saves its fresh judgments (tip anchor, pinned rule blob, finding/so
 
 The declaration reading groups findings by their judged commit and returns outcomes in input order.
 A finding without an anchor has its own group.
-After each historical group, the reading frees that commit's parsed files and the other declaration caches that name the commit.
-It keeps the synced tip's entries and each finding's anchor, follow evidence, and outcome.
+Within each commit group, consecutive findings from one file share a parsed source scope.
+Site proofs and declaration outcomes share one `DeclaredFile` per blob for the declaration step.
+`_parsed_files` and `_declared_blobs` hold explicit references until the step ends.
+Each file retains item metadata, integer line and body offsets, and compressed source bytes.
+A source scope expands source lines only while its findings use them.
+The scope releases expanded lines, body readings, binding readings, site indexes, and diffs.
+The parser reads tokens and offsets once, then releases the global token cache.
+`DeclaredFile` stores compressed token values and kinds beside integer offsets.
+Site proofs and statement reads expand the same token facts within each source scope.
+The scope releases expanded tokens with its source lines.
+`_trait_imports` keeps lexical import scopes, bindings, and blockers for the whole step.
+`_trait_positions` keeps each qualified header's scope.
+`_module_links` keeps each file's plain module declarations.
+`_extern_file_names` shares crate-root extern facts across caller files.
+`_type_header_conditions` keeps each declaration header's conditional status.
+The source batch also supplies `_commit_files`, so declaration reads reuse its bytes.
+Historical commit groups release their file bytes and comparison data when their findings finish.
+The step releases all remaining compact file facts after its final outcome.
+`_declared_files` retains compact item facts across commit groups.
+The current tip retains module facts, extern facts, and file bytes until the step ends.
+Cold judgment comparisons retain commit inventories for later judgments and the declaration step.
+Each commit inventory is built once before the declaration step completes.
+The step releases parsing, compressed sources, file bytes, and inventories after its final outcome.
+It retains anchors, follow evidence, outcomes, current item metadata, and compact comparison results.
+These lifetimes also apply when a declaration read fails.
+
+Schema 42 maintains coverage in `refill_cells`.
+`refill_tables` stores source counters and applied counters.
+`refill_rows` stores the latest version and deletion state for each changed source key.
+An unchanged source row has implicit version zero.
+Insert, update, and delete triggers cover six source tables:
+
+1. `judgments`.
+2. `rule_generations`.
+3. `invalidated_held_judgments`.
+4. `held_cell_corrections`.
+5. `lint_runs`.
+6. `sync`.
+
+The triggers mark dependent cells in the source transaction.
+Python and SQLite use the same unescaped Unicode JSON keys for judgment membership.
+A key change records the old key as deleted and the new key as present.
+Cell dependencies include judgment membership, source rows, generations, scope membership, history, and removal barriers.
+The existing coverage code supplies each cell universe and its order.
+Changed rules, paths, ignores, manifests, and generator sites update that universe.
+Each catalog and execution checkout has a separate projection.
+The `synced` view retains current state, verdict, crate, family, and tier.
+The indexed `refill_cell_counts` view groups those contributions.
+
+`refill_inputs` stores immutable scope comparisons, ancestry results, and exact `RustCode` digests by reader version.
+Scope comparisons include declared scope, explicit reads, family, fingerprints, and both commits.
+The existing judgment code computes each missing result.
+It retains active generations, administrative rule equivalence, removal barriers, and newest-first judgment order.
+The shared comparison does not extend comment-only carry to another family.
+Each observation verifies required Git objects before it uses stored results.
+Dependencies include the manifests, configuration blobs, and recursive trees read to construct historical tips.
+Reader version 2 replaces results with incomplete object dependencies.
+An unchanged cell needs no historical source bytes.
+Publication compares source versions and retains dirty work after an intervening mutation.
+Derived fact writes do not change the connection-local source revision.
+Site readers therefore retain their observed rows across comparison-fact publication.
+Read-only coverage uses the original calculation.
+Only maintained coverage calculations read or write persistent judgment facts.
+Ticket proofs retain their Git reads and create no comparison facts before their source transaction.
+
 The second reading in `follow_declarations` returns the same result when the rows and approvals remain unchanged.
 `run_follow` uses its planned reading directly when no outcome requires a finding write.
 It calls `follow_declarations` only for a move, rename, removal, or `FindingSite` with `UnchangedSite` evidence.
@@ -823,7 +886,9 @@ All follow writes run in one `BEGIN IMMEDIATE` transaction. The write refuses wh
 - Hand-off readers use git ancestry and the recorded checkpoint.
 - No acknowledgment of a hand-off precedes a successful push.
 - `proposal_issue.create` keeps both `_decision_path_state` checks, before and inside the folder lock.
-- Every state reader compares a judgment with a tip through `_judgment_inputs_match`. A judgment with reads compares only by `_read_fingerprint`.
+- Missing judgment comparisons use `_judgment_inputs_match`.
+  Explicit reads retain their named input set.
+  Maintained cells reuse the result only while their source versions and immutable inputs match.
 - Every waive write picks a `WaiveActor` variant and passes it through `_waive_actor_record`. A new actor kind extends `WaiveActor` and `WaiveProvenance`, and `_held` maps it back from `waive_provenance` and `waived_by`. `decline_findings` takes only a `DeclineActor`. `replace_held` replaces only a unit's waive, and an unrecorded waive only with `--person`.
 - Readers count proposals by the approval record, not only the stage. Never write stages on read.
 - `style_footprint.tokens`, `closing` and `attribute_spans` keep their behavior; `declarations.py` and `style_ledger.py` use them.

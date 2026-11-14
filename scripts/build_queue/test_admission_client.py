@@ -35,6 +35,11 @@ from scripts.build_queue.admission_test_support import (
     AdmissionFixture, Exchange, GIB, ScriptedTransport, ScriptSocket, TimedChunk, only_admitted, reply_bytes,
 )
 from scripts.build_queue.queue_fixture import QueueFixture, write_memory_config
+from scripts.build_queue.test_snapshot_codec import service_snapshot
+from scripts.build_queue import placement
+from scripts.build_queue.test_placement import (
+    PlacementFixture, adopt_assignment, assignment_for, placement_request, publish_candidate,
+)
 from scripts.lint.memory_test_support import commit_config_fixture, config_environment
 
 WAIT = wait_reply(records.NeedsMemory(), 1, "head", "free memory")
@@ -47,6 +52,60 @@ def setUpModule() -> None:
 
 
 class ClientTests(unittest.TestCase):
+    def service_wait_record(self) -> tuple[dict[str, object], dict[str, object]]:
+        raw = cast(dict[str, object], json.loads(wire.encode_reply(replace(WAIT, snapshot=service_snapshot()))))
+        snapshot = cast(dict[str, object], cast(dict[str, object], raw["data"])["snapshot"])
+        return raw, snapshot
+
+    def test_unknown_unused_service_variants_keep_the_wait_and_allow_admission(self) -> None:
+        for field in ("job_state", "service_job_state"):
+            with self.subTest(field=field), AdmissionFixture() as fixture:
+                request = fixture.request()
+                raw, snapshot = self.service_wait_record()
+                memory = cast(dict[str, object], cast(list[dict[str, object]], snapshot["running"])[0]["measured"])
+                memory[field] = {"kind": "FutureServiceJob"}
+                transport = self.use_transport(fixture, Exchange((json.dumps(raw) + "\n").encode(), reply_bytes(GRANTED)))
+                waits: list[wire.Wait] = []
+                with redirect_stderr(io.StringIO()) as output:
+                    result = client.admit(request, waits.append, lambda: request)
+                self.assertEqual(result, GRANTED)
+                self.assertEqual(len(waits), 1)
+                measured = waits[0].snapshot.running[0].measured
+                assert isinstance(measured, records.UnownedSliceMemory)
+                self.assertEqual(measured.bytes, 123)
+                self.assertEqual(transport.requests, [request])
+                self.assertNotIn("memory admission check failed", output.getvalue())
+                self.doCleanups()
+
+    def test_unknown_used_wait_variant_keeps_the_named_checker_error(self) -> None:
+        with AdmissionFixture() as fixture:
+            request = fixture.request()
+            raw, snapshot = self.service_wait_record()
+            snapshot["head_reason"] = {"kind": "FutureAdmissionReason"}
+            transport = self.use_transport(fixture, Exchange((json.dumps(raw) + "\n").encode()))
+            with redirect_stderr(io.StringIO()) as output:
+                result = client.admit(request, lambda _wait: None, lambda: request)
+            self.assertEqual(result, wire.Refused("invalid snapshot variant"))
+            self.assertIn("memory admission check failed (invalid snapshot variant); step refused", output.getvalue())
+            self.assertEqual(transport.requests, [request])
+
+    def test_unused_service_variants_do_not_extend_the_silent_queue_deadline(self) -> None:
+        with AdmissionFixture() as fixture:
+            request = fixture.service_request()
+            raw, snapshot = self.service_wait_record()
+            memory = cast(dict[str, object], cast(list[dict[str, object]], snapshot["running"])[0]["measured"])
+            memory["service_job_state"] = {"kind": "FutureServiceJob"}
+            transport = self.use_transport(fixture, Exchange((json.dumps(raw) + "\n").encode(), TimeoutError()))
+            waits: list[wire.Wait] = []
+            with redirect_stderr(io.StringIO()) as output:
+                result = client.service_admit(request, waits.append, wire.AcquisitionTiming(10, 10, 5))
+            self.assertEqual(result, wire.Refused(
+                "build queue unreachable for 5 s; step stopped; cargo token given back"))
+            self.assertEqual(fixture.clock.monotonic(), 5)
+            self.assertEqual(len(waits), 1)
+            self.assertEqual(transport.requests, [request])
+            self.assertNotIn("memory admission check failed", output.getvalue())
+
     def test_history_generation_reads_current_configuration_at_use(self) -> None:
         with AdmissionFixture() as fixture:
             transport = self.use_transport(fixture, Exchange(reply_bytes(wire.BuildHistoryReply(7))))
@@ -170,7 +229,7 @@ class ClientTests(unittest.TestCase):
                 child_environment = dict(os.environ)
                 _ = child_environment.pop("TEST_SENDER_GUARD", None)
                 _ = child_environment.pop("HERDR_BIN", None)
-                child_environment["PYTHONPATH"] = str(Path(__file__).resolve().parents[2])
+                child_environment["PYTHONPATH"] = str(Path(__file__).resolve().parents[1] / "lib/python_startup")
                 message = "The build queue service has not answered. Builds wait."
                 with FakeDaemon(address, receive, repeat=True):
                     result = subprocess.run(command, input=message, text=True, capture_output=True,
@@ -1245,6 +1304,90 @@ class ClientTests(unittest.TestCase):
                     self.assertEqual(client.main(), 2)
                 self.assertIn("admission service unavailable: no socket", output.getvalue())
                 self.doCleanups()
+
+    def placement_control_query(self, fixture: PlacementFixture, operation: str
+                                ) -> tuple[wire.Request, Callable[[], object], wire.Reply]:
+        submitted = placement_request(fixture)
+        evidence = publish_candidate(fixture, submitted)
+        self.assertEqual(evidence.key, fixture.server.host_evidence_key(submitted, submitted.constraints.candidates[0].destination))
+        assigned = assignment_for(fixture, submitted)
+        claim = adopt_assignment(fixture, submitted, assigned)
+        request: wire.Request
+        query: Callable[[], object]
+        if operation == "placement":
+            request = submitted
+            query = lambda: client.request_placement(submitted)
+        elif operation == "claim":
+            failure = wire.ClaimFailure("failed-claim", assigned, "busy")
+            request = failure
+            query = lambda: client.claim_failure(failure)
+        elif operation == "permission":
+            permission = wire.ConsumePermission("launch-permission", assigned, claim)
+            request = permission
+            query = lambda: client.consume_permission(permission)
+        elif operation == "execution":
+            execution = wire.ExecutionReport("finished-step", assigned, claim, placement.ExecutionNotStarted())
+            request = execution
+            query = lambda: client.report_execution(execution)
+        else:
+            raise AssertionError(f"unknown placement operation: {operation}")
+        expected, = fixture.server.handle_request(request)
+        return request, query, expected
+
+    def test_placement_requests_wait_for_slow_answers_and_refuse_dead_services(self) -> None:
+        for operation in ("placement", "claim", "permission", "execution"):
+            for service_state in ("slow", "missing", "refused"):
+                with self.subTest(operation=operation, service=service_state), PlacementFixture() as fixture:
+                    fixture.configure(silence_seconds=1)
+                    request, query, expected = self.placement_control_query(fixture, operation)
+                    response = (Exchange(TimeoutError(), reply_bytes(expected)) if service_state == "slow" else
+                                Exchange(connect_error=FileNotFoundError()) if service_state == "missing" else
+                                Exchange(connect_error=ConnectionRefusedError()))
+                    transport = self.use_transport(fixture, response)
+                    with redirect_stderr(io.StringIO()) as errors:
+                        if service_state == "slow":
+                            self.assertEqual(query(), expected)
+                            self.assertEqual(fixture.clock.monotonic(), 1)
+                            self.assertIn("admission service not answering", errors.getvalue())
+                            self.assertEqual(transport.requests, [replace(request,
+                                code_version=client.LOADED_ADMISSION_CODE_VERSION)])
+                        else:
+                            with self.assertRaises(wire.AdmissionUnavailable) as error:
+                                result = query()
+                                self.fail(f"dead service returned {result!r}")
+                            self.assertEqual(error.exception.reason,
+                                "no socket" if service_state == "missing" else "connect refused")
+                            self.assertEqual(fixture.clock.monotonic(), 0)
+                            self.assertFalse(transport.requests)
+                    self.assertEqual(len(transport.attempts), 1)
+                    self.assertFalse(fixture.clock.sleeps)
+                    self.doCleanups()
+
+    def test_placement_requests_bound_silence_and_repeated_resets_at_the_unreachable_limit(self) -> None:
+        for operation in ("placement", "claim", "permission", "execution"):
+            for failure in ("silence", "resets"):
+                for limit in (3, 60):
+                    with self.subTest(operation=operation, failure=failure, limit=limit), PlacementFixture() as fixture:
+                        fixture.configure(unreachable_limit_seconds=limit)
+                        request, query, expected = self.placement_control_query(fixture, operation)
+                        self.assertNotIsInstance(expected, wire.Refused)
+                        exchanges = ([Exchange(TimeoutError())] if failure == "silence" else
+                                     [Exchange(TimedChunk(1, b'{"kind":'), event)
+                                      for event in [ConnectionResetError(errno.ECONNRESET, "reset")] * limit])
+                        transport = self.use_transport(fixture, *exchanges)
+                        with redirect_stderr(io.StringIO()) as errors, self.assertRaises(wire.AdmissionUnavailable) as error:
+                            result = query()
+                            self.fail(f"unreachable service returned {result!r}")
+                        self.assertEqual(fixture.clock.monotonic(), limit)
+                        duration = "1 min" if limit == 60 else f"{limit} s"
+                        self.assertEqual(error.exception.reason,
+                            f"build queue unreachable for {duration}; step stopped; cargo token given back")
+                        self.assertIn(error.exception.reason, errors.getvalue())
+                        self.assertEqual(len(transport.attempts), len(exchanges))
+                        self.assertEqual(transport.requests, [replace(request,
+                            code_version=client.LOADED_ADMISSION_CODE_VERSION)] * len(exchanges))
+                        self.assertFalse(fixture.clock.sleeps)
+                        self.doCleanups()
 
     def test_query_timeout_uses_configuration_for_the_complete_reply(self) -> None:
         with AdmissionFixture() as fixture:

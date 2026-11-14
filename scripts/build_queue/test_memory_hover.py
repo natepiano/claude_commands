@@ -3,6 +3,7 @@ from __future__ import annotations
 from scripts.build_queue import admission_records
 
 import json
+from html.parser import HTMLParser
 from pathlib import Path
 import shutil
 import subprocess
@@ -20,6 +21,110 @@ GIB = admission_records.GIB
 
 
 class MemoryHoverTests(unittest.TestCase):
+    def test_builds_page_has_no_navigation_or_framing_restriction(self) -> None:
+        page = Path(memory_feed.__file__).with_name("memory_live.html").read_text()
+        self.assertIn("<title>Builds</title>", page)
+        self.assertIn("<h1>Builds</h1>", page)
+        elements: list[tuple[str, dict[str, str]]] = []
+
+        def collect(tag: str, attrs: list[tuple[str, str | None]]) -> None:
+            elements.append((tag, {key: value or "" for key, value in attrs}))
+
+        parser = HTMLParser()
+        parser.handle_starttag = collect
+        parser.feed(page)
+        self.assertNotIn("nav", [element[0] for element in elements])
+        for tag, attributes in elements:
+            if tag == "a" and not attributes.get("href", "").startswith("#"):
+                self.assertEqual(attributes.get("target"), "_top")
+            if tag == "meta":
+                self.assertNotEqual(attributes.get("http-equiv", "").lower(), "x-frame-options")
+                self.assertNotIn("frame-ancestors 'none'", attributes.get("content", "").lower())
+
+    def test_time_cells_use_short_times_without_a_wait_prefix(self) -> None:
+        for elapsed, expected in ((0, "<1 min"), (29, "<1 min"), (30, "1 min"),
+                                  (60, "1 min"), (2580, "43 min"), (3600, "1 h 0 min")):
+            with self.subTest(elapsed=elapsed):
+                data = {"total": 64, "cap": 48, "taken": 4, "read_at": 200_000,
+                    "walk": [{"name": "running", "queued": True, "started_at": 200_000 - elapsed,
+                              "used": 1, "reserved": 0, "counted": 1}],
+                    "waiters": [{"name": "queued", "since": 200_000 - elapsed, "detail": "fixture",
+                                 "pid": 200, "need": 1, "reason": "free memory"}]}
+                rendered = self.page_expression("(renderWalk(data), $('walk').innerHTML)", data, walk=True)
+                root = ElementTree.fromstring(f"<root>{rendered}</root>")
+                self.assertEqual(root.findtext(".//tr[@data-tip='row:0']/td[@class='duration']"), expected)
+                self.assertEqual(root.findtext(".//tr[@data-tip='wait:0']/td[@class='duration']"), expected)
+                tips = self.page_expression("[tipText('row:0', data), tipText('wait:0', data)]", data)
+                self.assertIn(f"Started {expected} ago.", str(tips))
+                self.assertIn(f"Waiting for {expected}.", str(tips))
+
+    def test_queued_titles_share_the_header_row_without_moving_the_room_row(self) -> None:
+        for units, expected in (([], "Queued, in order of submission"),
+                                (["research"], "Queued, research first, then in submission order"),
+                                (["research", "cables"], "Queued, research followed by cables and then in submission order"),
+                                (["a<&", "b"], "Queued, a<& followed by b and then in submission order")):
+            with self.subTest(units=units):
+                data = {"total": 64, "cap": 48, "taken": 4, "read_at": 200, "queued_priority_units": units,
+                    "walk": [{"name": "running", "queued": True}],
+                    "waiters": [{"name": "first", "since": 100, "detail": "research", "pid": 200}]}
+                rendered = self.page_expression("(renderWalk(data), $('walk').innerHTML)", data, walk=True)
+                root = ElementTree.fromstring(f"<root>{rendered}</root>")
+                chart = root.find("./div[@class='walk-chart']")
+                assert chart is not None
+                header = chart.find("./div[@class='walk-chart-head queue-head']")
+                assert header is not None
+                title = header.find("./span[@class='queue-title section-head']")
+                assert title is not None
+                self.assertEqual(title.text, expected)
+                self.assertEqual(title.get("title"), expected)
+                room = chart.find("./div[@class='wrow room']")
+                assert room is not None
+                children = list(chart)
+                self.assertEqual(children.index(room) + 1, children.index(header))
+                self.assertEqual(children[children.index(header) + 1].get("data-tip"), "wait:0")
+                table_rows = root.findall(".//tbody/tr")
+                self.assertEqual([row.get("class") for row in table_rows],
+                                 ["", "room", "queue-head", "wait wait-first"])
+                self.assertEqual(root.findtext(".//tr[@data-tip='wait:0']/td[@class='place']"), "1")
+                self.assertEqual(root.findtext(".//tr[@data-tip='wait:0']/th[@class='step']/span"), "first")
+
+    def test_the_done_column_uses_each_counter_and_preserves_unknown_progress(self) -> None:
+        for phase, unit, done, total, percent, expected in (
+            ("building", "units", 7, 10, 70, "70.0%"),
+            ("testing", "modules", 722, 727, None, "99.3%"),
+            ("testing", "tests", 0, 12, 0, "0.0%"),
+            ("testing", "modules", 12, 12, 100, "100.0%"),
+            ("testing", "modules", 11, 12, 100, "99.9%"),
+        ):
+            counter: dict[str, object] = {"kind": "RowProgress", "phase": phase, "unit": unit,
+                                         "done": done, "total": total}
+            if percent is not None:
+                counter["percent"] = percent
+            with self.subTest(counter=counter):
+                data = {"total": 64, "cap": 48, "taken": 4, "read_at": 200, "waiters": [],
+                        "walk": [{"name": "counter", "queued": True, "progress": counter},
+                                 {"name": "unknown", "queued": True, "progress": {"kind": "NoProgress"}}]}
+                rendered = self.page_expression("(renderWalk(data), $('walk').innerHTML)", data, walk=True)
+                root = ElementTree.fromstring(f"<root>{rendered}</root>")
+                row = root.find(".//tr[@data-tip='row:0']")
+                assert row is not None
+                self.assertEqual(row[0].text, phase)
+                self.assertEqual(row[1].get("class"), "done")
+                self.assertEqual(row[1].text, expected)
+                self.assertEqual(root.findtext(".//tr[@data-tip='row:1']/td[@class='done']"), "—")
+
+    def test_the_mac_memory_note_follows_all_tooltip_fields(self) -> None:
+        data = {"read_at": 200, "walk": [{"kind": "mac-build", "machine": "mac", "name": "hana nextest",
+            "used": 3.5, "started_at": 100, "read_at": 190, "stage": {"kind": "MacTesting"},
+            "progress": {"kind": "RowProgress", "phase": "testing", "unit": "tests",
+                         "done": 7, "total": 10, "percent": 70}}]}
+        rendered = self.page_expression("tooltipHtml('row:0', data)", data, walk=True)
+        root = ElementTree.fromstring(f"<root>{rendered}</root>")
+        self.assertEqual(root[-1].get("class"), "mac-note")
+        self.assertEqual(root[-1].text, "Mac memory does not count against natedev.")
+        self.assertEqual(root[-2].tag, "dl")
+        self.assertIn("70.0%", "".join(root[-2].itertext()))
+
     def test_the_memory_page_hover_shows_the_captured_phase_percent_hold_and_reason(self) -> None:
         row = memory_tests.ProgressKeepAsideTests.reservation("merge-gate", need=4 * GIB)
         memory = admission_records.MeasuredMemory(9 * GIB, anonymous=admission_records.AnonymousRunUse(GIB))
@@ -85,10 +190,24 @@ class MemoryHoverTests(unittest.TestCase):
 
     def test_pressure_percent_uses_one_decimal_and_rounds_down(self) -> None:
         hover = self.page_expression("[tipText('g-some', data), tipText('g-full', data), tipText('g-swap', data)]", {
-            "psi": {"some": 1.29, "full": 0.09}, "limits": {"some": 25, "full": 5, "swap": 85},
+            "psi": {"some": 1.29, "full": 0.09}, "limits": {"some": 25, "full": 5},
             "swap_used": 1, "swap_total": 3})
-        for expected in ("1.2%", "0.0%", "33.3%", "25.0%", "5.0%", "85.0%"):
+        for expected in ("1.2%", "0.0%", "33.3%", "25.0%", "5.0%"):
             self.assertIn(expected, str(hover))
+        self.assertIn("Swap use alone does not hold the queue.", str(hover))
+
+    def test_pressure_level_uses_stalls_without_a_swap_limit(self) -> None:
+        for some, full, used, pressure, expected in (
+            (0, 0, 8, "none", "ok"),
+            (15, 0, 0, "none", "warn"),
+            (0, 3, 0, "none", "warn"),
+            (26, 0, 0, "memory pressure: some avg10 26.0", "hold"),
+        ):
+            with self.subTest(some=some, full=full, swap_used=used):
+                result = self.page_expression("level(data)", {
+                    "psi": {"some": some, "full": full}, "limits": {"some": 25, "full": 5},
+                    "pressure": pressure, "swap_used": used, "swap_total": 8})
+                self.assertEqual(result, expected)
 
     def test_step_table_uses_the_first_column_for_stage_and_waiting_place(self) -> None:
         for waiting in (False, True):
@@ -106,9 +225,9 @@ class MemoryHoverTests(unittest.TestCase):
                      "progress": {"kind": "NoProgress"}},
                     {"name": "Mac test", "kind": "cloud", "machine": "mac",
                      "progress": {"kind": "RowProgress", "phase": "testing"}},
-                    {"name": "hana CI", "ci": True, "ci_runners": [{"state": "busy"}],
+                    {"name": "hana CI", "ci": True, "admitted": True, "ci_runners": [{"state": "busy"}],
                      "progress": {"kind": "NoProgress"}},
-                    {"name": "CI counter", "ci": True, "ci_runners": [{"state": "busy"}],
+                    {"name": "CI counter", "ci": True, "admitted": True, "ci_runners": [{"state": "busy"}],
                      "progress": {"kind": "RowProgress", "phase": "building"}},
                 ]
                 waiting_kinds: tuple[tuple[str, dict[str, object]], ...] = (
@@ -124,7 +243,7 @@ class MemoryHoverTests(unittest.TestCase):
                 assert table is not None
                 headers = table.findall("./thead/tr/th")
                 self.assertEqual([cell.text for cell in headers],
-                                 ["Stage", "Step", "Duration", "Unit", "Pid", "Machine", "vCPU"])
+                                 ["Stage", "Done", "Step", "Duration", "Unit", "Pid", "Machine", "vCPU"])
                 self.assertEqual(table.findall(".//*[@class='stage']"), [])
                 for index, expected in enumerate(("building", "testing", "—", "testing", "—", "testing", "—", "building")):
                     row = table.find(f"./tbody/tr[@data-tip='row:{index}']")
@@ -137,7 +256,7 @@ class MemoryHoverTests(unittest.TestCase):
                 self.assertEqual(len(spacers), int(waiting))
                 if waiting:
                     self.assertEqual([cell.text for cell in queue_headers[0]],
-                                     ["#", "Step", "Waiting", "Unit", "Pid", "Machine", "vCPU"])
+                                     ["#", "Done", "Step", "Waiting", "Unit", "Pid", "Machine", "vCPU"])
                     self.assertTrue(all(cell.get("scope") == "col" for cell in queue_headers[0]))
                     for index, expected in enumerate(("1", "cloud", "2")):
                         row = table.find(f"./tbody/tr[@data-tip='wait:{index}']")
@@ -147,11 +266,12 @@ class MemoryHoverTests(unittest.TestCase):
                     self.assertEqual(len(row), len(headers))
 
     def test_ci_row_requires_a_running_job_and_preserves_the_used_total(self) -> None:
-        for state in ("idle", "busy", "unreadable"):
+        for state in ("idle", "waiting", "unmatched", "busy", "unreadable"):
             with self.subTest(state=state):
                 data = {"total": 64, "cap": 48, "taken": 4.125, "used": 3, "ci_ram": 0.125,
                         "read_at": 200, "waiters": [], "walk": [{
-                            "name": "hana CI", "ci": True, "ci_runners": [{"state": state}],
+                            "name": "hana CI", "ci": True, "admitted": state == "busy",
+                            "ci_runners": [{"state": "busy" if state in ("waiting", "unmatched") else state}],
                             "used": 0.125, "queued": False, "started_at": 100,
                             "progress": {"kind": "NoProgress"}}]}
                 result = cast(list[object], self.page_expression(
@@ -212,8 +332,8 @@ class MemoryHoverTests(unittest.TestCase):
         root = ElementTree.fromstring(f"<root>{result[0]}</root>")
         row = root.find(".//tr[@data-tip='row:0']")
         assert row is not None
-        self.assertEqual([row[index].text for index in (0, 2, 4, 6)], ["—", "—", "—", "—"])
-        self.assertEqual(row[3][0].text, "—")
+        self.assertEqual([row[index].text for index in (0, 3, 5, 7)], ["—", "—", "—", "—"])
+        self.assertEqual(row[4][0].text, "—")
         self.assertEqual(result[1].count("unavailable"), 4)
 
     def test_queue_notes_appear_once_in_their_row_tooltips(self) -> None:
@@ -292,7 +412,7 @@ function fitLabels() {}
     def test_missing_pressure_keeps_the_other_limit_readings(self) -> None:
         result = self.page_expression("[level(data), tipText('g-full', data), tipText('cap', data)]", {
             "psi":{"some":{"kind":"PressureNotRecorded", "reason":"private PSI is missing"}, "full":1},
-            "limits":{"some":25,"full":5,"swap":85}, "pressure":"none", "cap":20,
+            "limits":{"some":25,"full":5}, "pressure":"none", "cap":20,
             "swap_used":0,"swap_total":8,"cap_text":"fixture room"})
         self.assertIn("neutral", str(result))
         self.assertIn("1.0", str(result))

@@ -67,6 +67,26 @@ It does not read completed files or run subprocesses.
 A missing folder returns an empty list.
 The reader skips files that a concurrent clear moves before the read.
 
+## Status line
+
+`scripts/statusline/rebuild_row.py` combines cached system comparisons with `read_needs()` on each status read.
+The `For you:` row shows `rebuild natedev`, `rebuild mac`, or both, without duplicates.
+Open needs appear even when evaluation has no result or the cache does not exist.
+Completed needs leave the row unless the cached system comparison still requires a rebuild.
+A failed need read leaves the cached answer visible.
+The refresh compares running systems with `rebuild.ref` in `rebuild.repo`.
+It reuses an evaluation only when both machine paths are valid for the same commit and source.
+A timeout, error, or empty path leaves no reusable evaluation.
+Each valid machine path still supplies its current comparison when the other machine has no path.
+The cache records the failed commit, evaluation source, and failure time.
+`rebuild.eval_retry_seconds` sets a 600-second wait before another evaluation for that commit and source.
+Refreshes during this wait keep the cached row.
+A new commit or evaluation source bypasses the wait.
+A successful evaluation clears the failure record.
+`rebuild.eval_timeout` in `config/statusline.conf` sets the evaluation time limit to 120 seconds.
+Other commands retain their 30-second limit.
+`rebuild.interval` sets the refresh interval to 60 seconds.
+
 ## Clear rule
 
 The rebuild writer records each activation in `generations.log` with five space-separated fields:

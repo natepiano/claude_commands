@@ -1,10 +1,10 @@
 """A queued program owns one reservation from before launch through finalization."""
 from __future__ import annotations
 
-from scripts.lib import atomic_file, build_folders
+from scripts.lib import atomic_file, cancellation
 
 from contextlib import ExitStack, redirect_stderr, redirect_stdout
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from datetime import UTC, datetime
 import io
 import json
@@ -790,6 +790,28 @@ with queue_place('rust-analyzer', Path(sys.argv[1])) as place:
             self.assertEqual(places[0].status, 1)
             fixture.assert_released(self, reservation_id, status=1)
 
+    def test_sampler_start_failure_stops_and_reaps_the_program_before_release(self) -> None:
+        with QueuePlaceFixture() as fixture, mock.patch.dict(os.environ, {"BUILDLOG_SCOPE": "0"}):
+            release = client.release
+
+            def release_after_reaping(path: str, status: int, configuration: records.MemoryConfig | wire.CleanupTiming) -> None:
+                self.assertEqual(len(fixture.children), 1)
+                child = fixture.children[0]
+                self.assertIsNotNone(child.returncode)
+                with self.assertRaises(ChildProcessError):
+                    _ = os.waitpid(child.pid, os.WNOHANG)
+                _ = release(path, status, configuration)
+
+            with mock.patch.object(client, "release", side_effect=release_after_reaping) as released:
+                with queue.queue_place("rust-analyzer", fixture.root) as place:
+                    with self.assertRaisesRegex(RuntimeError, "sampler start failed"), \
+                            mock.patch.object(threading.Thread, "start", side_effect=RuntimeError("sampler start failed")):
+                        _ = place.popen([sys.executable, "-c", BLOCKING_CHILD], stdout=subprocess.PIPE)
+            released.assert_called_once()
+            self.assertIsInstance(place.program, queue.StartedProgram)
+            self.assertEqual(place.status, 1)
+            fixture.assert_cleaned(self)
+
     def test_running_program_is_stopped_before_its_place_is_released(self) -> None:
         with QueuePlaceFixture() as fixture:
             release = client.release
@@ -1023,6 +1045,27 @@ with queue_place('rust-analyzer', Path(sys.argv[1])) as place:
             self.assertEqual(stdout.getvalue(), "")
             self.assertFalse(fixture.admission.server.waiters)
 
+    def test_cleanup_mask_is_restored_when_blocking_is_interrupted(self) -> None:
+        change_mask = signal.pthread_sigmask
+        previous = change_mask(signal.SIG_BLOCK, {signal.SIGUSR1})
+        expected = previous | {signal.SIGUSR1}
+
+        def interrupted_block(how: int, numbers: Iterable[int]) -> set[int | signal.Signals]:
+            mask = set(numbers)
+            result = change_mask(how, mask)
+            if how == signal.SIG_BLOCK and signal.SIGINT in mask:
+                raise KeyboardInterrupt
+            return result
+
+        try:
+            with mock.patch.object(signal, "pthread_sigmask", side_effect=interrupted_block):
+                with self.assertRaises(KeyboardInterrupt):
+                    with cancellation.defer_cleanup_signals():
+                        self.fail("The block step must interrupt entry")
+            self.assertEqual(change_mask(signal.SIG_BLOCK, set()), expected)
+        finally:
+            _ = change_mask(signal.SIG_SETMASK, previous)
+
     @unittest.skipUnless(hasattr(os, "fork"), "holder signal lifecycle needs fork")
     def test_holder_signals_release_and_restore_handlers(self) -> None:
         for number in (signal.SIGTERM, signal.SIGINT):
@@ -1077,8 +1120,7 @@ with queue_place('rust-analyzer', Path(sys.argv[1])) as place:
                         pass
         with QueuePlaceFixture() as fixture:
             before = {number: signal.getsignal(number) for number in (signal.SIGTERM, signal.SIGINT)}
-            with mock.patch.object(signal, "signal", side_effect=AssertionError("installed a signal handler")), \
-                    mock.patch.object(build_folders, "defer_signals", side_effect=AssertionError("deferred folder signals")):
+            with mock.patch.object(signal, "signal", side_effect=AssertionError("installed a signal handler")):
                 with queue.queue_place("rust-analyzer", fixture.root):
                     pass
             self.assertEqual({number: signal.getsignal(number) for number in before}, before)
@@ -1124,8 +1166,7 @@ with queue_place('rust-analyzer', Path(sys.argv[1])) as place:
                                         pause(place.program.process)
                                     place.on_started = on_started
                                 with mock.patch.object(subprocess, "Popen", side_effect=start), \
-                                        mock.patch.object(signal, "signal", side_effect=AssertionError("installed a signal handler")), \
-                                        mock.patch.object(build_folders, "defer_signals", side_effect=AssertionError("deferred start signals")):
+                                        mock.patch.object(signal, "signal", side_effect=AssertionError("installed a signal handler")):
                                     _ = place.popen([sys.executable, "-c", TERM_RESISTANT_CHILD], stdout=subprocess.PIPE)
                         except KeyboardInterrupt:
                             status = 128 + signal.SIGINT

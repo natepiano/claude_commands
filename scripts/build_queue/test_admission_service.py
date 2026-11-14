@@ -923,7 +923,7 @@ class AdmissionCallerPersistenceTests(unittest.TestCase):
 
 class PendingPriorityTests(unittest.TestCase):
     def test_priority_labels_use_recorded_units_without_reading_transcripts(self) -> None:
-        from scripts.message import roster
+        from scripts.message import roster, unit_labels
         from scripts.production import staff
 
         producer = staff.StaffRow(staff.StaffId("producer"), "showrunner", "production", staff.StaffRoot(),
@@ -933,8 +933,8 @@ class PendingPriorityTests(unittest.TestCase):
         worker = staff.StaffRow(staff.StaffId("worker"), "worker", "builder", staff.ReportsTo(director.id),
                                current_session=staff.StaffId("worker-session"))
         snapshot = staff.StaffSnapshot((producer, director, worker))
-        expected = {"director-session": UnitLabels("chosen", "production", "chosen"),
-                    "worker-session": UnitLabels("builder", "production", "chosen")}
+        expected = {"director-session": UnitLabels("chosen", "production", "chosen", unit_labels.OwnerRole.UNIT),
+                    "worker-session": UnitLabels("builder", "production", "chosen", unit_labels.OwnerRole.UNIT)}
         with mock.patch.object(staff, "snapshot", return_value=snapshot), \
                 mock.patch.object(roster, "unit_labels_for", side_effect=AssertionError("transcript lookup")):
             self.assertEqual(gate.priority_labels(["producer-session", "director-session", "worker-session"]), expected)
@@ -2489,6 +2489,45 @@ class QueueLifecycleTests(unittest.TestCase):
 
 
 class CiSliceAdmissionTests(unittest.TestCase):
+
+    def test_ci_worker_uses_the_current_reservation_and_waiter_identity(self) -> None:
+        from scripts.build_queue.scope_activity import IdleService, RunningServiceJob, WaitingServiceJob, UnmatchedServiceJob
+
+        for admitted, expected in ((True, RunningServiceJob), (False, WaitingServiceJob)):
+            with self.subTest(admitted=admitted), AdmissionFixture() as fixture:
+                owner = fixture.fixture_owner(700001, "100")
+                write_process(fixture.proc.path, 700010)
+                _ = (fixture.proc.path / "700010/comm").write_text("Runner.Worker\n")
+                write_process(fixture.proc.path, owner.pid, parent=700010, start=owner.start_time)
+                _ = (fixture.root / "ci.slice/cgroup.procs").write_text(f"700010\n{owner.pid}\n")
+                if not admitted:
+                    _ = only_admitted(fixture.server.handle_request(
+                        fixture.request(owner=fixture.fixture_owner(700020, "200"), need=GIB)))
+                request = fixture.request(owner=owner, need=GIB if admitted else 100 * GIB)
+                reply = fixture.server.handle_request(request)
+                self.assertEqual(any(isinstance(item, wire.Admitted) for item in reply), admitted)
+                _ = fixture.run_pass()
+                view, = fixture.server.handle_request(wire.ViewRequest())
+                assert isinstance(view, wire.ViewReply)
+                ci, = (step.measured for step in view.reading.view.running
+                       if isinstance(step.measured, records.UnownedSliceMemory)
+                       and step.measured.cgroup == str(fixture.root / "ci.slice"))
+                self.assertIsInstance(ci.service_job_state, expected)
+                self.assertIsInstance(ci.job_state, IdleService if admitted else RunningServiceJob)
+                self.assertEqual(len(view.reading.view.waiting), int(not admitted))
+                if admitted:
+                    grant = only_admitted(reply)
+                    fixture.release(grant)
+                else:
+                    fixture.server.waiters.clear()
+                _ = fixture.run_pass()
+                view, = fixture.server.handle_request(wire.ViewRequest())
+                assert isinstance(view, wire.ViewReply)
+                ci, = (step.measured for step in view.reading.view.running
+                       if isinstance(step.measured, records.UnownedSliceMemory)
+                       and step.measured.cgroup == str(fixture.root / "ci.slice"))
+                self.assertIsInstance(ci.service_job_state, UnmatchedServiceJob)
+                self.assertIsInstance(ci.job_state, RunningServiceJob)
 
     def test_ci_evidence_does_not_subtract_host_free_memory_twice(self) -> None:
         for shared, ci_bytes, run_bytes in ((0, 4, 0), (4, 0, 4)):

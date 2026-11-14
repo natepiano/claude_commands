@@ -511,6 +511,8 @@ print('two homes isolated; recorder lock retained; caller restored')
         environment["USER_ZONE"] = "UTC"
         self.isolate_recorder_roots(environment)
         self.isolate_identity(environment)
+        # The refresh process starts only when a vault is present.
+        Path(environment["PHASE_TABLE_VAULT"]).parent.mkdir(parents=True, exist_ok=True)
         stdout = io.StringIO()
         stderr = io.StringIO()
         if isinstance(refresh_result, BaseException):
@@ -4084,6 +4086,23 @@ with patch.object(fcntl, "flock", admission):
         self.assertEqual(self.pass_slots(session)["impl"]["status"], "completed")
         self.assertEqual(len(self.pass_events("refused-pass", "pass_finished")), 1)
 
+    def test_stopped_worker_passes_end_as_canceled_and_other_workers_keep_theirs(self) -> None:
+        session = self.start_run("canceled-pass", 41_000, staff_owned=True)
+        owner = unit_runs.run_owner(self.read_state(session), staff.local_snapshot())
+        assert isinstance(owner, staff.StaffRow)
+        stopped = fixture_worker("implementer", owner.id)
+        _ = fixture_worker("review2", owner.id)
+        self.start_phase(session, 41_010)
+        self.start_slot_pass(session, "impl", "impl", 41_020, worker_name="implementer")
+        self.start_slot_pass(session, "review", "review", 41_030, worker_name="review2")
+        with patch.dict(os.environ, {"HOME": str(self.root)}):
+            self.assertEqual(progress_history.cancel_worker_passes(session, stopped.id), 1)
+            self.assertEqual(progress_history.cancel_worker_passes(session, stopped.id), 0)
+        self.assertEqual(self.pass_slots(session)["impl"]["status"], "canceled")
+        self.assertEqual(self.pass_slots(session)["review"]["status"], "active")
+        finished = self.pass_events("canceled-pass", "pass_finished")
+        self.assertEqual([event["status"] for event in finished], ["canceled"])
+
     def test_invalid_launcher_arguments_leave_the_active_pass_unchanged(self) -> None:
         session = self.start_run("invalid-launcher", 41_000)
         self.start_phase(session, 41_010)
@@ -4141,6 +4160,17 @@ with patch.object(fcntl, "flock", admission):
             )
             self.assertEqual(resumed, first)
             self.assertEqual((path.read_bytes(), path.stat().st_mtime_ns), before)
+            original_prompt = prompt.read_text()
+            for changed_command in (command, [*command, "--reply-file", str(self.root / "summary.txt")]):
+                with self.subTest(prompt="changed active content", launcher=changed_command):
+                    _ = prompt.write_text(original_prompt + "Read the changed work order.\n")
+                    with self.assertRaisesRegex(RuntimeError, "different prompt content"):
+                        _ = progress_history.begin_dispatch(
+                            session, slot="impl2", phase="3", role="review", worker_name="impl2",
+                            worker_id=member.id, launcher_command=changed_command, prompt=prompt,
+                            kind="broad", lens="contract")
+                    self.assertEqual((path.read_bytes(), path.stat().st_mtime_ns), before)
+                    _ = prompt.write_text(original_prompt)
             stage_two = self.root / "stage-two-prompt.txt"
             _ = stage_two.write_text("Phase 3 — Retry handling\nComplete the second review stage.\n")
             second_stage = progress_history.begin_dispatch(
@@ -4218,6 +4248,16 @@ with patch.object(fcntl, "flock", admission):
                         session, slot="test", phase="3", role="review", prompt=prompt, launcher_command=command,
                     )
                     self.assertEqual(result, progress_history.MatchedDispatch("impl2", instance))
+                    original_prompt = prompt.read_text()
+                    with self.subTest(prompt="changed content"):
+                        _ = prompt.write_text(original_prompt + "Read the changed work order.\n")
+                        changed = progress_history.dispatch_worker(
+                            session, slot="test", phase="3", role="review", prompt=prompt, launcher_command=command)
+                        if status == "active":
+                            self.assertEqual(changed, progress_history.ActiveDispatchPromptConflict("impl2", instance))
+                        else:
+                            self.assertIsInstance(changed, progress_history.NoMatchedDispatch)
+                        _ = prompt.write_text(original_prompt)
                     for changed_prompt, changed_command in (
                         (self.root / "different-prompt.txt", command),
                         (prompt, [*command, "--new-dispatch"]),
@@ -8034,12 +8074,13 @@ with patch.object(fcntl, "flock", admission):
 
     def test_a_phase_started_while_another_is_open_leaves_the_older_one_open(self) -> None:
         started_at = 40_000
-        session_dir = self.start_run("overlapping-phases", started_at)
+        session_dir = self.start_run("overlapping-phases", started_at, unit_owned=True)
         self.start_numbered_phase(session_dir, "6", started_at + 10)
         self.start_slot_pass(session_dir, "impl", "impl", started_at + 20)
         self.team_slot = ""
         self.start_numbered_phase(session_dir, "18", started_at + 100)
 
+        self.assertNotIn("anomaly:", self.last_recorder_stderr)
         self.assertEqual(self.open_phase_ids(session_dir), ("18", ["6"]))
         self.assertEqual(self.pass_slots(session_dir)["impl"]["status"], "active")
         self.assertEqual(self.phase_events("overlapping-phases", "phase_finished"), [])
@@ -8060,6 +8101,12 @@ with patch.object(fcntl, "flock", admission):
             [(event.get("phase_id"), event.get("phase_elapsed_seconds")) for event in finished],
             [("18", 100), ("6", 290)],
         )
+
+        self.start_numbered_phase(session_dir, "19", started_at + 400)
+        self.start_numbered_phase(session_dir, "20", started_at + 500)
+        self.assertEqual(self.open_phase_ids(session_dir), ("20", ["19"]))
+        self.assertIn("anomaly: start-phase: reservation: phase 19 set aside unclosed, started 1970-01-01 11:13 UTC",
+                      self.last_recorder_stderr)
 
     def test_finishing_an_older_open_phase_leaves_the_current_one_and_its_workers(self) -> None:
         started_at = 41_000

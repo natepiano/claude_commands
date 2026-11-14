@@ -21,6 +21,7 @@ from typing import Literal, TypedDict, cast
 
 
 from scripts.whoami.agent_accounts import AccountSourceUnspecified, ClaudeDirectorySource, CodexHomeSource, KnownUsageLogin, NoWeeklyReadSkip, Quota, Report, StaleTokenSkip, UsageReadOutcome, UsageReadClaim, UsageReadHeld
+from scripts.whoami.agent_accounts import LoginEndUnknown, login_end_from_iso, login_end_iso
 from scripts.whoami.note_file import canonical_label
 
 
@@ -41,6 +42,8 @@ class StoredCredits(TypedDict):
 
 
 class StoredUsage(TypedDict, total=False):
+    # Claude only: the server login time limit in UTC. Absent when unknown.
+    login_ends_at: str
     # Absent beside a weekly window when the account has no 5-hour window.
     five_hour: StoredWindow
     weekly: StoredWindow
@@ -137,6 +140,7 @@ def save_timer_usage(signature: str, reports: list[Report], at: datetime) -> Non
     encoded: list[TimerReport] = []
     for report in reports:
         usage = StoredUsage()
+        _ = _merge_login_end(usage, report)
         for quota in report.quotas:
             if quota.label == "Weekly" and (window := _read(quota, at)) is not None:
                 usage["weekly"] = window
@@ -180,6 +184,8 @@ def recent_timer_usage(signature: str, now: datetime) -> RecentTimerUsage | Time
             report = Report(entry["tool"], email=entry["login"] or None, source=source,
                             problem=entry["problem"] or None, quota_problem=entry["quota_problem"] or None,
                             usage_read_outcome=UsageReadOutcome(entry["usage"].get("read_outcome", UsageReadOutcome.ERROR)))
+            report.login_ends_at = (login_end_from_iso(entry["usage"].get("login_ends_at"))
+                                    if report.tool == "Claude" else LoginEndUnknown())
             for name in ("weekly", "five_hour"):
                 window = _window(entry["usage"].get(name))
                 if window is None:
@@ -309,6 +315,8 @@ def load() -> UsageReadings:
             continue
         held = cast(dict[str, object], value)
         usage = StoredUsage()
+        if not login.startswith("codex:") and (login_end := login_end_iso(login_end_from_iso(held.get("login_ends_at")))) is not None:
+            usage["login_ends_at"] = login_end
         if (five_hour := _window(held.get("five_hour"))) is not None:
             usage["five_hour"] = five_hour
         if (weekly := _window(held.get("weekly"))) is not None:
@@ -353,6 +361,17 @@ def _read(quota: Quota, checked_at: datetime) -> StoredWindow | None:
     )
 
 
+def _merge_login_end(usage: StoredUsage, report: Report) -> bool:
+    """Replace the login end date with this reading's value, including an unknown value."""
+    value = login_end_iso(report.login_ends_at) if report.tool == "Claude" else None
+    if value is None:
+        return usage.pop("login_ends_at", None) is not None
+    if usage.get("login_ends_at") == value:
+        return False
+    usage["login_ends_at"] = value
+    return True
+
+
 def merge(stored: UsageReadings, reports: list[Report], checked_at: datetime) -> bool:
     """Save the latest attempt outcome, preserving last good numbers and times on failure.
 
@@ -388,6 +407,7 @@ def merge(stored: UsageReadings, reports: list[Report], checked_at: datetime) ->
         if not login:
             continue
         usage = stored.setdefault(login, StoredUsage())
+        changed = _merge_login_end(usage, report) or changed
         if isinstance(report.weekly_read_skip, StaleTokenSkip):
             usage = stored.setdefault(login, StoredUsage())
             if "weekly_read_skip" not in usage:

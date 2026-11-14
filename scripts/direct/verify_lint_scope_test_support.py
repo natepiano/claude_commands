@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from scripts.lib.checkout_test_support import write_python_tool
+
 from scripts.build_queue.admission_test_support import caller_admission
 from scripts.lib.py_floor_test_support import seed_interpreter_cache
 
@@ -12,7 +14,6 @@ import os
 from pathlib import Path
 import shutil
 import subprocess
-import sys
 import tempfile
 from typing import ClassVar, TypedDict, cast, override
 import unittest
@@ -313,8 +314,7 @@ class VerifyLintScopeFixture(unittest.TestCase):
         })
 
     def write_executable(self, path: Path, source: str) -> None:
-        _ = path.write_text(f"#!{sys.executable}\n" + source, encoding="utf-8")
-        path.chmod(0o755)
+        write_python_tool(path, source)
 
     def write_shell(self, path: Path, source: str) -> None:
         _ = path.write_text("#!/bin/sh\n" + source, encoding="utf-8")

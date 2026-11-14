@@ -8,7 +8,7 @@ from zoneinfo import ZoneInfo
 
 from scripts.build_queue import head_facts, queue_lines
 from scripts.build_queue.queue_lines import age, field
-from scripts.build_queue.scope_activity import IdleService, LiveBuildRun, NotServiceSlice, RunningServiceJob
+from scripts.build_queue.scope_activity import LiveBuildRun, NotServiceSlice, RunningServiceJob, WaitingServiceJob, UnmatchedServiceJob
 from scripts.lib.build_steps import StepNames
 from scripts.build_queue import admission_records
 from scripts.build_queue import step_estimator
@@ -116,8 +116,9 @@ def room_text(room: admission_records.MemoryRoom | admission_records.ReadingUnav
         if missing:
             calculation += f": swap-backed use unavailable for {missing}"
         calculation += f"; free {gib(room.available)}"
+    swapped = f"; − {gib(room.agent_swap_demand)} swapped outside builds" if room.agent_swap_demand else ""
     text = (f"{calculation} "
-            f"− safety {gib(room.safety)}; kept aside {gib(room.kept)}; room {gib(room.room)}")
+            f"− safety {gib(room.safety)}; kept aside {gib(room.kept)}{swapped}; room {gib(room.room)}")
     if room.shortfall:
         text += f"; shortfall {gib(room.shortfall)}"
     return text
@@ -147,9 +148,8 @@ def pressure_text(pressure: admission_records.MemoryPressure | admission_records
               + f"some avg10 {pressure.some_avg10:.1f}%, swap used {pressure.swap_used_percent:.1f}%")
     if isinstance(pressure.condition, admission_records.PressureConditionNotRecorded):
         return values + "; condition not recorded by service"
-    if pressure.condition == "swap":
-        return (values + f"; starts when swap is at most {policy.pressure.swap_used_limit:g}% "
-                + f"or some avg10 is at most {policy.pressure.some_avg10_limit:.1f}%")
+    if pressure.condition == "some":
+        return values + f"; starts below some avg10 {policy.pressure.some_avg10_limit:.1f}%"
     return values + f"; starts below full avg10 {policy.pressure.full_avg10_limit:.1f}%"
 
 
@@ -194,12 +194,14 @@ def release_text(release: gate.HeadAfterEnd, explanation: admission_records.Queu
 
 def service_activity_text(memory: admission_records.CompilerServiceMemory | admission_records.UnownedSliceMemory, now: float) -> str:
     """Describe the recorded service state at the pass time."""
-    state = memory.job_state
+    state = admission_records.recorded_service_state(memory)
     if isinstance(state, NotServiceSlice):
         raise ValueError("a build scope has no service state")
-    if isinstance(state, RunningServiceJob):
+    if isinstance(state, (RunningServiceJob, WaitingServiceJob, UnmatchedServiceJob)):
         elapsed = f"{age(state.started_at, now)} min" if state.started_at else "age unknown"
-        return f"running job, {elapsed}"
+        activity = ("running job" if isinstance(state, RunningServiceJob)
+                    else "waiting job" if isinstance(state, WaitingServiceJob) else "unmatched job")
+        return f"{activity}, {elapsed}"
     return "idle"
 
 
@@ -219,7 +221,7 @@ def running_text(running: admission_records.ExplainedRunningStep, explanation: a
                  labels: Mapping[str, unit_labels.UnitLabels], zone: ZoneInfo, *, names: StepNames) -> str:
     memory = running.step.measured
     if isinstance(memory, admission_records.CompilerServiceMemory) or (
-            isinstance(memory, admission_records.UnownedSliceMemory) and isinstance(memory.job_state, (IdleService, RunningServiceJob))):
+            isinstance(memory, admission_records.UnownedSliceMemory) and not isinstance(admission_records.recorded_service_state(memory), NotServiceSlice)):
         return service_text(memory, explanation.now)
     identity = step_labels(running.step, labels)
     admitted = running.admitted_at

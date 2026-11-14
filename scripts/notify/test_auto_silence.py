@@ -41,7 +41,11 @@ class AutoSilenceTests(unittest.TestCase):
     @override
     def setUp(self) -> None:
         folder = self.enterContext(tempfile.TemporaryDirectory())
-        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {"NOTIFY_STATE_DIR": folder})))
+        records = Path(folder) / "pane-records"
+        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
+            "NOTIFY_STATE_DIR": folder, "STAFF_FILE": str(Path(folder) / "staff.json"),
+            "HERDR_PANE_RECORD_DIR": str(records)})))
+        _ = cast(object, self.enterContext(mock.patch.object(pane_record, "RECORD_DIR", records)))
         self.commands, self.pushes, self.posted, self.now = [], [], [], START
         registry = Path(folder) / "sessions"
         registry.mkdir()
@@ -72,6 +76,7 @@ class AutoSilenceTests(unittest.TestCase):
                                ("models", "acae33e1-1a40-4d4e-af62-1697c067c1fc")):
             with self.subTest(session=name):
                 entry = pane_record.launch("w1:p1", identity, "/fixture", {}, ["claude"])
+                self.assertNotIn("staff_id", entry)
                 environment = {"HERDR_ENV": "1", "HERDR_PANE_ID": "w1:p1"}
                 with (mock.patch.object(pane_record, "matching_launch", return_value=entry),
                       mock.patch.object(session_staff, "record_membership", return_value=entry),

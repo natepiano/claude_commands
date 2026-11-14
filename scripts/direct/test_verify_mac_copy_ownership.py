@@ -3,7 +3,8 @@ from __future__ import annotations
 
 import unittest
 import subprocess
-from typing import final
+import json
+from typing import cast, final
 from scripts.direct.verify_mac_offload_test_support import VerifyMacOffloadFixture, VERIFY as VERIFY
 import os
 import signal
@@ -23,9 +24,16 @@ class VerifyMacCopyOwnershipTests(VerifyMacOffloadFixture):
         self.assertTrue({cargo, copy} <= processes_carrying(self.child_marker()))
         # Both folders carry the run's pid, and the copy folder sits in the hold folder, so
         # tmp_sweep.py can tie a folder a kill leaves behind to its run.
-        holds = list((self.root / "tmp").glob(f"verify-hold.{process.pid}.*"))
+        holds = [path for path in (self.root / "tmp").glob(f"verify-hold.{process.pid}.*") if path.is_dir()]
         self.assertEqual(len(holds), 1, list((self.root / "tmp").iterdir()))
-        self.assertEqual(len(list(holds[0].glob(f"verify-copy.{process.pid}.*"))), 1)
+        folders = [path for path in holds[0].glob(f"verify-copy.{process.pid}.*") if path.is_dir()]
+        self.assertEqual(len(folders), 1)
+        for folder in [*holds, *folders]:
+            self.assertTrue(folder.with_name(folder.name + ".lock").is_file())
+            lease = cast(dict[str, object], json.loads(folder.with_name(folder.name + ".lease.json").read_text()))
+            self.assertEqual(set(lease), {"showrunner", "unit", "work", "purpose", "pid", "start_time"})
+            self.assertIsInstance(lease["pid"], int)
+            self.assertIsInstance(lease["start_time"], str)
         process.send_signal(signal.SIGTERM)
         _ = process.communicate(timeout=TEST_HANG_GUARD_SECS)
         _ = wait_for_marker_exit(self.child_marker(), TEST_HANG_GUARD_SECS)

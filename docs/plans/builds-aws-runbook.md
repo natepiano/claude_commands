@@ -28,7 +28,7 @@ The ledger preserves those costs after builder removal.
 The current resource inventory excludes the removed builder's ongoing storage costs.
 
 The state folder is `~/.local/state/build-targets/aws`.
-`gate-deployment.json` records the bucket and regional launch resources.
+`gate-deployment.json` records the bucket, the deployed `instance_types` and regional launch resources.
 `deployment.json` records foundation ownership.
 The configured region list alone does not prove that all regional stacks exist.
 Preserve the ledger, deployment records, launch records, and cleanup records during recovery.
@@ -130,11 +130,40 @@ A requested quota does not prove an applied quota.
 
 `quota-status` reports the applied quotas and their request history without creating a request or writing local state.
 It uses the same regions, quota codes, and encrypted administrator credentials as `quota-request`.
-Each request row shows the region, quota name, asked value, current applied value, status, case ID, and date.
-The date uses the latest update time, or the creation time when no update time exists.
+Each region starts one block with its name as the heading.
+Each quota prints its applied vCPUs once, followed by aligned request columns.
+Requests appear newest first by update time, or creation time when no update time exists.
 Dates use the zone from `config/user_zone.conf`, with `USER_ZONE` as an override.
-A quota with no request history has one row with status `none`.
-The command prints progress for each region and a final completion time.
+A quota with no history prints `No requests.`
+The final summary lists regions whose applied GPU quota fits the trial and requests that remain open.
+The trial and report share the vCPU calculation over the types in `gpu_size_trial_spot_max_usd_per_hour`.
+An approved request does not prove that its value is applied.
+When every applied quota is too small, the summary says `no region has enough applied quota`.
+An unread applied GPU quota adds `unknown for <regions>` after the regions that fit.
+An unread request history makes the summary say `open requests: unknown` and name the unavailable region and quota.
+
+Example from the test fake:
+
+```text
+us-east-1
+  Standard Spot: 128 vCPUs applied
+    Asked vCPUs  Status       Case ID       Updated
+            129  CASE_OPENED  case-fixture  2026-01-15 13:59:00 HST
+            128  APPROVED     -             2026-01-14 13:59:00 HST
+
+us-west-2
+  Standard Spot: 128 vCPUs applied
+    No requests.
+  G and VT Spot: 4 vCPUs applied
+    Asked vCPUs  Status   Case ID  Updated
+              4  PENDING  -        2026-01-14 13:59:00 HST
+
+eu-north-1
+  G and VT Spot: 4 vCPUs applied
+    No requests.
+
+Summary: GPU trial needs 32 vCPUs; quota fits: no region has enough applied quota; open requests: us-east-1 Standard Spot 129 vCPUs (CASE_OPENED), us-west-2 G and VT Spot 4 vCPUs (PENDING)
+```
 A regional failure prints only its error code and makes the command exit with status 1 after the remaining regions.
 The report includes case IDs and omits account IDs, ARNs, and request IDs.
 It calls only `GetServiceQuota` and `ListRequestedServiceQuotaChangeHistoryByQuota` through the AWS CLI.

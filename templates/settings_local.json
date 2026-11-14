@@ -12,7 +12,6 @@
       "Bash(~/.claude/scripts/validate_and_push/validate_ci.sh:*)",
       "Bash(bash ~/.claude/scripts/validate_and_push/run_validation.sh:*)",
       "Bash(~/.claude/scripts/validate_and_push/run_validation.sh:*)",
-      "Bash(bash ~/.claude/scripts/commit_prep/analyze_changes.sh:*)",
       "Bash(bash ~/.claude/scripts/worktree_delete/discover_worktrees.sh:*)",
       "Bash(bash ~/.claude/scripts/worktree_delete/worktree_delete_validation.sh:*)",
       "Bash(bash ~/.claude/scripts/worktree_delete/record_confirmation.sh:*)",

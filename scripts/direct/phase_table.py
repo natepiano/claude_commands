@@ -480,11 +480,12 @@ def _phase_instances(
     return list(instances.values())
 
 
-def _newest_open_instance(
+def _open_instances(
     runs: list[list[dict[str, object]]],
-) -> OpenPhaseInstance | NoOpenPhase:
+) -> list[OpenPhaseInstance]:
+    """Read every unfinished phase instance in the newest run."""
     if not runs:
-        return NoOpenPhase()
+        return []
     events = runs[-1]
     started: list[PhaseInstance] = []
     closed: set[str] = set()
@@ -512,10 +513,7 @@ def _newest_open_instance(
                 finish=PhaseInstanceWithoutFinish(),
             )
         )
-    for instance in reversed(started):
-        if instance.instance_id not in closed:
-            return _open_instance(runs, instance)
-    return NoOpenPhase()
+    return [_open_instance(runs, instance) for instance in started if instance.instance_id not in closed]
 
 
 def _open_instance(
@@ -931,6 +929,29 @@ def _with_history(
     )
 
 
+def with_run_promises(record: PhaseRecord, events: list[dict[str, object]]) -> PhaseRecord:
+    """Use one run's promise trails and preserve the plan's duration predictions."""
+    runs = [events]
+    instances = _phase_instances(runs)
+    phases: list[plan_history.PlanPhase] = [
+        {"id": row.phase, "title": row.title, "done": isinstance(row, DonePhase)}
+        for row in record.phases
+    ]
+    assigned = _instances_by_phase(phases, instances)
+    rows: list[DonePhase | OpenPhase | TodoPhase] = []
+    current = record.current
+    for row, related in zip(record.phases, assigned, strict=True):
+        history = _phase_history(runs, related, row)
+        enriched = replace(row, eta_trail=history.eta_trail)
+        rows.append(enriched)
+        if isinstance(current, OpenPhase) and current.phase == row.phase:
+            current = replace(current, eta_trail=history.eta_trail)
+    if isinstance(current, OpenPhase) and current.phase not in {row.phase for row in rows}:
+        related = [instance for instance in instances if instance.instance_id == current.instance_id]
+        current = replace(current, eta_trail=_phase_history(runs, related, current).eta_trail)
+    return record._replace(current=current, phases=rows, plan_finish=_plan_finish(rows))
+
+
 def _current_run_events(runs: list[list[dict[str, object]]], record: staff.StaffSnapshot) -> list[list[dict[str, object]]]:
     """Select the run that its owner's staff pointer names."""
     opened = {row.run.path.name: row.run.path for row in record.rows if isinstance(row.run, staff.OpenRun)}
@@ -963,10 +984,9 @@ def build_plan(plan_path: Path, *, resolver: session_staff.RowResolver | None = 
                   for path in plan_history.plan_runs(plan_path, record=resolver.record)]
     instances = _phase_instances(run_events)
     current_run = _current_run_events(run_events, resolver.record)
-    open_instance = _newest_open_instance(current_run)
     return _build_phase_record(
         plan_path, phases, run_events, _instances_by_phase(phases, instances),
-        [open_instance] if isinstance(open_instance, OpenPhaseInstance) else [],
+        _open_instances(current_run),
     )
 
 
@@ -1000,13 +1020,13 @@ def build_run(plan_path: Path, events: list[dict[str, object]]) -> PhaseRecord:
             phase=_text(event.get("phase_id")) or (instance.phase if instance else ""),
             title=_text(event.get("phase_title")) or (instance.title if instance else ""),
             start=instance.start if instance else at - timedelta(seconds=seconds),
-            finish=InstanceFinished(at=at, status="completed", seconds=seconds, written_at=index),
+            finish=InstanceFinished(at=at, status=_text(event.get("status")), seconds=seconds, written_at=index),
         ))
     opened = [instance for instance in instances if instance.instance_id not in finished_ids]
     ordered = finished + opened
     phases: list[plan_history.PlanPhase] = [
         {"id": instance.phase, "title": instance.title,
-         "done": isinstance(instance.finish, InstanceFinished)}
+         "done": isinstance(instance.finish, InstanceFinished) and instance.finish.status == "completed"}
         for instance in ordered
     ]
     return _build_phase_record(
@@ -1060,7 +1080,7 @@ def _build_phase_record(
         ]
         row_instances.append(related)
         row_open = next(
-            (candidate for candidate in open_instances if any(
+            (candidate for candidate in reversed(open_instances) if any(
                 instance.instance_id == candidate.phase.instance_id for instance in assigned[index]
             )),
             NoOpenPhase(),
@@ -1070,7 +1090,7 @@ def _build_phase_record(
                 (instance.start for instance in related),
                 default=row_open.phase.start,
             )
-            current = OpenPhase(
+            opened = OpenPhase(
                 phase=phase["id"],
                 title=phase["title"],
                 started=earliest,
@@ -1079,7 +1099,9 @@ def _build_phase_record(
                 first_stated=row_open.first_stated,
                 instance_id=row_open.phase.instance_id,
             )
-            rows.append(current)
+            rows.append(opened)
+            if row_open is open_instance:
+                current = opened
         elif phase["done"]:
             rows.append(_done_phase(phase, related))
         else:
@@ -1723,6 +1745,11 @@ def _vault_root() -> Path:
     ).expanduser()
 
 
+def vault_present() -> bool:
+    """Report whether the folder that holds the vault exists; without it no phase note is written."""
+    return _vault_root().parent.exists()
+
+
 def _archive_note(candidate: Path, vault_root: Path, name: str) -> Path:
     """Move one generated phase note into the vault's archive and return its new path."""
     # Outside showrunners, the archive stays out of every scan and in the vault's Git history.
@@ -1771,9 +1798,9 @@ def archive(production_doc: Path) -> list[Path]:
     """Move a production's generated phase notes into the vault's archive."""
     resolver = session_staff.RowResolver(staff.snapshot())
     production = read_production(production_doc, resolver=resolver)
-    vault_root = _vault_root()
-    if not vault_root.parent.exists():
+    if not vault_present():
         return []
+    vault_root = _vault_root()
     archived: list[Path] = []
     for candidate in sorted(vault_root.glob("*/*.md")):
         ownership = _note_ownership(candidate, resolver.record)
@@ -1824,9 +1851,9 @@ def refresh(session_dir: Path) -> None:
     reference = _production_reference(record.plan, resolver=resolver)
     if isinstance(reference, PlanOutsideProduction):
         return
-    vault_root = _vault_root()
-    if not vault_root.parent.exists():
+    if not vault_present():
         return
+    vault_root = _vault_root()
     production = read_production(_production_document(record.plan, reference), resolver=resolver)
     owner = resolver.record.by_doc(remote.local_machine(), production.doc)
     from scripts.message import sessions

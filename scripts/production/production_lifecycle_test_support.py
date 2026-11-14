@@ -91,6 +91,7 @@ class LifecycleFixture(unittest.TestCase):
 
     fixture_root: ClassVar[Path]
     fixture_snapshot: ClassVar[Path]
+    running_snapshot: ClassVar[Path]
     fixture_env: ClassVar[dict[str, str]]
 
     @classmethod
@@ -101,11 +102,14 @@ class LifecycleFixture(unittest.TestCase):
         cls.fixture_root = Path(folder.name).resolve() / "case"
         cls.fixture_root.mkdir()
         cls.fixture_snapshot = cls.fixture_root.with_name("snapshot")
+        cls.running_snapshot = cls.fixture_root.with_name("running")
         builder = cls()
         builder.root = cls.fixture_root
         builder.build_fixture()
         cls.fixture_env = builder.env.copy()
         _ = shutil.copytree(cls.fixture_root, cls.fixture_snapshot)
+        builder.build_running_repository()
+        _ = shutil.copytree(cls.fixture_root, cls.running_snapshot)
         shutil.rmtree(cls.fixture_root)
 
     @override
@@ -225,7 +229,7 @@ class LifecycleFixture(unittest.TestCase):
         lines.extend(["", "## Production rules", "", "- No CI, smoke launch, Mac run, or validate_and_push.sh."])
         self.write(self.doc, "\n".join(lines) + "\n")
 
-    def running(self) -> None:
+    def build_running_repository(self) -> None:
         _ = self.git("switch", "-c", "production")
         self.production_doc("running")
         _ = self.git("add", str(self.doc))
@@ -234,6 +238,13 @@ class LifecycleFixture(unittest.TestCase):
         _ = self.git("worktree", "add", "-b", "alpha-branch", str(self.alpha), "production")
         _ = self.git("worktree", "add", "-b", "beta-branch", str(self.beta), "production")
         _ = self.git("push", "origin", "alpha-branch", "beta-branch")
+
+    def running(self) -> None:
+        # Keep the per-test state and the fixed paths in Git worktree links.
+        for directory in (self.origin, self.checkout, self.alpha, self.beta):
+            if directory.exists():
+                shutil.rmtree(directory)
+            _ = shutil.copytree(self.running_snapshot / directory.name, directory)
         runner = fixture_member("showrunner", name="example",
                               doc=staff.LiveDoc(remote.local_machine(), self.doc))
         for name, worktree in (("alpha", self.alpha), ("beta", self.beta)):
