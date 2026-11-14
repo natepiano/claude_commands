@@ -4,6 +4,7 @@
 // Add --console as the fourth argument for the Builds title comparison.
 // Add --step-names as the fourth argument for owner-based step names.
 // Add --owners as the fourth argument for machine owners and table spacing.
+// Add --cloud-owner as the fourth argument for cloud worker owner images.
 import assert from 'node:assert/strict';
 import {readFile, writeFile, mkdtemp, rm, mkdir} from 'node:fs/promises';
 import {createServer} from 'node:http';
@@ -29,6 +30,7 @@ try {
   const consoleComparison = process.argv[4] === '--console';
   const stepNamesComparison = process.argv[4] === '--step-names';
   const ownersComparison = process.argv[4] === '--owners';
+  const cloudOwnerComparison = process.argv[4] === '--cloud-owner';
   const readings = JSON.parse(await readFile(join(folder, 'fixtures.json'), 'utf8'));
   const now = Date.now() / 1000;
   for (const reading of Object.values(readings)) {
@@ -828,6 +830,42 @@ try {
           await writeFile(join(folder,`${name}.png`),Buffer.from(shot.data,'base64'));
         };
         const comparisons = [];
+        if (cloudOwnerComparison) {
+          await call('Emulation.setEmulatedMedia', {features:[{name:'prefers-color-scheme',value:'dark'}]});
+          await call('Emulation.setDeviceMetricsOverride', {width:1600,height:1200,deviceScaleFactor:1,mobile:false});
+          for (const version of ['before','after']) {
+            const reading=structuredClone(readings.step_owners);
+            reading.walk=reading.walk.filter(row=>row.kind==='cloud');
+            reading.waiters=reading.waiters.filter(row=>row.kind==='cloud');
+            assert.equal(reading.walk.length,1);
+            assert.equal(reading.waiters.length,1);
+            if(version==='before') for(const row of [...reading.walk,...reading.waiters]) {
+              row.name='nextest';row.unit='owner not recorded';row.showrunner='owner not recorded';
+            }
+            await show(reading);
+            const row=await evaluate(`(() => {
+              const chart=document.querySelector('.wrow[data-run="0"]');
+              const table=document.querySelector('tr[data-tip="row:0"]');
+              return {name:chart.querySelector('.name').textContent,
+                small:chart.querySelector('.owner').textContent,
+                unit:table.querySelector('.unit').textContent,
+                machine:table.querySelector('.machine').textContent};
+            })()`);
+            assert.equal(row.machine,'aws');
+            assert.equal(row.name,version==='before'?'nextest':'research nextest');
+            assert.equal(row.unit,version==='before'?'owner not recorded':'research');
+            if(version==='after') assert.equal(row.small,'hana');
+            await capture(version+'-aws-row','#walk');
+            await evaluate(`showTip('row:0',180,160)`);
+            const tooltip=await evaluate(`document.querySelector('#tip').innerText`);
+            if(version==='after') {
+              assert.match(tooltip,/Showrunner: hana/);
+              assert.match(tooltip,/Unit: research/);
+            } else assert.match(tooltip,/owner not recorded/);
+            await capture(version+'-aws-tooltip','#tip');
+            comparisons.push({version,...row,tooltip});
+          }
+        }
         if (ownersComparison) {
           assert.ok(beforePage, 'The owner comparison needs the previous page.');
           await call('Emulation.setEmulatedMedia', {features:[{name:'prefers-color-scheme',value:'dark'}]});
