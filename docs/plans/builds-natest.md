@@ -3575,7 +3575,7 @@ The transitive config closure is deleted. An index read error gives `FullSuite` 
 - The three fixture classes inherit the seed. `test_unit_config.py` (45 tests) and `lib/test_git_exclude.py` (5 tests) did not change.
 - aws paired trial, 3 rounds on m7a.8xlarge: `test_unit_config.py` CPU 3.099 to 2.947 s; `test_git_exclude.py` 0.295 to 0.285 s; peak unchanged. natedev module_cost 3.915 to 1.744 s for both. Taplo (158 starts, 1.16 natedev CPU s) is now the top command in `test_unit_config.py`. Checkpoint `63acaa3e0`.
 
-### Phase 235 — The copies tests copy one source seed  · status: todo
+### Phase 235 — The copies tests copy one source seed  · status: done
 **Depends on:** Phase 234
 
 #### Work Order
@@ -3647,35 +3647,11 @@ The transitive config closure is deleted. An index read error gives `FullSuite` 
 ### Phase 237 — The build record tests copy one seed repository  · status: done
 **Depends on:** Phase 234
 
-#### Work Order
+#### As-built
 
-**Goal:** `buildlog/test_record.py` uses less CPU in aws pairs, with the same tests and assertions.
-
-**Decision:** architect 29 trial queue row 4; sdlc owner go 2026-11-13 13:38. `setUp` (`test_record.py:126-129`) runs `git init` and an empty commit in each of 84 tests.
-
-**Spec:**
-1. Profile first: `python3 ~/.claude/scripts/test_times/module_cost.py --tree $PWD buildlog/test_record.py --tests 10 --commands 10`, under `systemd-run --user --scope -q -p MemoryMax=2G --unit=<a new name>`. Name the top costs by test, fixture and command.
-2. If the per-test `git init` and commit are a top cost: build one seed repository in `setUpClass` and copy it into each test's `self.repo`, as Phase 234 did in `unit_config_test_support.py`. Keep admission state, build records, environment and patches private per test. The copy must hold no absolute path into the seed.
-3. If the profile names a larger cost, report it to the director before you change the plan.
-4. Keep every test and assertion. Map each changed fixture step to the assertions that read its result.
-5. Run the module three times and basedpyright on each changed file. Give the before and after `module_cost.py` CPU.
-6. The director runs the aws pairs.
-
-**Files:**
-- `scripts/buildlog/test_record.py`
-
-**Workers:** 1 writer; one test module.
-- impl: all files.
-
-**Constraints from prior phases:**
-- Phase 232: no signal handlers anywhere.
-- Phase 234: the seed pattern in `unit_config_test_support.py` (class seed under a private home; `shutil.copytree` per test).
-- sdlc terms: test files only; every test and assertion stays; land only on a measured aws gain; report paired peak memory.
-
-**Acceptance gate:**
-- The same test count and assertions; the module passes three times.
-- `module_cost.py` CPU before and after, with the top costs named.
-- aws pairs (3 rounds) show a gain; peak memory reported.
+- `RecordTests.setUpClass` (`buildlog/test_record.py`) builds one seed repository under a private home: `git init` on `main` and one empty commit. `setUp` copies it into each test's `self.repo`. Admission state, build records, tools, environment and patches stay private per test.
+- Callers in other modules that build the fixture without class setup register the seed cleanup before the seed build, so a failed build leaves no seed. All 84 test bodies and assertions did not change.
+- aws paired trial, 3 rounds on m7a.8xlarge: CPU 11.874 to 11.493 s; peak 136.6 to 135.5 MiB. Admission (`admission_client.py`, 2.9 natedev CPU s) and `module_run.py` stay the top costs. Checkpoint `4f9a19c62`.
 
 ### Phase 238 — The models publication tests copy one publication fixture  · status: todo
 **Depends on:** Phase 234
@@ -3707,5 +3683,76 @@ The transitive config closure is deleted. An index read error gives `FullSuite` 
 
 **Acceptance gate:**
 - The same test count and assertions; the module passes three times.
+- `module_cost.py` CPU before and after, with the top costs named.
+- aws pairs (3 rounds) show a gain; peak memory reported.
+
+### Phase 239 — The unit config fixtures write formatted configs without Taplo  · status: todo
+**Depends on:** Phase 234
+
+#### Work Order
+
+**Goal:** The unit config fixture callers start fewer Taplo processes and use less CPU in aws pairs, with the same tests and assertions.
+
+**Decision:** architect 29 trial queue row 5; sdlc owner go 2026-11-13 13:38 (sdlc owns configuration behavior). `unit_config._formatted` (`scripts/production/unit_config.py:387`) starts Taplo for each config write. `test_unit_config.py` starts Taplo 158 times (1.16 natedev CPU s). The lifecycle fixture writes two configs in each of 56 `running()` calls.
+
+**Spec:**
+1. Profile first, each module under `systemd-run --user --scope -q -p MemoryMax=2G --unit=<a new name>`: `python3 ~/.claude/scripts/test_times/module_cost.py --tree $PWD production/test_unit_config.py production/test_production_lifecycle.py --tests 10 --commands 10`. Name the Taplo starts that fixture setup makes, apart from the starts that tests under test make.
+2. Remove only fixture-setup Taplo starts. Write formatted baseline bytes once per class, or copy them with the class seed or snapshot, so setup writes no config through Taplo again. Keep real Taplo in every format, refusal and publication test.
+3. Change test support files only. Do not change `unit_config.py` or any production code.
+4. If the profile shows that fixture setup makes few Taplo starts, report it to the director and stop before you change code.
+5. Keep every test and assertion. Map each changed fixture step to the assertions that read its result.
+6. Run each changed module and each caller of a changed support file three times, and basedpyright on each changed file. Give the before and after `module_cost.py` CPU.
+7. The director runs the aws pairs.
+
+**Files:**
+- `scripts/production/unit_config_test_support.py`
+- `scripts/production/production_lifecycle_test_support.py`
+
+**Workers:** 1 writer; shared fixture support.
+- impl: all files.
+
+**Constraints from prior phases:**
+- Phase 232: no signal handlers anywhere.
+- Phase 233: the lifecycle fixture copies a running snapshot per test from `running_snapshot`.
+- Phase 234: `UnitConfigFixture` copies a class seed repository per test.
+- sdlc terms: test files only; every test and assertion stays; land only on a measured aws gain; report paired peak memory.
+
+**Acceptance gate:**
+- The same test counts and assertions; each changed module passes three times.
+- `module_cost.py` CPU and Taplo starts before and after, with the top costs named.
+- aws pairs (3 rounds) show a gain; peak memory reported.
+
+### Phase 240 — The message process fixture finds descendants without a host scan  · status: todo
+**Depends on:** none
+
+#### Work Order
+
+**Goal:** The message process fixture finds owned descendants without a scan of every host process, and its importers use less CPU in aws pairs, with the same tests and assertions.
+
+**Decision:** next-items row 0a (host scans); sdlc owner go 2026-11-13 13:38. `OwnedTestProcesses.pin_descendants` (`scripts/message/process_test_support.py:90`) reads `/proc/<pid>/environ` for every process on the host, each time `stop_and_kill` (`:218`) loops. Phase 230 measured 53.9 natedev CPU s in 7 modules. The cost grows with the host process count, not with the test.
+
+**Spec:**
+1. Profile first, under `systemd-run --user --scope -q -p MemoryMax=2G --unit=<a new name>`: `python3 ~/.claude/scripts/test_times/module_cost.py --tree $PWD <each importer module> --tests 10`. Importers: `message/test_process_test_support.py`, `message/test_top_level.py`, `message/test_repeat_guard.py`, `message/test_notifier.py`, `message/test_rca.py`, `production/test_merge_gate_suites_resources.py`, `test_times/test_module_run.py`. Name the CPU in `pin_descendants`.
+2. On Linux, find owned descendants from the process tree under the test process, not from all of `/proc`. `scripts/lib/descendants.py` `adopt_descendants()` makes a process a child subreaper, so orphaned descendants stay in its tree. Read the tree through `/proc/<pid>/task/<tid>/children`, then check the owner marker only on those processes. Keep the pidfd pin and the stop, kill and reap order.
+3. A descendant that leaves the tree (a new session that is not reparented to the subreaper) must still be found, or the change must prove that the subreaper keeps it. Map each case to the test that proves it.
+4. Keep the macOS path (`darwin.user_processes`) unchanged unless the profile shows a cost there.
+5. Change test support files only. No signal handlers.
+6. Keep every test and assertion. Map each changed step to the assertions that read its result.
+7. Run each importer three times, and basedpyright on each changed file. Give the before and after `module_cost.py` CPU.
+8. The director runs the aws pairs.
+
+**Files:**
+- `scripts/message/process_test_support.py`
+
+**Workers:** 1 writer; one shared fixture and its importers.
+- impl: all files.
+
+**Constraints from prior phases:**
+- Phase 230: the host-scan census that measured this cost.
+- Phase 232: no signal handlers anywhere.
+- sdlc terms: test files only; every test and assertion stays; land only on a measured aws gain; report paired peak memory.
+
+**Acceptance gate:**
+- The same test counts and assertions; each importer passes three times.
 - `module_cost.py` CPU before and after, with the top costs named.
 - aws pairs (3 rounds) show a gain; peak memory reported.
