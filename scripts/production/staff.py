@@ -577,8 +577,16 @@ class StaffSnapshot:
         row = self.by_member_reference(reference)
         return self.parent_of(row) if row is not None and row.kind == "worker" else row
 
+    @cached_property
+    def rows_by_current_session(self) -> dict[str, StaffRow]:
+        """The first row for each session, as a scan in row order finds it."""
+        found: dict[str, StaffRow] = {}
+        for row in self.rows:
+            _ = found.setdefault(row.current_session, row)
+        return found
+
     def by_current_session(self, session_id: str) -> StaffRow | None:
-        return next((row for row in self.rows if row.current_session == session_id), None)
+        return self.rows_by_current_session.get(session_id)
 
     def by_member_reference(self, reference: str) -> StaffRow | None:
         """Resolve a persisted fixed member id or its current conversation."""

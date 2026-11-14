@@ -25,7 +25,7 @@ from scripts.copies.copies_test_support import copies_environment
 
 from scripts.lint.memory_test_support import write_config_fixture, config_environment
 
-from scripts.mac_test import offload, mac_test
+from scripts.mac_test import eligibility, offload, mac_test
 from scripts.lib import conf
 from scripts.buildlog import treekey
 from scripts.mac_test.offload_test_commands import COMMAND_STUB, write_shell
@@ -118,7 +118,7 @@ class RemoteClaimRecord(TypedDict):
     since: str
     remote_host: str
 
-HANA = offload.KnownRepository("hana")
+HANA = eligibility.KnownRepository("hana")
 
 FIXTURE_MIRROR_ROOT = conf.read(Path(__file__).resolve().parents[2] / "config/mac_test.conf").text("mirror_root").removeprefix("~/")
 
@@ -362,11 +362,11 @@ class OffloadCommandFixture(unittest.TestCase):
         filter_run: bool = False,
         timeout: float = test_hang_guard.TEST_HANG_GUARD_SECS,
         subprocess_cli: bool = False,
-        settings: Path | offload.DefaultMacSettings = offload.DEFAULT_MAC_SETTINGS,
+        settings: Path | eligibility.DefaultMacSettings = eligibility.DEFAULT_MAC_SETTINGS,
         last_decline: str = "",
         separate_stderr: bool = False,
         copy: bool = False,
-        verb: offload.MacVerb = "nextest",
+        verb: eligibility.MacVerb = "nextest",
         package: str = "hana",
         source: offload.MacSource = WORKING_TREE_SOURCE,
         runner_options: tuple[str, ...] = (),
@@ -416,7 +416,7 @@ class OffloadCommandFixture(unittest.TestCase):
         program = r'''
 import subprocess
 import sys
-from scripts.mac_test import offload
+from scripts.mac_test import eligibility, offload
 
 clock = [100.0]
 offload.time.monotonic = lambda: clock[0]

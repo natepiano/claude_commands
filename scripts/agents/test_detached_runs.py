@@ -1360,6 +1360,31 @@ class PaneRunDeliveryTests(unittest.TestCase):
                 with patch.dict(os.environ, {"CODEX_THREAD_ID": row.id}):
                     self.assertIsInstance(detached_runs.caller_from_environment({variable: row.id}), detached_runs.NotDetachedWorker)
 
+    def test_a_unit_director_with_a_run_folder_owns_its_run_and_hears_its_result(self) -> None:
+        director = self.fixture.parent
+        self.assertEqual(director.kind, "unit")
+        runs = self.run_dir / detached_runs.DETACHED_RUNS_DIR
+        with (patch.dict(os.environ, {"CODEX_THREAD_ID": "", "CLAUDE_CODE_SESSION_ID": director.current_session}),
+              patch.object(treekey, "tree_key", return_value="private-tree"),
+              patch.object(subprocess, "Popen", return_value=SimpleNamespace(pid=0)) as spawn,
+              contextlib.redirect_stdout(io.StringIO()) as output):
+            self.assertEqual(detached_runs.main(["start", "--", "private-land"]), detached_runs.NOT_A_DETACHED_WORKER)
+            spawn.assert_not_called()
+            self.assertEqual(detached_runs.main(["start", "--session-dir", str(self.run_dir), "--", "private-land"]), 0,
+                             output.getvalue())
+        spawn.assert_called_once()
+        path, = runs.glob("*.json")
+        record = cast(detached_runs.RunRecord, json.loads(path.read_text()))
+        self.assertEqual((record["session_dir"], record["worker"], record["staff_id"]),
+                         (str(self.run_dir), director.name, director.id))
+        write_text_atomic(Path(record["log"]), "Private land completed.\n")
+        self.assertIn("sent", detached_runs.deliver(record, detached_runs.CompletedCommand(0)))
+        self.assertEqual(self.inputs, [])
+        target, text = self.notices[-1]
+        self.assertEqual((len(self.notices), target), (1, director.id))
+        self.assertIn(f"Detached run: {record['run_id']}", text)
+        self.assertIn("Private land completed.", text)
+
     def test_a_pane_workers_run_keeps_its_owner_when_options_name_another_worker(self) -> None:
         row = self.fixture.worker("TEST-command-owner", family="codex")
         other = self.fixture.worker("TEST-impl", family="codex")

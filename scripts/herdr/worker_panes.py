@@ -276,8 +276,12 @@ class WorkerLockHold:
 
 
 @contextmanager
-def worker_lock(parent: StaffId, name: WorkerName, *, blocking: bool = False) -> Generator[WorkerLockHold | Kept]:
-    """Serialize creation, then hold the published worker's fixed-id lock."""
+def worker_lock(parent: StaffId, name: WorkerName, *, blocking: bool = False,
+                deadline: float = worker_lifecycle.NO_LOCK_DEADLINE) -> Generator[WorkerLockHold | Kept]:
+    """Serialize creation, then hold the published worker's fixed-id lock.
+
+    A deadline waits for a published worker's lock until that monotonic time.
+    """
     with ExitStack() as operations:
         record = staff.snapshot()
         row = worker_admission.find_worker(record, parent, name.value)
@@ -294,7 +298,7 @@ def worker_lock(parent: StaffId, name: WorkerName, *, blocking: bool = False) ->
         hold = WorkerLockHold(parent, name, operations, blocking=blocking)
         try:
             if row is not None:
-                hold.bind(row)
+                hold.bind(row, deadline=deadline)
         except BlockingIOError:
             yield Kept("dispatch lock is held")
             return
@@ -586,14 +590,20 @@ def worker_run_directories(record: staff.StaffSnapshot) -> unit_runs.LauncherRun
     if not workers:
         return unit_runs.LauncherRunDirectories({}, {})
     scanned = parent_run_index(record)
+    # Workers share their parent's runs; read them once for each parent.
+    parents: dict[StaffId, tuple[list[str], tuple[Path, ...]]] = {}
     found: dict[StaffId, tuple[Path, ...]] = {}
     for row in workers:
         parent = record.parent_of(row) or row
-        selected = worker_run(row, record=record, scanned=scanned)
-        held = unit_runs.held(str(parent.current_session), record=record, scanned=scanned)
-        recorded = (parent.run.path,) if isinstance(parent.run, staff.OpenRun) else ()
-        found[row.id] = tuple(dict.fromkeys((selected, *(Path(directory) for directory in held),
-                                            *recorded, worker_fallback_run(parent, record=record))))
+        if parent.id not in parents:
+            held = unit_runs.held(str(parent.current_session), record=record, scanned=scanned)
+            recorded = (parent.run.path,) if isinstance(parent.run, staff.OpenRun) else ()
+            fallback = worker_fallback_run(parent, record=record)
+            parents[parent.id] = (_parent_runs(parent, held), (*(Path(directory) for directory in held), *recorded, fallback))
+        runs, shared = parents[parent.id]
+        selected = (_worker_run_in(row, parent, runs, record=record) if parent is not row
+                    else worker_run(row, record=record, scanned=scanned))
+        found[row.id] = tuple(dict.fromkeys((selected, *shared)))
     return unit_runs.LauncherRunDirectories(found, scanned)
 
 
@@ -611,24 +621,32 @@ def worker_run(member: staff.StaffRow, *,
         return unit_runs.state_dir() / "staff" / "workers" / member.id
     if scanned is None:
         scanned = parent_run_index(record)
-    runs = unit_runs.held(str(parent.current_session), record=record, scanned=scanned)
-    if isinstance(parent.run, staff.OpenRun):
-        runs = list(dict.fromkeys((str(parent.run.path), *runs)))
+    runs = _parent_runs(parent, unit_runs.held(str(parent.current_session), record=record, scanned=scanned))
+    return (_worker_run_in(member, parent, runs, record=record) if member.kind == "worker"
+            else Path(runs[0]) if runs else worker_fallback_run(parent, record=record))
+
+
+def _parent_runs(parent: staff.StaffRow, held: list[str]) -> list[str]:
+    """Order the parent's open run, its held runs, then a supplied run that it owns."""
+    runs = list(dict.fromkeys((str(parent.run.path), *held))) if isinstance(parent.run, staff.OpenRun) else held
     if supplied := unit_runs.environ("RUN_DIR"):
         fields = worker_lifecycle.read_json_object(Path(supplied) / recorder_state.STATE_FILENAME)
         if fields.get(unit_runs.OWNER_FIELD) == parent.id:
             runs = list(dict.fromkeys((*runs, supplied)))
-    fallback = Path(runs[0]) if runs else worker_fallback_run(parent, record=record)
-    if member.kind == "worker":
-        from scripts.direct import progress_history
+    return runs
 
-        dispatched = progress_history.recorded_dispatch_run(member.id)
-        linked = (dispatched.directory,) if isinstance(dispatched, progress_history.RecordedDispatchRun) else ()
-        candidates = dict.fromkeys((*(Path(run) for run in runs), *linked, fallback))
-        passes = [(run, passed) for run in candidates if (passed := worker_pass(member, run, record=record))]
-        if passes:
-            return max(passes, key=lambda item: _pass_started_at(item[1]))[0]
-    return fallback
+
+def _worker_run_in(member: staff.StaffRow, parent: staff.StaffRow, runs: list[str], *,
+                   record: staff.StaffSnapshot) -> Path:
+    """Select the parent run that holds the worker's newest pass."""
+    from scripts.direct import progress_history
+
+    fallback = Path(runs[0]) if runs else worker_fallback_run(parent, record=record)
+    dispatched = progress_history.recorded_dispatch_run(member.id)
+    linked = (dispatched.directory,) if isinstance(dispatched, progress_history.RecordedDispatchRun) else ()
+    candidates = dict.fromkeys((*(Path(run) for run in runs), *linked, fallback))
+    passes = [(run, passed) for run in candidates if (passed := worker_pass(member, run, record=record))]
+    return max(passes, key=lambda item: _pass_started_at(item[1]))[0] if passes else fallback
 
 
 def _passes(state: dict[str, object]) -> list[dict[str, object]]:

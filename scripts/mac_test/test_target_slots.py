@@ -29,7 +29,7 @@ from unittest import mock
 
 SCRIPTS = Path(__file__).resolve().parents[1]
 
-from scripts.mac_test import claim_state, mac_test, offload
+from scripts.mac_test import eligibility, claim_state, mac_test, offload
 from scripts.build_hold import build_hold
 from scripts.build_targets import targets
 from scripts.lint.memory_test_support import config_environment, write_config_fixture
@@ -48,19 +48,19 @@ class RepositoryKeyTests(unittest.TestCase):
                               capture_output=True, text=True).stdout.strip()
 
     def test_real_origin_forms_keep_the_normalized_repository_key(self) -> None:
-        expected = offload.KnownRepository("project", "https://github.com/nate/project")
+        expected = eligibility.KnownRepository("project", "https://github.com/nate/project")
         for remote in ("git@GitHub.com:nate/project.git", "https://github.com/nate/project.git"):
             with self.subTest(remote=remote):
                 _ = self.git("config", "remote.origin.url", remote)
-                self.assertEqual(offload.repository_identity(self.root), expected)
+                self.assertEqual(eligibility.repository_identity(self.root), expected)
 
     def test_real_repository_without_origin_keeps_the_root_commit_key(self) -> None:
         root_commit = commit_repository(self.root, "Fixture", allow_empty=True)
-        self.assertEqual(offload.repository_identity(self.root),
-                         offload.KnownRepository("project", "git-root:" + root_commit))
+        self.assertEqual(eligibility.repository_identity(self.root),
+                         eligibility.KnownRepository("project", "git-root:" + root_commit))
 
     def test_real_repository_without_commits_keeps_the_repository_name(self) -> None:
-        self.assertEqual(offload.repository_identity(self.root), offload.KnownRepository("project"))
+        self.assertEqual(eligibility.repository_identity(self.root), eligibility.KnownRepository("project"))
 
     def test_attempt_without_commits_or_origin_records_unknown_identity(self) -> None:
         log_root = self.root.parent / "buildlog"
@@ -84,7 +84,7 @@ class RepositoryKeyTests(unittest.TestCase):
 
         sys.setprofile(collect_file)
         try:
-            _ = offload.repository_identity(self.root)
+            _ = eligibility.repository_identity(self.root)
         finally:
             sys.setprofile(None)
         self.assertNotIn("memory_admit.py", {Path(file).name for file in files})
@@ -223,14 +223,14 @@ class RepositorySlotTests(unittest.TestCase):
         clone = self.repository("tmp/phase-copy", "https://github.com/nate/hana/")
         linked = self.repository("worktrees/feature", "ssh://git@github.com:22/nate/hana.git", main)
 
-        identities = [offload.repository_identity(path) for path in (main, clone, linked)]
+        identities = [eligibility.repository_identity(path) for path in (main, clone, linked)]
 
-        known = [identity for identity in identities if isinstance(identity, offload.KnownRepository)]
+        known = [identity for identity in identities if isinstance(identity, eligibility.KnownRepository)]
         self.assertEqual(len(known), 3)
         self.assertEqual(len({identity.key for identity in known}), 1)
         self.assertEqual([identity.name for identity in known], ["hana", "phase-copy", "hana"])
-        self.assertIsInstance(identities[0], offload.KnownRepository)
-        self.assertEqual(cast(offload.KnownRepository, identities[0]).name, "hana")
+        self.assertIsInstance(identities[0], eligibility.KnownRepository)
+        self.assertEqual(cast(eligibility.KnownRepository, identities[0]).name, "hana")
         self.assertEqual(self.claim("mac", main, 101)[0], 0)
         self.assertEqual(self.claim("mac", clone, 102)[0], 0)
 
@@ -247,7 +247,7 @@ class RepositorySlotTests(unittest.TestCase):
         first = self.repository("first/project", "https://github.com/first/project.git")
         second = self.repository("second/project", "https://github.com/second/project.git")
 
-        self.assertNotEqual(offload.repository_identity(first), offload.repository_identity(second))
+        self.assertNotEqual(eligibility.repository_identity(first), eligibility.repository_identity(second))
         self.assertEqual(self.claim("mac", first, 101)[0], 0)
         self.assertEqual(self.claim("mac", second, 102)[0], 11)
         self.assertEqual(set(self.claims("mac")), {101})
@@ -272,18 +272,18 @@ class RepositorySlotTests(unittest.TestCase):
         alternates.parent.mkdir(parents=True)
         _ = alternates.write_text(str(main / ".git/objects") + "\n")
 
-        expected = offload.repository_identity(main)
+        expected = eligibility.repository_identity(main)
 
-        self.assertEqual(offload.repository_identity(local), expected)
-        self.assertEqual(offload.repository_identity(shared), expected)
+        self.assertEqual(eligibility.repository_identity(local), expected)
+        self.assertEqual(eligibility.repository_identity(shared), expected)
 
     def test_credentials_and_default_ports_do_not_change_identity(self) -> None:
         first = self.repository("one/project", "https://user@example.com:443/team/project.git?view=1#readme")
         second = self.repository("two/project", "ssh://git@example.com:22/team/project.git")
         third = self.repository("three/project", "https://example.com:8443/team/project.git")
 
-        self.assertEqual(offload.repository_identity(first), offload.repository_identity(second))
-        self.assertNotEqual(offload.repository_identity(second), offload.repository_identity(third))
+        self.assertEqual(eligibility.repository_identity(first), eligibility.repository_identity(second))
+        self.assertNotEqual(eligibility.repository_identity(second), eligibility.repository_identity(third))
 
     def test_concurrent_requests_never_share_a_slot(self) -> None:
         root = self.repository("project", "https://github.com/nate/project.git")
@@ -412,9 +412,9 @@ class RepositorySlotTests(unittest.TestCase):
 
     def test_linux_mirrors_use_the_build_folder_rule_without_percent_encoding_the_key(self) -> None:
         cases = (
-            (offload.KnownRepository("checkout", "https://example.com/one/hana"), "hana-33d435bf"),
-            (offload.KnownRepository("checkout", "https://example.com/two/hana"), "hana-020748b0"),
-            (offload.KnownRepository("project", "git-root:" + "1" * 40), "project-c8446dca"),
+            (eligibility.KnownRepository("checkout", "https://example.com/one/hana"), "hana-33d435bf"),
+            (eligibility.KnownRepository("checkout", "https://example.com/two/hana"), "hana-020748b0"),
+            (eligibility.KnownRepository("project", "git-root:" + "1" * 40), "project-c8446dca"),
         )
         mirrors: set[str] = set()
         for repository, name in cases:
@@ -425,17 +425,17 @@ class RepositorySlotTests(unittest.TestCase):
                 self.assertIn("%", repository.path_key)
                 mirrors.add(mirror)
         self.assertEqual(len(mirrors), len(cases))
-        self.assertEqual(offload.remote_mirror(offload.KnownRepository("other-copy", cases[0][0].key), "linux", 2),
+        self.assertEqual(offload.remote_mirror(eligibility.KnownRepository("other-copy", cases[0][0].key), "linux", 2),
                          offload.remote_mirror(cases[0][0], "linux", 2))
 
     def test_linux_mirrors_isolate_origins_slots_and_build_folders(self) -> None:
         first = self.repository("one/project", "ssh://git@example.com/a/project.git")
         second = self.repository("two/project", "https://example.com/b/project.git")
-        first_id = offload.repository_identity(first)
-        second_id = offload.repository_identity(second)
-        self.assertIsInstance(first_id, offload.KnownRepository)
-        self.assertIsInstance(second_id, offload.KnownRepository)
-        if not isinstance(first_id, offload.KnownRepository) or not isinstance(second_id, offload.KnownRepository):
+        first_id = eligibility.repository_identity(first)
+        second_id = eligibility.repository_identity(second)
+        self.assertIsInstance(first_id, eligibility.KnownRepository)
+        self.assertIsInstance(second_id, eligibility.KnownRepository)
+        if not isinstance(first_id, eligibility.KnownRepository) or not isinstance(second_id, eligibility.KnownRepository):
             self.fail("Repository identity must resolve before selecting a mirror")
         mirrors = [offload.remote_mirror(first_id, "linux", 1), offload.remote_mirror(first_id, "linux", 2),
                    offload.remote_mirror(second_id, "linux", 1)]
@@ -448,7 +448,7 @@ class RepositorySlotTests(unittest.TestCase):
             self.assertEqual(path.name, f"linux-s{slot}")
             self.assertNotIn("..", path.parts)
         self.assertEqual(offload.remote_mirror(first_id), ".local/state/mac-test/mirror/project")
-        config = offload.read_config(self.root / "linux.conf")
+        config = eligibility.read_config(self.root / "linux.conf")
         request = offload.OffloadRequest(first, "project", "call", offload.NO_RESULT_FILE, (), owner="verify", target="linux", slot=2, holder_session="fixture-session")
 
         command = offload.remote_test_command(config, request, first_id)
@@ -468,9 +468,9 @@ class RepositorySlotTests(unittest.TestCase):
 
     def test_origin_name_does_not_move_a_legacy_mac_mirror_or_claim(self) -> None:
         root = self.repository(".claude", "https://github.com/nate/claude_commands.git")
-        identity = offload.repository_identity(root)
-        self.assertIsInstance(identity, offload.KnownRepository)
-        if not isinstance(identity, offload.KnownRepository):
+        identity = eligibility.repository_identity(root)
+        self.assertIsInstance(identity, eligibility.KnownRepository)
+        if not isinstance(identity, eligibility.KnownRepository):
             self.fail("The repository must have a known identity")
         self.assertEqual(identity.name, ".claude")
         self.assertEqual(identity.key, "https://github.com/nate/claude_commands")
@@ -548,8 +548,8 @@ class RepositorySlotTests(unittest.TestCase):
             "targets=mac,linux,natedev", "targets=mac,linux,darwin,natedev")
             + "kind.darwin=ssh\nplatform.darwin=macos\nsettings.darwin=mac.conf\n")
         root = self.repository("project", "https://github.com/nate/project.git")
-        identity = offload.repository_identity(root)
-        if not isinstance(identity, offload.KnownRepository):
+        identity = eligibility.repository_identity(root)
+        if not isinstance(identity, eligibility.KnownRepository):
             self.fail("The repository must have a known identity")
         self.assertEqual(offload.remote_mirror(identity, "darwin"), ".local/state/mac-test/mirror/project")
         self.assertEqual(self.claim("darwin", root, 101)[0], 0)
@@ -592,7 +592,7 @@ class RepositorySlotTests(unittest.TestCase):
         self.assertEqual(len({record.get("slot") for record in self.claims("linux").values()}), 3)
 
     def test_mac_skip_keeps_legacy_filters_when_linux_filter_support_expands(self) -> None:
-        identity = offload.KnownRepository("hana", "https://github.com/nate/hana")
+        identity = eligibility.KnownRepository("hana", "https://github.com/nate/hana")
         settings = self.root / "mac.conf"
         _ = write_config_fixture(settings, settings.read_text() + "mac_skip.hana=test(gpu)\n",
                                  template="mac_test")
@@ -607,7 +607,7 @@ class RepositorySlotTests(unittest.TestCase):
             with self.subTest(words=words):
                 request = offload.OffloadRequest(self.root / "hana", "hana", "call", offload.NO_RESULT_FILE, words, owner="verify", holder_session="fixture-session")
 
-                command = offload.remote_test_command(offload.read_config(settings), request, identity)
+                command = offload.remote_test_command(eligibility.read_config(settings), request, identity)
 
                 invocation = shlex.split(command.rpartition("; echo mac_exit=$?")[0])
                 start = invocation.index("~/.claude/scripts/lint/lint") + 1

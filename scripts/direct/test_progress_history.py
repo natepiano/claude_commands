@@ -511,6 +511,8 @@ print('two homes isolated; recorder lock retained; caller restored')
         environment["USER_ZONE"] = "UTC"
         self.isolate_recorder_roots(environment)
         self.isolate_identity(environment)
+        # The refresh process starts only when a vault is present.
+        Path(environment["PHASE_TABLE_VAULT"]).parent.mkdir(parents=True, exist_ok=True)
         stdout = io.StringIO()
         stderr = io.StringIO()
         if isinstance(refresh_result, BaseException):
@@ -4083,6 +4085,23 @@ with patch.object(fcntl, "flock", admission):
         self.finish_slot_pass(session, "impl", "completed", 41_040)
         self.assertEqual(self.pass_slots(session)["impl"]["status"], "completed")
         self.assertEqual(len(self.pass_events("refused-pass", "pass_finished")), 1)
+
+    def test_stopped_worker_passes_end_as_canceled_and_other_workers_keep_theirs(self) -> None:
+        session = self.start_run("canceled-pass", 41_000, staff_owned=True)
+        owner = unit_runs.run_owner(self.read_state(session), staff.local_snapshot())
+        assert isinstance(owner, staff.StaffRow)
+        stopped = fixture_worker("implementer", owner.id)
+        _ = fixture_worker("review2", owner.id)
+        self.start_phase(session, 41_010)
+        self.start_slot_pass(session, "impl", "impl", 41_020, worker_name="implementer")
+        self.start_slot_pass(session, "review", "review", 41_030, worker_name="review2")
+        with patch.dict(os.environ, {"HOME": str(self.root)}):
+            self.assertEqual(progress_history.cancel_worker_passes(session, stopped.id), 1)
+            self.assertEqual(progress_history.cancel_worker_passes(session, stopped.id), 0)
+        self.assertEqual(self.pass_slots(session)["impl"]["status"], "canceled")
+        self.assertEqual(self.pass_slots(session)["review"]["status"], "active")
+        finished = self.pass_events("canceled-pass", "pass_finished")
+        self.assertEqual([event["status"] for event in finished], ["canceled"])
 
     def test_invalid_launcher_arguments_leave_the_active_pass_unchanged(self) -> None:
         session = self.start_run("invalid-launcher", 41_000)

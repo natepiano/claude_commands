@@ -1230,7 +1230,8 @@ def widen(repo: Path, ticket_id: str, paths: tuple[str, ...], reason: str, by: s
 
 
 def run_verification_step(repo: Path, stage: str, package: str) -> subprocess.CompletedProcess[bytes]:
-    return subprocess.run(["bash", str(Path.home() / ".claude/scripts/direct/verify.sh"), stage, package],
+    """Run one verify.sh stage for the package, or for the workspace when the package is ""."""
+    return subprocess.run(["bash", str(Path.home() / ".claude/scripts/direct/verify.sh"), stage, *([package] if package else [])],
                           cwd=repo, check=False)
 
 
@@ -1298,22 +1299,30 @@ def verify_source(ledger: style_ledger.Ledger, repo: Path, ticket_id: str, view:
     tree = git(repo, "rev-parse", f"{snapshot}^{{tree}}").strip()
     sources = style_footprint.RevisionTree(ledger.repo, snapshot)
     changed = ledger.ticket_changed_paths(ticket, snapshot)
-    if any(path.endswith((".rs", "Cargo.toml", "Cargo.lock")) and sources.crate(path) != ticket["crate"]
-           for path in changed if path):
-        raise style_ledger.LedgerError(f"{ticket_id}: verification crosses crate boundaries")
-    manifest: dict[str, object] = tomllib.loads(sources.text(str(PurePosixPath(ticket["crate"]) / "Cargo.toml")))
+    crates = {ticket["crate"]} | {sources.crate(path) for path in changed
+                                  if path.endswith((".rs", "Cargo.toml", "Cargo.lock"))}
+    names = {verified_package(sources, crate) for crate in crates}
+    packages = [""] if "" in names else sorted(names)
+    for stage in ("check", "lint", "test"):
+        for package in packages:
+            status = run_verification_step(view.repo, stage, package).returncode
+            if status:
+                return status
+            current = ticket_snapshot(ledger, ticket, repo) if view.isolated else style_footprint.worktree_commit(repo)
+            if git(repo, "rev-parse", f"{current}^{{tree}}").strip() != tree:
+                raise style_ledger.LedgerError(f"{ticket_id}: tree changed during {stage}")
+    return 0
+
+
+def verified_package(sources: style_footprint.RevisionTree, crate: str) -> str:
+    """The crate's package name, or "" for a folder with no package: the workspace root."""
+    manifest_path = str(PurePosixPath(crate) / "Cargo.toml")
+    if manifest_path not in sources.paths:
+        return ""
+    manifest: dict[str, object] = tomllib.loads(sources.text(manifest_path))
     package_table = manifest.get("package")
     package = cast(dict[str, object], package_table).get("name", "") if isinstance(package_table, dict) else ""
-    if not isinstance(package, str) or not package:
-        raise style_ledger.LedgerError(f"{ticket_id}: no package to verify")
-    for stage in ("check", "lint", "test"):
-        status = run_verification_step(view.repo, stage, package).returncode
-        if status:
-            return status
-        current = ticket_snapshot(ledger, ticket, repo) if view.isolated else style_footprint.worktree_commit(repo)
-        if git(repo, "rev-parse", f"{current}^{{tree}}").strip() != tree:
-            raise style_ledger.LedgerError(f"{ticket_id}: tree changed during {stage}")
-    return 0
+    return package if isinstance(package, str) else ""
 
 
 @dataclass(frozen=True)

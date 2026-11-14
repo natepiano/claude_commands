@@ -65,14 +65,26 @@ REAL_LAUNCH_WORKER_MOVES = cast(Callable[[str, str], None], getattr(accounts, "_
 REFUSAL_ACTION = "At chatgpt.com/codex/settings/usage, add credits for account codex1."
 
 
+class WorkerModeRequests(list[list[str]]):
+    """Notice requests; `stops` holds the requests that stop the Codex workers."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.stops: list[list[str]] = []
+
+
 @contextmanager
-def worker_mode_broadcasts() -> Generator[list[list[str]]]:
-    """Record notice requests without starting transient units."""
-    sent: list[list[str]] = []
+def worker_mode_broadcasts() -> Generator[WorkerModeRequests]:
+    """Record notice and worker stop requests without starting transient units."""
+    sent = WorkerModeRequests()
 
     def record(arguments: list[str], **options: object) -> subprocess.CompletedProcess[str]:
         if "--no-block" in arguments:
-            sent.append(arguments[arguments.index("--from"):])
+            if "--from" in arguments:
+                sent.append(arguments[arguments.index("--from"):])
+            else:
+                script = arguments.index("--") + 2
+                sent.stops.append([Path(arguments[script]).name, *arguments[script + 1:]])
             return subprocess.CompletedProcess(arguments, 0, "", "")
         run = cast(Callable[..., subprocess.CompletedProcess[str]], subprocess.run)
         return run(arguments, **options)
@@ -127,7 +139,7 @@ class QuotaReminderFixture(unittest.TestCase):
         self.push_errors: list[quota_alert.PushDelivery] = []
         self.pushed: list[tuple[str, str, quota_alert.Ask]] = []
         self.noted: list[RenderedPush] = []
-        self.broadcasts: list[list[str]] = []
+        self.broadcasts: WorkerModeRequests = WorkerModeRequests()
         self.credits: set[str] = set()
 
     @override
@@ -382,8 +394,6 @@ def complete_worker_moves(readings: quota_alert.CodexAlertPassReadings,
 
 class CodexZeroEpisodeFixture(unittest.TestCase):
     root: Path = Path()
-    broadcasts: list[list[str]] = []
-
     now: datetime = datetime.now(timezone.utc)
 
     def __init__(self, methodName: str = "runTest") -> None:
@@ -392,6 +402,7 @@ class CodexZeroEpisodeFixture(unittest.TestCase):
         self.relay: mock.MagicMock = mock.MagicMock()
         self.swap: mock.MagicMock = mock.MagicMock()
         self.credits: set[str] = set()
+        self.broadcasts: WorkerModeRequests = WorkerModeRequests()
 
     @override
     def setUp(self) -> None:

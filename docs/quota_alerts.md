@@ -21,7 +21,8 @@ The move preserves its native conversation, pane, and terminal.
 The launcher reads the transcript before another submission.
 
 The refusal sends one relay to the director of the stopped worker after the refusal is routed.
-The relay says that the pass stays open, names the outcome when it is known, and tells the director not to rerun the assign command.
+The relay names the outcome when it is known and tells the director not to rerun the assign command.
+The pass stays open, except when no-worker mode started: then the stop of the Codex workers ends it as canceled.
 The outcome is one of these: workers moved to an account, workers wait for a reset time, or no-worker mode started.
 The caller supplies `--stopped <session id> <worker>`.
 Unknown directors receive no message; a waiting follow keeps its continuation.
@@ -99,7 +100,7 @@ An account with credits off cannot buy room from its credit balance.
 
 While credits are on, an hourly forecast is logged; only the first hourly forecast also goes to the phone, with phone-only retries on failure. It uses decreases in numeric balances from `agent-notes/readings.jsonl`, skips purchases and divides usage by the observed interval. Less than 30 minutes of observation or a newest reading older than 10 minutes makes usage unknown. Whole-credit rounding may report zero use; a missing observation never means zero use. Unlimited and unknown balances are stated explicitly.
 
-The paid-credits opening notice uses `quota.paid_credits`. While a workers move is queued, every send and retry uses `quota.paid_credits_queued`: workers spend credits until the move runs, or wait if credits run out or are turned off. The saved notice keeps the ordinary values. If the queue empties before a retry, that retry uses `quota.paid_credits` again. Old saved notices are rebuilt from the current account reading. Both notices give the action to remove the account from `codex_credit_accounts`. An episode rereads this setting on every pass. The first on-to-off change requests the credits-off move once, stops forecasts and repeats no opening alert.
+The paid-credits opening notice uses `quota.paid_credits`. While a workers move is queued, every send and retry uses `quota.paid_credits_queued`: workers spend credits until the move runs, or wait if credits run out or are turned off. The saved notice keeps the ordinary values. If the queue empties before a retry, that retry uses `quota.paid_credits` again. Old saved notices are rebuilt from the current account reading. Both notices give the action to remove the account from `codex_credit_accounts`. An episode rereads this setting on every pass. The first on-to-off change requests the credits-off move once, stops forecasts and repeats no opening alert. When the workers stay on the account, that change also turns on no-worker mode and stops the Codex workers. An off-to-on change is recorded in the episode, so a later on-to-off change acts again.
 
 
 Replay checks defer entries when their journal cannot be read or decoded. An undecodable final line with no trailing newline is skipped with a log naming the file; an undecodable middle line still blocks. Rows are appended as complete encoded lines. See `docs/accounts.md` for the engine guards and install order.
