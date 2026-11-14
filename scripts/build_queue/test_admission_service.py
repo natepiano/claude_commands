@@ -292,7 +292,7 @@ class LocalHoldPlacementTests(unittest.TestCase):
         from scripts.build_queue import placement
         from scripts.build_queue.test_placement import placement_request
         from scripts.build_targets import build_targets, target_config
-        from scripts.mac_test import claim_state, mac_test, offload
+        from scripts.mac_test import claim_state, eligibility, mac_test
 
         for failure in (OSError("ssh missing"), subprocess.TimeoutExpired("ssh", 1),
                         subprocess.CompletedProcess(["ssh"], 255, "", "unreachable")):
@@ -316,7 +316,7 @@ class LocalHoldPlacementTests(unittest.TestCase):
                      mock.patch.object(claim_state, "read_claims", return_value=(held,)), \
                      mock.patch.object(claim_state, "target_claim_scope", return_value=destination.scope), \
                      mock.patch.object(mac_test, "run_is_live", return_value=False), \
-                     mock.patch.object(offload, "repository_identity", return_value=offload.KnownRepository("hana")), \
+                     mock.patch.object(eligibility, "repository_identity", return_value=eligibility.KnownRepository("hana")), \
                      mock.patch.object(subprocess, "run") as probe:
                     if isinstance(failure, BaseException):
                         probe.side_effect = failure
@@ -333,7 +333,7 @@ class LocalHoldPlacementTests(unittest.TestCase):
                     self.assertEqual(second.claims[0].reference.claim_id, "retained")
                     self.assertIsInstance(second.executions[0][1], placement.ExecutionEvidenceUnavailable)
                     self.assertEqual(probe.call_count, 1)
-                    self.assertIsInstance(offload.read_backoff(time.time(), "linux"), offload.ActiveBackoff)
+                    self.assertIsInstance(eligibility.read_backoff(time.time(), "linux"), eligibility.ActiveBackoff)
 
     def test_hanging_or_failing_target_readers_do_not_delay_a_view(self) -> None:
         from scripts.build_queue import placement

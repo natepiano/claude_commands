@@ -184,11 +184,11 @@ class FinalRemoteEnvironmentTests(VerifyMacOffloadFixture):
     def setUp(self) -> None:
         super().setUp()
         observe = f'''with open({str(VERIFY.parents[2] / "scripts/lib/package_root.py")!r}) as package_root: exec(package_root.read(), {{"__file__": package_root.name}})
-from scripts.mac_test import offload
+from scripts.mac_test import eligibility, offload
 parsed = offload.parser().parse_args(namespace=offload.CliArguments())
 request = offload.request_from_arguments(parsed)
-config = offload.read_config(Path(parsed.settings))
-command = offload.remote_test_command(config, request, offload.KnownRepository("hana"))
+config = eligibility.read_config(Path(parsed.settings))
+command = offload.remote_test_command(config, request, eligibility.KnownRepository("hana"))
 with Path(os.environ["TEST_RUNNER_STATE"], "remote-commands").open("a") as output:
     output.write(json.dumps({{"verb": request.verb, "environment": dict(request.environment),
                              "command": command, "copy": parsed.copy}}) + "\\n")

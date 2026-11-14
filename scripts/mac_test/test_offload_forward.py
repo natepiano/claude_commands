@@ -10,7 +10,7 @@ import signal
 import time
 from typing import cast
 
-from scripts.mac_test import offload
+from scripts.mac_test import eligibility, offload
 from scripts.buildlog import sync as buildlog_sync
 from scripts.mac_test.offload_test_support import HANA, OffloadCommandFixture
 from scripts.lib import test_hang_guard
@@ -70,7 +70,7 @@ class OffloadForwardTests(OffloadCommandFixture):
 
     def test_default_remote_command_is_byte_equal_and_fetch_alone_keeps_artifacts(self) -> None:
         request = offload.OffloadRequest(self.repository, "hana", "call-forward", offload.NO_RESULT_FILE, ("--workspace",), owner="verify", holder_session="fixture-session")
-        config = offload.read_config(self.config_path)
+        config = eligibility.read_config(self.config_path)
         expected = (
             'cd .local/state/mac-test/mirror/hana && { find "$HOME"/.local/state/mac-test/mirror/hana/target -maxdepth 5 -type d '
             + r"\( -name deps -o -name build -o -name .fingerprint -o -name examples \) -prune -o "
@@ -192,7 +192,7 @@ class OffloadForwardTests(OffloadCommandFixture):
         self.assertIn("du -sk target/shots", events[-3]["args"][-1])
         self.assertIn("sweep.sweep_workspace", events[-1]["args"][-1])
         pull = events[-2]["args"]
-        self.assertEqual(pull[:6], ["-rlp", "--stats", "--compress", "--safe-links", "-e", shlex.join(["ssh", *offload.ssh_options(offload.read_config(self.config_path).connection)])])
+        self.assertEqual(pull[:6], ["-rlp", "--stats", "--compress", "--safe-links", "-e", shlex.join(["ssh", *offload.ssh_options(eligibility.read_config(self.config_path).connection)])])
         self.assertEqual(pull[-2], "mac:.local/state/mac-test/mirror/hana/target/shots/")
         self.assertTrue(pull[-1].endswith("/fetched/call-forward.partial/target/shots/"))
         rows = [cast(dict[str, object], json.loads(line))

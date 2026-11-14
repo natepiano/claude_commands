@@ -2205,7 +2205,8 @@ class AdmissionServer:
     def _read_host_evidence(self, key: placement.HostEvidenceKey) -> placement.HostEvidence:
         """Read local hold policy or remote provider claims."""
         from scripts.build_targets import build_targets, target_config
-        from scripts.mac_test import claim_state, offload, mac_test
+        from scripts.mac_test import claim_state, mac_test
+        from scripts.mac_test.eligibility import MacVerb, verb_kind
         from scripts.build_hold import build_hold
 
         destination = key.destination
@@ -2235,7 +2236,7 @@ class AdmissionServer:
             return placement.HostEvidenceUnavailable(key, self.clock.now(), "target is no longer configured")
         if isinstance(target, target_config.SshTarget) and isinstance(key.settings, placement.ExplicitProviderSettings):
             target = replace(target, settings=key.settings.path)
-        kind = offload.verb_kind(cast(offload.MacVerb, request.profile.step))
+        kind = verb_kind(cast(MacVerb, request.profile.step))
         if kind not in ("check", "lint", "doc", "test", "build", "example", "final"):
             return placement.HostEvidenceUnavailable(key, self.clock.now(), "command policy is unavailable")
         if isinstance(target, target_config.SshTarget):
@@ -2289,12 +2290,12 @@ class AdmissionServer:
                                     settings: placement.ProviderSettings
                                     ) -> placement.ExecutionEvidence:
         """Read existing mirror process evidence without invoking provider cleanup."""
-        from scripts.mac_test import offload, claim_state
+        from scripts.mac_test import eligibility, offload, claim_state
 
-        if isinstance(offload.read_backoff(time.time(), destination.target), offload.ActiveBackoff):
+        if isinstance(eligibility.read_backoff(time.time(), destination.target), eligibility.ActiveBackoff):
             return placement.ExecutionEvidenceUnavailable("provider retry backoff is active", self.clock.now())
-        repository = offload.repository_identity(Path(request.constraints.repository))
-        if not isinstance(repository, offload.KnownRepository):
+        repository = eligibility.repository_identity(Path(request.constraints.repository))
+        if not isinstance(repository, eligibility.KnownRepository):
             return placement.ExecutionEvidenceUnavailable("repository execution scope is unavailable", self.clock.now())
         scope = reference.scope
         slot = scope.slot if isinstance(scope, claim_state.RepositoryScope) and scope.slot else destination.slot or 1
@@ -2307,8 +2308,8 @@ for placement_pid in $placement_pids; do
 done
 '''
         try:
-            target = offload.configured_ssh_target(destination.target)
-            config = offload.read_config(settings.path if isinstance(settings, placement.ExplicitProviderSettings)
+            target = eligibility.configured_ssh_target(destination.target)
+            config = eligibility.read_config(settings.path if isinstance(settings, placement.ExplicitProviderSettings)
                                          else target.settings)
         except (OSError, ValueError):
             return placement.ExecutionEvidenceUnavailable("provider settings are unavailable", self.clock.now())

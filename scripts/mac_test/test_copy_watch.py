@@ -24,7 +24,7 @@ from typing import TypedDict, cast, final, override
 from scripts.lib import process_start as process_identity
 
 
-from scripts.mac_test import copy_watch, offload
+from scripts.mac_test import eligibility, copy_watch
 from scripts.direct import step_record
 from scripts.lint.memory_test_support import config_environment, write_config_fixture
 from scripts.lib import test_hang_guard
@@ -241,7 +241,7 @@ class StepProgressTests(unittest.TestCase):
                             "linux", 42, "123", root, "test", step_record.NamedPackage("sample"),
                             permission, state, "now", selected_target=selected))
                         self.assertIsInstance(step_record.read("linux"), step_record.StepRecord)
-                        watch = copy_watch.Watch(request, offload.KnownRepository("repo"), root)
+                        watch = copy_watch.Watch(request, eligibility.KnownRepository("repo"), root)
                         watch.step = copy_watch.StepProgress(copy_watch.StepInfo(42, log))
                         watch.step.read()
                         self.assertTrue(watch.step.compiling)
@@ -315,7 +315,7 @@ class StopTests(unittest.TestCase):
             )
             for name, (mac, status, outcome) in cases.items():
                 with self.subTest(name):
-                    watch = copy_watch.Watch(request, offload.KnownRepository("repo"), root)
+                    watch = copy_watch.Watch(request, eligibility.KnownRepository("repo"), root)
                     result = root / "copy.result"
                     _ = result.write_text(f"mac={mac}\nreason=busy\nseconds=1.0\n")
                     process = subprocess.Popen([sys.executable, "-c", f"raise SystemExit({status})"])
@@ -541,7 +541,7 @@ class CopyWatchProcessTests(unittest.TestCase):
         errors = io.StringIO()
         with (mock.patch.object(argparse.ArgumentParser, "parse_args", return_value=arguments),
               mock.patch.object(copy_watch, "request_from_arguments", return_value=request),
-              mock.patch.object(offload, "repository_identity", return_value=offload.KnownRepository("repo")),
+              mock.patch.object(eligibility, "repository_identity", return_value=eligibility.KnownRepository("repo")),
               mock.patch.object(copy_watch.Watch, "run", settled),
               mock.patch.object(admission_client, "cancel_placement",
                                 side_effect=wire.AdmissionUnavailable("fixture cancellation unavailable")) as cancel,

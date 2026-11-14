@@ -22,7 +22,7 @@ from unittest import mock
 
 from scripts.lib.py_floor_test_support import interpreter_cache_environment
 from scripts.copies.copies_test_support import copies_environment
-from scripts.mac_test import claim_state, linux_runner, mac_test, offload, test_target_slots
+from scripts.mac_test import eligibility, claim_state, linux_runner, mac_test, offload, test_target_slots
 from scripts.mac_test.offload_test_support import mirror_use_payload
 from scripts.lint.memory_test_support import write_config_fixture
 
@@ -141,7 +141,7 @@ class LinuxShellTests(unittest.TestCase):
     event_path: Path = Path()
     environment: dict[str, str] = {}
     use_real_sweep: bool = False
-    identity: offload.KnownRepository = offload.KnownRepository("phase-copy", "https://example.com/team/hana")
+    identity: eligibility.KnownRepository = eligibility.KnownRepository("phase-copy", "https://example.com/team/hana")
 
     @override
     def setUp(self) -> None:
@@ -226,14 +226,14 @@ class LinuxShellTests(unittest.TestCase):
             path.parent.mkdir(parents=True, exist_ok=True)
             _ = path.write_text(contents)
 
-    def request(self, verb: offload.MacVerb = "nextest", words: tuple[str, ...] = ()) -> offload.OffloadRequest:
+    def request(self, verb: eligibility.MacVerb = "nextest", words: tuple[str, ...] = ()) -> offload.OffloadRequest:
         return offload.OffloadRequest(
             self.source, "hana", "call with spaces", offload.NO_RESULT_FILE, words, owner="verify",
             verb=verb, target="linux", slot=2, holder_session="fixture-session")
 
     def command(self, request: offload.OffloadRequest) -> str:
         return offload.remote_test_command(
-            offload.read_config(self.settings), request, self.identity, offload.KnownTreeKey("sent-tree-key"),
+            eligibility.read_config(self.settings), request, self.identity, offload.KnownTreeKey("sent-tree-key"),
         )
 
     def execute(self, request: offload.OffloadRequest) -> subprocess.CompletedProcess[str]:
@@ -283,7 +283,7 @@ class LinuxShellTests(unittest.TestCase):
         return events[-1]
 
     def test_step_removes_only_old_abandoned_sessions_before_building(self) -> None:
-        minutes = offload.read_config(self.settings).abandoned_session_minutes
+        minutes = eligibility.read_config(self.settings).abandoned_session_minutes
         cases: tuple[tuple[str, int, bool, tuple[str, ...]], ...] = (
             ("debug/incremental/crate/s-old-working", minutes + 2, False, ()),
             ("aarch64-unknown-linux-gnu/debug/incremental/crate/s-old-working", minutes + 2, False, ()),
@@ -375,7 +375,7 @@ class LinuxShellTests(unittest.TestCase):
     def test_linux_command_forwards_repository_identity_only_when_nonempty(self) -> None:
         for key in ("https://example.com/team/hana", "git-root:/source with spaces/hana", ""):
             with self.subTest(key=key):
-                self.identity = offload.KnownRepository("phase-copy", key)
+                self.identity = eligibility.KnownRepository("phase-copy", key)
                 arguments = shlex.split(self.command(self.request()))
                 if key:
                     self.assertEqual(arguments.count("--repo-identity"), 1)
@@ -384,7 +384,7 @@ class LinuxShellTests(unittest.TestCase):
                     self.assertNotIn("--repo-identity", arguments)
 
     def test_linux_step_environment_omits_an_empty_repository_identity(self) -> None:
-        self.identity = offload.KnownRepository(self.identity.name)
+        self.identity = eligibility.KnownRepository(self.identity.name)
         mirror = self.root / offload.remote_mirror(self.identity, "linux", 2)
         mirror.parent.mkdir(parents=True, exist_ok=True)
         _ = self.mirror.rename(mirror)
@@ -514,7 +514,7 @@ class LinuxShellTests(unittest.TestCase):
     def test_other_clone_names_keep_the_origin_shell_budget_and_skip_settings(self) -> None:
         words = ("-p", "hana", "-E", "test(a)")
         first = self.assert_ran(self.request(words=words))
-        self.identity = offload.KnownRepository("temporary-clone", "https://example.com/team/hana")
+        self.identity = eligibility.KnownRepository("temporary-clone", "https://example.com/team/hana")
 
         second = self.assert_ran(replace(self.request(words=words), repo_root=self.root / "rust/temporary-clone"))
 
@@ -757,7 +757,7 @@ class LinuxShellTests(unittest.TestCase):
         self.write_input("Cargo.toml", '[package]\nname = "fixture"\nversion = "0.1.0"\n')
         self.environment["FAKE_NIX_EXPORTS"] = "export PATH=/shell-tools\nexport TEST_SHELL_TOOL_VERSION=shell"
         arguments = shlex.split(linux_runner.probe_command_script(
-            str(self.mirror), offload.read_config(self.settings).values, "hana",
+            str(self.mirror), eligibility.read_config(self.settings).values, "hana",
         ))
         output = io.StringIO()
         real_run = subprocess.run
@@ -881,7 +881,7 @@ class LinuxShellTests(unittest.TestCase):
         self.assertNotIn("-g", self.events("df")[-1]["args"])
 
     def test_probe_disk_units_do_not_depend_on_the_mirror_path(self) -> None:
-        identity = offload.KnownRepository("phase-copy", "https://example.com/team/GiB")
+        identity = eligibility.KnownRepository("phase-copy", "https://example.com/team/GiB")
         mirror = self.root / offload.remote_mirror(identity, "linux", 2)
         mirror.mkdir(parents=True)
         for tool in ("rustc", "cargo", "hostname"):
@@ -914,11 +914,11 @@ class LinuxShellTests(unittest.TestCase):
             self.write_tool(self.root / "bin" / tool)
         version = "cargo-nextest 0.9.143 (60fa45f63 2026-08-04)"
         details = "release: 0.9.143 commit: 60fa45f63 date: 2026-08-04 host: x86_64-linux"
-        config = offload.read_config(self.settings)
+        config = eligibility.read_config(self.settings)
         config = replace(config, values={**config.values, "parity.nextest": version + " " + details})
         self.environment["TEST_NEXTEST_VERSION"] = ("  " + version + "  \n"
             + " release: 0.9.143  \n\tcommit: 60fa45f63\n date: 2026-08-04\n host: x86_64-linux  \n")
-        with mock.patch.object(offload, "read_config", return_value=config):
+        with mock.patch.object(eligibility, "read_config", return_value=config):
             result = self.execute(self.request())
 
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
@@ -931,11 +931,11 @@ class LinuxShellTests(unittest.TestCase):
             self.write_tool(self.root / "bin" / tool)
         expected = " cargo-nextest 0.9.143  \n release: expected \n commit: abc\n date: today\n host: linux\n"
         actual = " cargo-nextest 0.9.143 \n release: different  \n commit: abc\n date: today\n host: linux\n"
-        config = offload.read_config(self.settings)
+        config = eligibility.read_config(self.settings)
         config = replace(config, values={**config.values, "parity.nextest": expected,
                                         "version_pin_file": "nixos hosts/linux-build.nix"})
         self.environment["TEST_NEXTEST_VERSION"] = actual
-        with mock.patch.object(offload, "read_config", return_value=config):
+        with mock.patch.object(eligibility, "read_config", return_value=config):
             result = self.execute(self.request())
 
         self.assertEqual(result.returncode, 75, result.stdout + result.stderr)
@@ -985,7 +985,7 @@ class LinuxShellTests(unittest.TestCase):
     def test_version_decline_uses_the_selected_target_and_configured_pin_file(self) -> None:
         for tool in ("rustc", "cargo"):
             self.write_tool(self.root / "bin" / tool)
-        values = {**offload.read_config(self.settings).values, "selected_target": "builder",
+        values = {**eligibility.read_config(self.settings).values, "selected_target": "builder",
                   "parity.rustc": "rustc required", "version_pin_file": "nixos hosts/builder.nix"}
         output, errors = io.StringIO(), io.StringIO()
         real_run = subprocess.run
@@ -1014,7 +1014,7 @@ class LinuxShellTests(unittest.TestCase):
     def test_remote_build_and_judgments_receive_their_verbs_and_kinds(self) -> None:
         _ = self.settings.write_text(self.settings.read_text().replace(
             "kinds=test,check,doc", "kinds=test,check,doc,lint,example,build"))
-        cases: tuple[tuple[offload.MacVerb, str, tuple[str, ...]], ...] = (
+        cases: tuple[tuple[eligibility.MacVerb, str, tuple[str, ...]], ...] = (
             ("build", "build", ("--workspace", "--bins")),
             ("clippy", "lint", ("--workspace", "--all-features")),
             ("mend-check", "lint", ("--workspace",)),
@@ -1209,7 +1209,7 @@ class LinuxProcessTests(unittest.TestCase):
         self.use_private_processes()
         with mock.patch.object(offload, "mirror_selector_script",
                                return_value=linux_runner.mirror_selector_script(str(self.mirror))):
-            script = offload.leftover_check_script(offload.KnownRepository("hana", "https://example.invalid/hana"), "linux")
+            script = offload.leftover_check_script(eligibility.KnownRepository("hana", "https://example.invalid/hana"), "linux")
         selections = script.count('leftover_pids=$(select_leftovers)')
         self.assertEqual(selections, 3)
         for index in range(selections):
@@ -1345,8 +1345,8 @@ class LinuxProcessTests(unittest.TestCase):
         self.addCleanup(dispatch.doCleanups)
         dispatch.setUp()
         _ = dispatch.settings.write_text(dispatch.settings.read_text().replace("slots.hana=4", "slots.hana=1"))
-        identity = offload.repository_identity(dispatch.source)
-        if not isinstance(identity, offload.KnownRepository):
+        identity = eligibility.repository_identity(dispatch.source)
+        if not isinstance(identity, eligibility.KnownRepository):
             self.fail("The fixture must have a repository identity")
         self.mirror = dispatch.fixture.root / offload.remote_mirror(identity, "linux", 1)
         self.mirror.mkdir(parents=True)
@@ -1427,7 +1427,7 @@ class LinuxProcessTests(unittest.TestCase):
         self.assertIsInstance(takeover, offload.BusyMacDecline)
         if isinstance(takeover, offload.BusyMacDecline):
             self.assertIsInstance(takeover.holder, offload.LostRunLeftovers)
-        self.assertIsInstance(offload.read_backoff(time.time(), "linux"), offload.NoBackoff)
+        self.assertIsInstance(eligibility.read_backoff(time.time(), "linux"), eligibility.NoBackoff)
         self.assertIn(999, dispatch.fixture.claims("linux"))
         self.assertNotIn("release", dispatch.actions)
         self.assertNotIn("run", dispatch.actions)
@@ -1466,8 +1466,8 @@ class LinuxProcessTests(unittest.TestCase):
         dispatch = LinuxDispatchTests()
         self.addCleanup(dispatch.doCleanups)
         dispatch.setUp()
-        identity = offload.repository_identity(dispatch.source)
-        if not isinstance(identity, offload.KnownRepository):
+        identity = eligibility.repository_identity(dispatch.source)
+        if not isinstance(identity, eligibility.KnownRepository):
             self.fail("The fixture must have a repository identity")
         self.mirror = dispatch.fixture.root / offload.remote_mirror(identity, "linux", 1)
         self.mirror.mkdir(parents=True)
@@ -1547,8 +1547,8 @@ class LinuxProcessTests(unittest.TestCase):
         self.assertIn(900, dispatch.fixture.claims("linux"))
         self.assertTrue((self.mirror / ".linux-run.json").exists())
         self.assertNotIn("release", dispatch.actions)
-        self.assertIsInstance(offload.read_backoff(time.time(), "linux"), offload.NoBackoff)
-        self.assertFalse(offload.backoff_path("linux").exists())
+        self.assertIsInstance(eligibility.read_backoff(time.time(), "linux"), eligibility.NoBackoff)
+        self.assertFalse(eligibility.backoff_path("linux").exists())
         execute.assert_not_called()
         self.assertEqual(evaluate.call_count, 1 if stage == "after-probe" else 0)
         self.assertTrue(replies)
@@ -1731,8 +1731,8 @@ class LinuxCopyTests(unittest.TestCase):
             self.fail(f"Unexpected external command: {argv}")
         return offload.CommandOutput(result.returncode, result.stdout, result.stderr)
 
-    def config(self) -> offload.OffloadConfig:
-        return offload.read_config(self.root / "linux.conf")
+    def config(self) -> eligibility.OffloadConfig:
+        return eligibility.read_config(self.root / "linux.conf")
 
     def test_first_linux_copy_creates_the_missing_repository_and_slot_directories(self) -> None:
         _ = self.write_source("src/lib.rs", "first source\n")
@@ -1746,7 +1746,7 @@ class LinuxCopyTests(unittest.TestCase):
         ssh.chmod(0o755)
         controller = offload.ProcessController()
         request = offload.OffloadRequest(self.source, "hana", "copy", offload.NO_RESULT_FILE, (), owner="verify", target="linux", holder_session="fixture-session")
-        identity = offload.KnownRepository("source", "https://example.invalid/team/hana")
+        identity = eligibility.KnownRepository("source", "https://example.invalid/team/hana")
         environment = {**os.environ, "PATH": f"{self.root}:{os.environ['PATH']}",
                        "TEST_REMOTE_HOME": str(remote_home), "HOME": str(remote_home)}
         with mock.patch.dict(os.environ, environment):
@@ -1767,7 +1767,7 @@ class LinuxCopyTests(unittest.TestCase):
         _ = self.git("commit", "-qm", "Fixture source")
         controller = offload.ProcessController()
         request = offload.OffloadRequest(self.source, "hana", "copy", offload.NO_RESULT_FILE, (), owner="verify", target="linux", holder_session="fixture-session")
-        identity = offload.KnownRepository("source", "https://example.invalid/team/hana")
+        identity = eligibility.KnownRepository("source", "https://example.invalid/team/hana")
         with mock.patch.object(controller, "capture", side_effect=self.capture):
             self.assertTrue(offload.copy_tree(controller, self.config(), request, identity))
             self.assertEqual((self.destination / "tests/b.rs").read_text(), "old test\n")
@@ -1899,7 +1899,7 @@ class LinuxDispatchTests(unittest.TestCase):
         _ = self.enterContext(mock.patch.object(offload, "read_tree_key", return_value=offload.KnownTreeKey("source-key")))
         _ = self.enterContext(mock.patch.object(subprocess, "run", side_effect=self.command_reply))
 
-    def request(self, verb: offload.MacVerb = "nextest") -> offload.OffloadRequest:
+    def request(self, verb: eligibility.MacVerb = "nextest") -> offload.OffloadRequest:
         return offload.OffloadRequest(self.source, "hana", "call", offload.NO_RESULT_FILE,
                                      ("-p", "hana"), owner="verify", verb=verb, target="linux", holder_session="fixture-session")
 
@@ -1977,7 +1977,7 @@ class LinuxDispatchTests(unittest.TestCase):
     def run_request(self, request: offload.OffloadRequest) -> tuple[offload.MacOffloadResult, str, str]:
         output, errors = io.StringIO(), io.StringIO()
         with redirect_stdout(output), redirect_stderr(errors):
-            result = offload.run_offload(self.controller, offload.read_config(self.settings), request, 100.0)
+            result = offload.run_offload(self.controller, eligibility.read_config(self.settings), request, 100.0)
         return result, output.getvalue(), errors.getvalue()
 
 
@@ -1989,8 +1989,8 @@ class LinuxDispatchTests(unittest.TestCase):
         self.assertIsInstance(result, offload.PassedOnTarget)
         self.assertIn("running on linux (Linux, host fake-linux)", output)
         self.assertNotIn("running on the Mac", output)
-        self.assertIsInstance(offload.read_backoff(time.time(), "mac"), offload.ActiveBackoff)
-        self.assertIsInstance(offload.read_backoff(time.time(), "linux"), offload.NoBackoff)
+        self.assertIsInstance(eligibility.read_backoff(time.time(), "mac"), eligibility.ActiveBackoff)
+        self.assertIsInstance(eligibility.read_backoff(time.time(), "linux"), eligibility.NoBackoff)
         self.assertLess(self.actions.index("scripts-copy"), self.actions.index("run"))
         self.assertFalse(self.fixture.claims("linux"))
         self.assertFalse(self.fixture.claims("mac"))
@@ -2010,11 +2010,11 @@ class LinuxDispatchTests(unittest.TestCase):
 
     def test_linux_probe_accepts_no_rustc_value(self) -> None:
         self.assertNotIn("rustc=", self.probe_wire)
-        identity = offload.repository_identity(self.source)
-        self.assertIsInstance(identity, offload.KnownRepository)
-        if not isinstance(identity, offload.KnownRepository):
+        identity = eligibility.repository_identity(self.source)
+        self.assertIsInstance(identity, eligibility.KnownRepository)
+        if not isinstance(identity, eligibility.KnownRepository):
             self.fail("The fixture must have a repository identity")
-        probe = offload.probe_mac(self.controller, offload.read_config(self.settings), identity, "linux", 2)
+        probe = offload.probe_mac(self.controller, eligibility.read_config(self.settings), identity, "linux", 2)
         self.assertIsInstance(probe, offload.ProbeSnapshot)
 
     def test_each_parity_mismatch_blocks_source_execution(self) -> None:
@@ -2023,11 +2023,11 @@ class LinuxDispatchTests(unittest.TestCase):
             with self.subTest(field=field):
                 self.probe_wire = "\n".join(field + "=wrong" if line.startswith(field + "=") else line
                                              for line in matching.splitlines()) + "\n"
-                identity = offload.repository_identity(self.source)
-                if not isinstance(identity, offload.KnownRepository):
+                identity = eligibility.repository_identity(self.source)
+                if not isinstance(identity, eligibility.KnownRepository):
                     self.fail("The fixture must have a repository identity")
                 with redirect_stderr(io.StringIO()):
-                    probe = offload.probe_mac(self.controller, offload.read_config(self.settings), identity, "linux", 2)
+                    probe = offload.probe_mac(self.controller, eligibility.read_config(self.settings), identity, "linux", 2)
                 self.assertIsInstance(probe, offload.UnavailableProbe)
         self.assertNotIn("source-copy", self.actions)
         self.assertNotIn("run", self.actions)
@@ -2085,8 +2085,8 @@ class LinuxDispatchTests(unittest.TestCase):
         self.assertIn("--delete", source_copy)
         self.assertEqual(self.filters, ["/.git\n/target/\n/private/\n/.env\n"])
         self.assertNotIn("--copy-links", source_copy)
-        identity = offload.repository_identity(self.source)
-        if not isinstance(identity, offload.KnownRepository):
+        identity = eligibility.repository_identity(self.source)
+        if not isinstance(identity, eligibility.KnownRepository):
             self.fail("The fixture must have a repository identity")
         command = next(argv[-1] for argv in self.commands if argv[0] == "ssh" and "--mirror" in argv[-1])
         words = shlex.split(command)
@@ -2128,8 +2128,8 @@ class LinuxDispatchTests(unittest.TestCase):
 
     def test_live_slot_children_block_new_work_until_cleanup_confirms_they_ended(self) -> None:
         _ = self.settings.write_text(self.settings.read_text().replace("slots.hana=4", "slots.hana=1"))
-        identity = offload.repository_identity(self.source)
-        if not isinstance(identity, offload.KnownRepository):
+        identity = eligibility.repository_identity(self.source)
+        if not isinstance(identity, eligibility.KnownRepository):
             self.fail("The fixture must have a repository identity")
         mirror = self.fixture.root / offload.remote_mirror(identity, "linux", 1)
         mirror.mkdir(parents=True)
@@ -2208,8 +2208,8 @@ class LinuxDispatchTests(unittest.TestCase):
         self.assertIsInstance(result, offload.PassedOnTarget)
         self.assertEqual(self.actions[:4], ["claim:13", "cleanup", "release", "claim:0"])
         cleanup = next(argv for argv in self.commands if argv[0] == "ssh" and "select_leftovers" in argv[-1])
-        identity = offload.repository_identity(self.source)
-        if not isinstance(identity, offload.KnownRepository):
+        identity = eligibility.repository_identity(self.source)
+        if not isinstance(identity, eligibility.KnownRepository):
             self.fail("The fixture must have a repository identity")
         self.assertIn(offload.remote_mirror(identity, "linux", 1), cleanup[-1])
         self.assertNotIn(offload.remote_mirror(identity, "linux", 2), cleanup[-1])
@@ -2233,8 +2233,8 @@ class LinuxDispatchTests(unittest.TestCase):
         result, _, _ = self.run_request(self.request())
 
         self.assertIsInstance(result, offload.DeclinedMacRun)
-        self.assertIsInstance(offload.read_backoff(time.time(), "linux"), offload.ActiveBackoff)
-        self.assertIsInstance(offload.read_backoff(time.time(), "mac"), offload.NoBackoff)
+        self.assertIsInstance(eligibility.read_backoff(time.time(), "linux"), eligibility.ActiveBackoff)
+        self.assertIsInstance(eligibility.read_backoff(time.time(), "mac"), eligibility.NoBackoff)
         self.assertLess(self.actions.index("source-copy"), self.actions.index("probe"))
         self.assertNotIn("run", self.actions)
         self.assertFalse(self.fixture.claims("linux"))
@@ -2257,7 +2257,7 @@ class LinuxDispatchTests(unittest.TestCase):
                         return offload.COMMAND_TIMED_OUT
             return self.capture(arguments, deadline)
 
-        config = offload.read_config(self.settings)
+        config = eligibility.read_config(self.settings)
         self.assertLess(config.probe_timeout_s, cold_seconds)
         self.assertLess(cold_seconds, float(config.values["shell_timeout_s"]))
         with mock.patch.object(self.controller, "capture", side_effect=timed_capture):
@@ -2266,7 +2266,7 @@ class LinuxDispatchTests(unittest.TestCase):
             self.assertIsInstance(cold, offload.PassedOnTarget)
             self.assertTrue(shell_limits)
             self.assertTrue(all(limit >= cold_seconds for limit in shell_limits))
-            self.assertIsInstance(offload.read_backoff(time.time(), "linux"), offload.NoBackoff)
+            self.assertIsInstance(eligibility.read_backoff(time.time(), "linux"), eligibility.NoBackoff)
             self.actions.clear()
             unreachable = True
             failed, _, _ = self.run_request(self.request())
@@ -2275,7 +2275,7 @@ class LinuxDispatchTests(unittest.TestCase):
         if isinstance(failed, offload.DeclinedMacRun):
             self.assertEqual(failed.reason, "unreachable")
         self.assertEqual(failed_limits, [config.probe_timeout_s])
-        self.assertIsInstance(offload.read_backoff(time.time(), "linux"), offload.ActiveBackoff)
+        self.assertIsInstance(eligibility.read_backoff(time.time(), "linux"), eligibility.ActiveBackoff)
         self.assertNotIn("run", self.actions)
         self.assertFalse(self.fixture.claims("linux"))
 

@@ -26,7 +26,7 @@ from scripts.copies.copies_test_support import copies_environment
 
 from scripts.lint.memory_test_support import write_config_fixture, config_environment
 
-from scripts.mac_test import offload, mac_test
+from scripts.mac_test import eligibility, offload, mac_test
 from scripts.lib import conf
 from scripts.buildlog import treekey
 from scripts.buildlog import sync as buildlog_sync
@@ -52,7 +52,7 @@ def assigned_adapter_main() -> int:
     """Run the adapter after placement, with the current provider state."""
     arguments = offload.parser().parse_args(namespace=offload.CliArguments())
     request = offload.request_from_arguments(arguments)
-    config = offload.read_config(Path(arguments.settings)) if arguments.settings else offload.read_config()
+    config = eligibility.read_config(Path(arguments.settings)) if arguments.settings else eligibility.read_config()
     controller = offload.ProcessController()
     started = time.monotonic()
     with offload.interrupt_handlers(controller), buildlog_sync.measure_transfers(controller.attempt_evidence.traffic):
@@ -146,7 +146,7 @@ class RemoteClaimRecord(TypedDict):
     since: str
     remote_host: str
 
-HANA = offload.KnownRepository("hana")
+HANA = eligibility.KnownRepository("hana")
 
 FIXTURE_MIRROR_ROOT = conf.read(Path(__file__).resolve().parents[2] / "config/mac_test.conf").text("mirror_root").removeprefix("~/")
 
@@ -373,8 +373,8 @@ class OffloadCommandFixture(unittest.TestCase):
 
         admission.server.host_probe = provider
 
-    def assignment_options(self, repository: Path, verb: offload.MacVerb,
-                           settings: Path | offload.DefaultMacSettings,
+    def assignment_options(self, repository: Path, verb: eligibility.MacVerb,
+                           settings: Path | eligibility.DefaultMacSettings,
                            runner_options: tuple[str, ...], *, environment: dict[str, str] | None = None) -> list[str]:
         """Give command fixtures one real queue assignment before the adapter starts."""
         if "--assignment-file" in runner_options:
@@ -451,11 +451,11 @@ class OffloadCommandFixture(unittest.TestCase):
         filter_run: bool = False,
         timeout: float = test_hang_guard.TEST_HANG_GUARD_SECS,
         subprocess_cli: bool = False,
-        settings: Path | offload.DefaultMacSettings = offload.DEFAULT_MAC_SETTINGS,
+        settings: Path | eligibility.DefaultMacSettings = eligibility.DEFAULT_MAC_SETTINGS,
         last_decline: str = "",
         separate_stderr: bool = False,
         copy: bool = False,
-        verb: offload.MacVerb = "nextest",
+        verb: eligibility.MacVerb = "nextest",
         package: str = "hana",
         source: offload.MacSource = WORKING_TREE_SOURCE,
         runner_options: tuple[str, ...] = (),
@@ -523,7 +523,7 @@ class OffloadCommandFixture(unittest.TestCase):
         program = r'''
 import subprocess
 import sys
-from scripts.mac_test import offload
+from scripts.mac_test import eligibility, offload
 
 clock = [100.0]
 offload.time.monotonic = lambda: clock[0]
@@ -594,7 +594,7 @@ raise SystemExit(offload.main())
             "--result",
             str(self.result_path),
             *runner_options,
-            *self.assignment_options(self.repository, "nextest", offload.DEFAULT_MAC_SETTINGS, runner_options,
+            *self.assignment_options(self.repository, "nextest", eligibility.DEFAULT_MAC_SETTINGS, runner_options,
                                      environment={**self.environment, **(extra or {})}),
             "--",
             *nextest_arguments,

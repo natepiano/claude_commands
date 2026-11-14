@@ -25,7 +25,7 @@ from zoneinfo import ZoneInfo
 from scripts.buildlog import cli
 from scripts.buildlog import index
 from scripts.buildlog import mac_idle, mac_idle_alert, sample
-from scripts.mac_test import offload, mac_test
+from scripts.mac_test import eligibility, offload, mac_test
 from scripts.build_queue import admission_protocol as wire, admission_client
 from scripts.build_queue.admission_test_support import AdmissionFixture, caller_admission
 from scripts.buildlog.mac_idle_test_support import NotificationGuardedTestCase, NotificationTransportBlocked, PrivateSenderAcceptance, private_sender_acceptance
@@ -831,11 +831,11 @@ done
             mac_idle.watch_once(self.paths, 1600, 100)
         push.assert_called_once()
         self.assertEqual(mac_idle.read_record(self.paths.state / "alert.json")["cause"], "disk")
-        config = offload.read_config(self.root / "mac_test.conf")
+        config = eligibility.read_config(self.root / "mac_test.conf")
         with (mock.patch.object(offload.ProcessController, "capture", return_value=offload.CommandOutput(0, "", "")),
               mock.patch.object(offload, "probe_mac", return_value=offload.ProbeSnapshot(config.free_floor_gib, "fake-mac"))):
             answer = offload.ensure_mac_disk_floor(offload.ProcessController(), config,
-                offload.KnownRepository("hana"), offload.ProbeSnapshot(0, "fake-mac"))
+                eligibility.KnownRepository("hana"), offload.ProbeSnapshot(0, "fake-mac"))
         self.assertEqual(answer, offload.MacDiskReady(config.free_floor_gib))
         self.step(state=step_record.StepState.ON_MAC)
         mac_idle.write_record(mac_idle.call_path(self.paths, self.call.call_id), asdict(self.call))

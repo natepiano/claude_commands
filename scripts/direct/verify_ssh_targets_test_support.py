@@ -121,12 +121,12 @@ from unittest import mock
 
 source = Path(os.environ["TEST_SOURCE_REPO"])
 with open(source / "scripts/lib/package_root.py") as package_root: exec(package_root.read(), {"__file__": package_root.name})
-from scripts.mac_test import offload, mac_test, claim_state
+from scripts.mac_test import eligibility, offload, mac_test, claim_state
 from scripts.build_queue import admission_protocol as queue_wire, placement
 
 args = offload.parser().parse_args(namespace=offload.CliArguments())
 request = offload.request_from_arguments(args)
-config = offload.read_config(Path(args.settings))
+config = eligibility.read_config(Path(args.settings))
 controller = offload.ProcessController()
 root = Path(os.environ["TEST_RUNNER_STATE"])
 mode = json.loads(os.environ.get("TEST_SSH_MODES", "{}" )).get(request.target, "passed")
