@@ -2615,3 +2615,14 @@ Each Mac run without `--target-dir` trims the mirror target to `mac_budget_gib.<
 3. `SweepStartupTests` in `scripts/lint/test_invoke_scope.py`: a fake `systemd-cat` gets the sweep's lines and the `lint-sweep` identifier; without it the sweep still starts; the caller's output closes before the sweep ends.
 
 **Files:** `scripts/lint/invoke.sh`, `scripts/lint/test_invoke_scope.py`.
+
+### Phase 122 — A clone's tag that its local source holds unchanged is not unsaved work  · status: todo
+
+**Why:** `/tmp/claude/scratch/until-2026-11-13T0519Z-assembly-unit-open-before-c54457` stayed 17 h past its until: time. Its clone is clean and HEAD is on origin, but tag `hana_liminal-v0.2.0` points at a commit on no branch. `tmp_sweep.repo_git_work` checks every clone tag against the remote-tracking refs and the local source's branches only, so a tag copied from the source reads as unsaved work.
+
+**Work:**
+1. `repo_git_work` reads the tags of each local clone source. A clone tag with the same name and object in a source is not a tip to check. Other tags, HEAD and the branches are checked as now.
+2. A clone HEAD or branch commit that only a source tag holds stays unsaved (`test_source_tag_without_a_branch_does_not_replace_a_remote_copy` keeps its result).
+3. Tests in `scripts/lint/test_tmp_sweep.py`: a clean clone whose only off-branch commit is a tag its source holds unchanged is removed; the same tag moved in the clone keeps it.
+
+**Files:** `scripts/lint/tmp_sweep.py`, `scripts/lint/test_tmp_sweep.py`.

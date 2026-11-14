@@ -1581,6 +1581,26 @@ with copies.standing("verify-unit", source, copies.WorktreeSource("HEAD", source
                 self.assertTrue(repo.exists())
                 self.assertIn(str(repo.parent), result.kept[tmp_sweep.UNSAVED_WORK])
 
+    def test_clone_tag_that_the_source_holds_unchanged_is_not_unsaved_work(self) -> None:
+        for kind in ("same-tag", "moved-tag"):
+            with self.subTest(kind=kind):
+                repo = self.clone(kind)
+                source = self.tmp.parent / f"source-{kind}"
+                self.git(source, "checkout", "-q", "--detach")
+                _ = write(source / "file", "release\n")
+                self.git(source, "commit", "-qam", "release")
+                self.git(source, "tag", "-a", "-m", "release", "release-v1")
+                self.git(repo, "fetch", "-q", "--tags", "origin")
+                if kind == "moved-tag":
+                    self.git(source, "tag", "-f", "-a", "-m", "moved", "release-v1", "HEAD~1")
+                result = self.sweep()
+                if kind == "same-tag":
+                    self.assertFalse(repo.exists())
+                    self.assertIn(str(repo.parent), [entry["path"] for entry in result.deleted])
+                else:
+                    self.assertTrue(repo.exists())
+                    self.assertIn(str(repo.parent), result.kept[tmp_sweep.UNSAVED_WORK])
+
     def test_git_failure_or_timeout_keeps_the_idle_clone(self) -> None:
         repo = self.clone("error")
         for error in (ValueError("git failed"), subprocess.TimeoutExpired("git", 10)):
