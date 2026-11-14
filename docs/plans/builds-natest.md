@@ -3910,20 +3910,10 @@ Checkpoint 2cfdd87f1. Changed `scripts/message/test_notifier.py` (launcher stubs
 **Depends on:** none
 **Owner:** natest (test-only change).
 
-#### Work Order
+#### As-built
 
-**Goal:** `mac_test/test_offload_cleanup.py` starts the real lint sweep only in the subtests that check the trim.
-
-**Spec:**
-- The trim step in the remote text runs the lint sweep through `$HOME/.claude/scripts/lib/py`. One start costs about 0.5 CPU s (import and `process_uses`).
-- `setUp` writes a `py` stub that exits 0. The tests of the shell text around the trim use it.
+- `MacTargetCleanupShellTests.setUp` writes a `py` stub that exits 0, so the shell-text tests start no lint sweep.
 - `real_sweep()` writes the `exec python3` stub. The budget trim subtests and the trim success subtest call it.
 - The trim failure subtest keeps its `exit 9` stub.
-
-**Files:** `scripts/mac_test/test_offload_cleanup.py`.
-
-**Workers:** director only (no-worker mode).
-
-**Acceptance gate:**
-- The module passes with the same 17 tests.
-- AWS pair on `mac_test/test_offload_cleanup.py`. Every behavior check stays.
+- AWS pair (c7a.8xlarge, 3 rounds): `mac_test/test_offload_cleanup.py` 26.76 -> 7.77 CPU s.
+- Commit 6f6840546. Test-only change.
