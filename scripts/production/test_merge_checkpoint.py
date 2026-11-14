@@ -5,8 +5,9 @@ from __future__ import annotations
 from scripts.production import checkpoint_gate
 
 from scripts.agents import remote
+from scripts.agents.remote import local_machine
 
-from scripts.production.staff_test_support import isolated_staff_file, unit_membership, recorded_showrunner
+from scripts.production.staff_test_support import fixture_runtime_id, isolated_staff_file, unit_membership, recorded_showrunner
 from scripts.production import staff
 
 import json
@@ -569,6 +570,11 @@ os.execv({real_git!r}, [{real_git!r}, *sys.argv[1:]])
                 if outcome == "equal-patch":
                     _ = self.git("cherry-pick", later, cwd=self.promote)
                     _ = self.git("push", "origin", "main", cwd=self.promote)
+                if outcome == "ancestor":
+                    # A producer's launch folder is not a checkout; it keeps no branch.
+                    (self.root / "producer-folder").mkdir()
+                    _ = staff.ensure("producer", name="dwight", runtime_id=fixture_runtime_id("dwight"),
+                                     worktree=staff.PresentWorktree(local_machine(), self.root / "producer-folder"))
                 if outcome == "merge-branch":
                     doc = self.root / "other-production.md"
                     _ = doc.write_text("- **Merge branch:** alpha-phase\n")

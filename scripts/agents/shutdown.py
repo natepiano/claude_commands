@@ -46,6 +46,7 @@ from scripts.production.production_doc import Production, Refusal, read_producti
 from scripts.production.unit_move import RenameRefused, read_json, write_json
 from scripts.lib.atomic_file import sync_folder, write_text_atomic
 from scripts.agents import (
+    producer_transfer,
     restart,
     restart_support,
     shutdown_record,
@@ -99,6 +100,8 @@ class CommandLine(argparse.Namespace):
     to_branch: str = ""
     target: str = ""
     producer: str = ""
+    model: str = ""
+    effort: str = ""
 
 
 class UnreachableMachine(TypedDict):
@@ -244,6 +247,7 @@ USAGE = """usage: agents COMMAND
   agents restart [ACCOUNT] [--all] [--dry-run] [--only ID[,ID...]] [--here]
   agents stop SESSION [--dry-run] | --all [--dry-run] [--only ID[,ID...]] [--account ACCOUNT]
   agents remove-stray NAME SESSION
+  agents transfer NAME [--model MODEL --effort EFFORT]
 """
 
 
@@ -662,6 +666,10 @@ def main(argv: list[str] | None = None) -> int:
     command = commands.add_parser("remove-stray")
     _ = command.add_argument("producer", metavar="NAME")
     _ = command.add_argument("session", metavar="SESSION")
+    command = commands.add_parser("transfer")
+    _ = command.add_argument("producer", metavar="NAME")
+    _ = command.add_argument("--model", default="")
+    _ = command.add_argument("--effort", default="")
     for verb in ("pause", "exit", "resume"):
         command = commands.add_parser(verb)
         selection = command.add_mutually_exclusive_group(required=True)
@@ -714,6 +722,8 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if options.command == "remove-stray":
             return remove_stray_producer(options.producer, options.session)
+        if options.command == "transfer":
+            return producer_transfer.transfer(options.producer, model=options.model, effort=options.effort)
         if options.command == "stop" and options.all:
             return restart.stop_all(dry_run=options.dry_run,
                                     only=tuple(item for item in options.only.split(",") if item),

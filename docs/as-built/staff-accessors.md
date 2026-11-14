@@ -56,6 +56,12 @@ The Codex command sync names Morty's skill `producer-morty`.
 `PRODUCER_FOLDER_ROOT` in `config/staff.conf` selects the document root, with default `~/rust/hanadocs`.
 Each producer uses `<root>/<name>/README.md`.
 The [shared resume path](shutdown-and-restart.md#producer-launch-and-admission) admits a first conversation through `staff.ensure`.
+A producer's `worktree` is its launch folder and owns no path.
+`by_worktree` skips producers, and two producers can record one folder.
+`merge_checkpoint.branch_keep_reason` and `branch_page.list_branches` read no branch from a producer's folder.
+`staff.transfer_producer(identity, session, home, folder)` sets `current_session`, `home`, and the launch folder in one transaction.
+It refuses a row that is not a producer and a session that another row holds.
+The hidden `transfer-producer` CLI verb sends the write to the owner machine.
 
 ## Backend and hold evidence
 
@@ -297,6 +303,7 @@ The shared pane launch builder uses `set_home`.
 | `scripts/agents/member_account.py` | write | StaffRow, SessionHome, set_home; repairs the home from live process evidence |
 | `scripts/agents/pane_record.py` | read | initial_snapshot |
 | `scripts/agents/pane_restore.py` | read | row_operation |
+| `scripts/agents/producer_transfer.py` | write | initial_snapshot, runtime_id, native_id, slot_operation, row_operation, transfer_producer |
 | `scripts/agents/remote_control.py` | read | initial_snapshot |
 | `scripts/agents/restart.py` | write | initial_snapshot, row_operation, set_home |
 | `scripts/agents/session_types.py` | read | snapshot |
