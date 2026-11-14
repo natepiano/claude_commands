@@ -253,10 +253,8 @@ def workers_cell(workers: Sequence[census.CensusWorker] | census.CensusFailed, *
             bearing.append(text)
         if worker.runs:
             continue
-        if worker.status in ("busy", "starting"):
+        if worker.status == "busy":
             working.append(f"{worker.name} working")
-        elif worker.status == "waiting":
-            working.append(f"{worker.name} waiting")
         elif worker.status == "idle":
             idle += 1
     result = " · ".join([*bearing, *working])
@@ -268,7 +266,7 @@ def workers_cell(workers: Sequence[census.CensusWorker] | census.CensusFailed, *
 class CensusView(NamedTuple):
     """One census, indexed for the table rows."""
 
-    directors: dict[staff.StaffId, census.CensusDirector]
+    sessions: dict[str, census.CensusSession]
     reachable: frozenset[str]
     workers: dict[staff.StaffId, tuple[census.CensusWorker, ...]]
 
@@ -279,17 +277,26 @@ def census_view(read: census.Census | census.CensusFailed) -> CensusView | censu
     workers: dict[staff.StaffId, list[census.CensusWorker]] = {}
     for worker in read.workers:
         workers.setdefault(worker.parent_staff_id, []).append(worker)
-    return CensusView({director.staff_id: director for director in read.directors},
+    return CensusView({session.session: session for session in read.sessions},
                       frozenset(machine.name for machine in read.machines if machine.reachable),
                       {parent: tuple(rows) for parent, rows in workers.items()})
+
+
+def _unit_session(unit: live_units.LiveUnit) -> str | None:
+    """Return the staff row's current session, else the session of the Claude in the unit's pane."""
+    if isinstance(unit.member, staff.StaffRow):
+        return unit.member.current_session
+    claude = unit.session.claude if unit.session is not None else None
+    return claude.session_id if isinstance(claude, unit_lookup.LiveClaude) else None
 
 
 def census_status(view: CensusView | census.CensusFailed, unit: live_units.LiveUnit) -> str:
     """Return the tile's status word, `exited` for an unlisted unit on a scanned machine, or `—`."""
     if isinstance(view, census.CensusFailed):
         return display_cells.NONE
-    if isinstance(unit.member, staff.StaffRow) and (director := view.directors.get(unit.member.id)) is not None:
-        return director.status or display_cells.NONE
+    session_id = _unit_session(unit)
+    if session_id is not None and (session := view.sessions.get(session_id)) is not None:
+        return session.status or display_cells.NONE
     return "exited" if (unit.machine or remote.local_machine()) in view.reachable else display_cells.NONE
 
 

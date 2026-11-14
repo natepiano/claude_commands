@@ -726,10 +726,13 @@ An unstaffed session requires an explicit native id and an explicit unit name.
     ETA Plan appears for unfinished plan phases or promises for unfinished targets without open rows.
     Status and Workers come from one `census.read()`, which runs `cargo-handler census --json` within `units_census_seconds`.
     `unit_phases.main` submits the census to its read pool with the unit and plan reads, so the reads overlap.
-    `census.parse` accepts schema 1 and 2 and returns `Census` with `CensusMachine`, `CensusDirector` and `CensusWorker` records, or `CensusFailed(reason)`.
+    `census.parse` accepts schema 2 only and returns `Census` with `CensusMachine`, `CensusSession` and `CensusWorker` records, or `CensusFailed(reason)`.
+    It reads the top-level `sessions` list and not the `directors` list.
     A worker carries `CensusPass(role, phase)` or `NoPass`, and its `CensusRun` records.
-    `census_status` gives the director's status word for the unit's staff ID, or `—` when the word is null.
-    An unlisted unit shows `exited` when its machine is a reachable census machine, and `—` otherwise.
+    `census_status` gives the status word of the census session for the unit, or `—` when the word is null.
+    The unit's session is the staff row's `current_session`, or the pane Claude's session when the unit has no staff row.
+    The words are `busy`, `idle`, `paused` and `exited`; the census gives starting and waiting as activities.
+    A unit whose session is not listed shows `exited` when its machine is a reachable census machine, and `—` otherwise.
     A failed census gives `—` in Status and Workers and one anomaly line; the table has no other source for these cells.
     The style table keeps the [shared session classifier](accounts.md#status-counts-and-notes).
     The status table and the style table add **Machine** after **Status** only when a row runs on another machine.
@@ -809,7 +812,7 @@ An unstaffed session requires an explicit native id and an explicit unit name.
     `census_workers` selects the census workers whose `parent_staff_id` is the unit.
     An open phase row keeps only the workers whose open pass names that phase instance.
     `workers_cell` shows each detached run first: `waiting on run: <label> <elapsed>`, `result queued: <label>`, or `run gone: <label>`.
-    A worker without a run shows `working` when busy or starting, and `waiting` when waiting; idle workers add `+<n> idle`.
+    A busy worker without a run shows `working`; idle workers add `+<n> idle`.
     Its cell keeps the existing 80-character limit.
     The table reads no panes, run records or process table for Workers.
     Non-Phase Work shows `—` for open phase rows because Notes already describes each phase.

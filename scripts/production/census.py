@@ -10,7 +10,7 @@ from scripts.lib.process_failure import failure_detail
 from scripts.production import staff
 
 COMMAND = ("cargo-handler", "census", "--json")
-SCHEMAS = (1, 2)
+SCHEMA = 2
 
 type RunState = Literal["running", "finished_queued", "missing"]
 RUN_STATES: tuple[RunState, ...] = ("running", "finished_queued", "missing")
@@ -21,12 +21,10 @@ class CensusMachine(NamedTuple):
     reachable: bool
 
 
-class CensusDirector(NamedTuple):
-    """A unit director that a handler tile shows. `status` is None when the accounts command has no entry."""
+class CensusSession(NamedTuple):
+    """A session that a handler tile shows. `status` is None when the accounts command has no entry."""
 
-    staff_id: staff.StaffId
-    name: str
-    machine: str
+    session: str
     status: str | None
 
 
@@ -58,7 +56,7 @@ class CensusWorker(NamedTuple):
 
 class Census(NamedTuple):
     machines: tuple[CensusMachine, ...]
-    directors: tuple[CensusDirector, ...]
+    sessions: tuple[CensusSession, ...]
     workers: tuple[CensusWorker, ...]
 
 
@@ -115,10 +113,9 @@ def _assignment(value: object, where: str) -> CensusPass | NoPass:
     return CensusPass(_text(fields, "role", where), _text(fields, "phase", where))
 
 
-def _director(value: object, where: str) -> CensusDirector:
+def _session(value: object, where: str) -> CensusSession:
     fields = _object(value, where)
-    return CensusDirector(staff.StaffId(_text(fields, "staff_id", where)), _text(fields, "name", where),
-                          _text(fields, "machine", where), _optional_text(fields, "status", where))
+    return CensusSession(_text(fields, "session", where), _optional_text(fields, "status", where))
 
 
 def _worker(value: object, where: str) -> CensusWorker:
@@ -139,16 +136,16 @@ def _machine(value: object, where: str) -> CensusMachine:
 
 
 def parse(text: str) -> Census | CensusFailed:
-    """Parse census schema 1 or 2. Schema 2 adds keys that this reader does not use yet."""
+    """Parse census schema 2."""
     try:
         document = _object(json.loads(text), "census")  # pyright: ignore[reportAny]
         schema = document.get("schema")
-        if isinstance(schema, bool) or schema not in SCHEMAS:
-            return CensusFailed(f"census schema {schema!r} is not {' or '.join(map(str, SCHEMAS))}")
+        if isinstance(schema, bool) or schema != SCHEMA:
+            return CensusFailed(f"census schema {schema!r} is not {SCHEMA}")
         return Census(
             tuple(_machine(item, f"machines[{index}]") for index, item in enumerate(_list(document, "machines", "census"))),
-            tuple(_director(item, f"directors[{index}]")
-                  for index, item in enumerate(_list(document, "directors", "census"))),
+            tuple(_session(item, f"sessions[{index}]")
+                  for index, item in enumerate(_list(document, "sessions", "census"))),
             tuple(_worker(item, f"workers[{index}]") for index, item in enumerate(_list(document, "workers", "census"))))
     except json.JSONDecodeError as error:
         return CensusFailed(f"census output is not JSON: {error}")

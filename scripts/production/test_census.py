@@ -17,7 +17,7 @@ WORKER: dict[str, object] = {
              {"label": "lint", "started_at": None, "state": "missing", "unknown": {"reason": "run has no start time"}}],
     "unknown": None}
 SAMPLE: dict[str, object] = {
-    "schema": 1,
+    "schema": 2,
     "machines": [{"name": "natedev", "reachable": True, "error": None},
                  {"name": "mac", "reachable": False, "error": "timed out"}],
     "directors": [{"staff_id": "handler-unit", "name": "handler-unit", "machine": "natedev",
@@ -29,33 +29,35 @@ SAMPLE: dict[str, object] = {
                 {"staff_id": "handler-test", "name": "handler-test", "parent_staff_id": "handler-unit",
                  "machine": "natedev", "status": "idle", "activity": "", "activity_started_at": None,
                  "pass": None, "pane": "closed", "runs": [], "unknown": None}],
+    "sessions": [{"session": "4dbdb78e", "machine": "natedev", "status": "busy", "activity": "impl · waiting"},
+                 {"session": "01a18dbb", "machine": "natedev", "status": None, "activity": None}],
 }
 
 
 class CensusTests(unittest.TestCase):
-    def test_schema_one_and_two_parse_into_typed_records(self) -> None:
+    def test_schema_two_parses_into_typed_records(self) -> None:
         expected = census.Census(
             (census.CensusMachine("natedev", True), census.CensusMachine("mac", False)),
-            (census.CensusDirector(staff.StaffId("handler-unit"), "handler-unit", "natedev", "busy"),
-             census.CensusDirector(staff.StaffId("quiet-unit"), "quiet-unit", "natedev", None)),
+            (census.CensusSession("4dbdb78e", "busy"), census.CensusSession("01a18dbb", None)),
             (census.CensusWorker(staff.StaffId("handler-impl"), "handler-impl", staff.StaffId("handler-unit"), "busy",
                                  census.CensusPass("impl", "8"),
                                  (census.CensusRun("verify test", 1794600060.0, "running"),
                                   census.CensusRun("lint", None, "missing"))),
              census.CensusWorker(staff.StaffId("handler-test"), "handler-test", staff.StaffId("handler-unit"), "idle",
                                  census.NoPass(), ())))
-        for schema, extra in ((1, {}), (2, {"sessions": [{"session_id": "s", "machine": "natedev"}]})):
-            with self.subTest(schema=schema):
-                self.assertEqual(census.parse(json.dumps({**SAMPLE, "schema": schema, **extra})), expected)
+        self.assertEqual(census.parse(json.dumps(SAMPLE)), expected)
 
     def test_bad_output_is_one_failure_with_its_reason(self) -> None:
         worker = WORKER
         cases: list[tuple[str, str]] = [
             ("not json", "census output is not JSON"),
             (json.dumps([]), "census: census is not an object"),
-            (json.dumps({**SAMPLE, "schema": 3}), "census schema 3 is not 1 or 2"),
-            (json.dumps({**SAMPLE, "schema": True}), "census schema True is not 1 or 2"),
-            (json.dumps({**SAMPLE, "directors": {}}), "census: census.directors is not a list"),
+            (json.dumps({**SAMPLE, "schema": 1}), "census schema 1 is not 2"),
+            (json.dumps({**SAMPLE, "schema": True}), "census schema True is not 2"),
+            (json.dumps({key: value for key, value in SAMPLE.items() if key != "sessions"}),
+             "census: census.sessions is not a list"),
+            (json.dumps({**SAMPLE, "sessions": [{"session": "s", "status": 2}]}),
+             "census: sessions[0].status is not text or null"),
             (json.dumps({**SAMPLE, "machines": [{"name": "natedev", "reachable": "yes"}]}),
              "census: machines[0].reachable is not true or false"),
             (json.dumps({**SAMPLE, "workers": [{**worker, "status": 3}]}),

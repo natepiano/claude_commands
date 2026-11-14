@@ -95,8 +95,8 @@ def event(kind: str, **fields: str) -> str:
 LOCAL = census.Census((census.CensusMachine("natedev", True),), (), ())
 
 
-def director(member: staff.StaffId, status: str | None) -> census.CensusDirector:
-    return census.CensusDirector(member, f"unit-{member}", "natedev", status)
+def session_of(member: staff.StaffRow, status: str | None) -> census.CensusSession:
+    return census.CensusSession(member.current_session, status)
 
 
 def census_worker(name: str, parent: staff.StaffId, *, status: str | None = "busy", phase: str = "",
@@ -105,15 +105,15 @@ def census_worker(name: str, parent: staff.StaffId, *, status: str | None = "bus
     return census.CensusWorker(staff.StaffId(f"{name}-id"), name, parent, status, assignment, tuple(runs))
 
 
-def tiles(*, directors: Sequence[census.CensusDirector] = (),
+def tiles(*, sessions: Sequence[census.CensusSession] = (),
           workers: Sequence[census.CensusWorker] = ()) -> census.Census:
-    return LOCAL._replace(directors=tuple(directors), workers=tuple(workers))
+    return LOCAL._replace(sessions=tuple(sessions), workers=tuple(workers))
 
 
 def census_for(units: Sequence[live_units.LiveUnit]) -> census.Census:
     """List each recorded unit that is not exited, with the status word of its live classification."""
-    return tiles(directors=[director(selected.member.id, selected.status) for selected in units
-                            if isinstance(selected.member, staff.StaffRow) and selected.status != "exited"])
+    return tiles(sessions=[session_of(selected.member, selected.status) for selected in units
+                           if isinstance(selected.member, staff.StaffRow) and selected.status != "exited"])
 
 
 def table_of(units: list[live_units.LiveUnit], records: dict[str, object]) -> str:
@@ -742,9 +742,7 @@ class UnitPhasesTests(unittest.TestCase):
         ]
         cases: list[tuple[Sequence[census.CensusWorker] | census.CensusFailed, str]] = [
             (workers, "a waiting on run: x 1m · b result queued: y · c run gone: z · d working +1 idle"),
-            ([census_worker("a", parent, runs=[census.CensusRun("w", None, "running")]),
-              census_worker("asking", parent, status="waiting"), census_worker("starting", parent, status="starting")],
-             "a waiting on run: w · asking waiting · starting working"),
+            ([census_worker("a", parent, runs=[census.CensusRun("w", None, "running")])], "a waiting on run: w"),
             ([census_worker("idle", parent, status="idle")], "—"),
             ([census_worker("held", parent, status="paused")], "—"), ([], "—"),
             (census.CensusFailed("census took longer than 10 s"), "—")]
@@ -752,17 +750,21 @@ class UnitPhasesTests(unittest.TestCase):
             with self.subTest(expected=expected):
                 self.assertEqual(unit_phases.workers_cell(sample, now=1060), expected)
 
-    def test_status_comes_from_the_census_director_or_the_scanned_machines(self) -> None:
+    def test_status_comes_from_the_census_session_or_the_scanned_machines(self) -> None:
         owner = fixture_member("showrunner", name="status-owner")
         member = fixture_member("unit", name="listed", parent=owner.id,
             worktree=staff.PresentWorktree(remote.local_machine(), self.root))
         listed = unit("listed", live("listed"))
         mac = listed._replace(machine="mac")
+        unrecorded = unit("unrecorded", live("unrecorded"))
         failed = census.CensusFailed("census exited 2: bad config")
         cases: list[tuple[census.Census | census.CensusFailed, live_units.LiveUnit, str]] = [
-            (tiles(directors=[director(member.id, "busy")]), listed, "busy"),
-            (tiles(directors=[director(member.id, "paused")]), mac, "paused"),
-            (tiles(directors=[director(member.id, None)]), listed, "—"),
+            (tiles(sessions=[session_of(member, "busy")]), listed, "busy"),
+            (tiles(sessions=[session_of(member, "paused")]), mac, "paused"),
+            (tiles(sessions=[session_of(member, None)]), listed, "—"),
+            (tiles(sessions=[census.CensusSession("listed-id", "busy")]), listed, "exited"),
+            (tiles(sessions=[census.CensusSession("unrecorded-id", "idle")]), unrecorded, "idle"),
+            (LOCAL, unrecorded._replace(session=None), "exited"),
             (LOCAL, listed, "exited"),
             (LOCAL, listed._replace(machine=""), "exited"),
             (LOCAL, mac, "—"),
@@ -881,7 +883,7 @@ class UnitPhasesTests(unittest.TestCase):
                 with patch.object(plan_history, "now_epoch", return_value=now):
                     record = phase_table.build_plan(plan)
                 rendered = unit_phases.table([unit("parallel", live("parallel"))._replace(machine="mac")], {"parallel": record},
-                    now=now, zone=ZoneInfo("UTC"), census_read=tiles(directors=[director(member.id, "idle")], workers=[
+                    now=now, zone=ZoneInfo("UTC"), census_read=tiles(sessions=[session_of(member, "idle")], workers=[
                         census_worker("repair", member.id, phase="eight"),
                         census_worker("verifier", member.id, phase="ten")]))
                 sections = rendered.split("\n\n")
@@ -1311,7 +1313,7 @@ class UnitPhasesTests(unittest.TestCase):
                     self.assertEqual(units[0].status, expected)
                     self.assertEqual(units[0].machine, machine)
                     output = unit_phases.table(units, {}, snapshot=snapshot,
-                                               census_read=tiles(directors=[director(first.id, expected)]))
+                                               census_read=tiles(sessions=[session_of(member, expected)]))
                     if machine == "mac":
                         self.assertIn("| Unit | Status | Machine |", output)
                         self.assertIn(f"| first | {expected} | mac |", output)

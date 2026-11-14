@@ -23,7 +23,7 @@ The showrunner's order on 2026-11-13 19:4x EST: "Start the switch phase now: the
   - `scripts/production/unit_phases.py` — `table()` builds table 1 with Status and Workers; `workers_cell()` writes the Workers text; `main()` runs the reads in a thread pool.
   - `scripts/production/live_units.py` — `read_units()` supplies the units and today's Status.
   - `scripts/direct/worker_runs.py` — `observe_pane_rows()`, `phase_workers()`, `pane_worker_rows()` observe worker panes and run records for the table today.
-  - `~/rust/cargo-liner/crates/cargo-handler/README.md` section `census` — schema 1 and its example.
+  - `~/rust/cargo-liner/crates/cargo-handler/README.md` section `census` — schema 2 and its example.
   - `commands/showrunner/units.md`, `docs/as-built/showrunner-automation.md` — the units rules.
 - **Test lane:** `scripts.production.test_unit_phases`, `scripts.production.test_display_cells`, `scripts.direct.test_phase_waits`, `scripts.production.test_census`, `scripts.production.test_staff_accessors`, `scripts.agents.test_shutdown_cli`, `scripts.accounts.test_accounts`.
 - **Build:** `basedpyright` on each changed Python file must read `0 errors, 0 warnings, 0 notes`.
@@ -60,7 +60,7 @@ The showrunner's order on 2026-11-13 19:4x EST: "Start the switch phase now: the
 - `pass.phase` is the phase instance id, not the plan phase number.
 - A test that builds the table without a census read reads live data; every test injects a `Census`.
 
-### Phase 2 — Take census schema 2  · status: todo
+### Phase 2 — Take census schema 2  · status: done
 
 #### Work Order
 

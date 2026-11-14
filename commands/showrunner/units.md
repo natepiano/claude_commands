@@ -17,12 +17,13 @@ This fallback is normal and prints no anomaly.
 `units_table_cell_lines` sets the cell line cap for Claude Code 2.1.319.
 Each table shows only the production's staff units, sorted by unit name without case distinctions.
 The phase tables read one `cargo-handler census --json` for **Status** and **Workers**.
-The census lists the unit directors and workers that the handler tiles show.
+The census lists the sessions and the workers that the handler tiles show.
 It runs beside the other reads, within `units_census_seconds` in `config/production.conf`.
-For the phase status table, **Status** is the tile's status word for the unit's staff ID.
-The words are `busy`, `starting`, `waiting`, `idle`, `paused` and `exited`.
+For the phase status table, **Status** is the tile's status word for the unit's current session.
+The session is the staff row's current session, or the session of the Claude in the unit's pane when the unit has no staff row.
+The words are `busy`, `idle`, `paused` and `exited`. Starting and waiting are activities, not status words.
 A tile without an accounts entry shows `—`.
-A unit that the census does not list shows `exited` when the census scanned the unit's machine.
+A unit whose session the census does not list shows `exited` when the census scanned the unit's machine.
 A unit on a machine that the census did not scan shows `—`.
 When the census fails, Status and Workers show `—` and the output ends with one anomaly line.
 The style table keeps the shared session classifier, which the accounts board also uses.
@@ -111,7 +112,7 @@ ETA Plan appears when a unit has unfinished plan phases or a promise for an unfi
    A row without an open phase lists every census worker of the unit.
    Each detached run shows first, as `<name> waiting on run: <label> <elapsed>`, `<name> result queued: <label>`, or `<name> run gone: <label>`.
    A running run without a start time omits the elapsed time.
-   A worker without a run shows `<name> working` when busy or starting, and `<name> waiting` when waiting.
+   A busy worker without a run shows `<name> working`.
    Idle workers add `+<n> idle` after other workers.
 7. **Non-Phase Work** shows `—` for an open phase row because Notes already describes that phase.
    A row without a recorded phase instance keeps the existing summary for work outside the plan.
