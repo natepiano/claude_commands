@@ -22,7 +22,7 @@ import unittest
 from unittest import mock
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import BinaryIO, cast, override
+from typing import BinaryIO, ClassVar, cast, override
 
 
 from scripts.lib.socket_test_support import short_socket_directory
@@ -108,12 +108,34 @@ def setUpModule() -> None:
 
 
 class RecordTests(unittest.TestCase):
+    repository_seed: ClassVar[Path]
     base: Path  # pyright: ignore[reportUninitializedInstanceVariable]
     root: Path  # pyright: ignore[reportUninitializedInstanceVariable]
     repo: Path  # pyright: ignore[reportUninitializedInstanceVariable]
 
+    @classmethod
+    @override
+    def setUpClass(cls) -> None:
+        seed_root = Path(cls.enterClassContext(tempfile.TemporaryDirectory(prefix="record-seed-"))).resolve()
+        seed_home = seed_root / "home"
+        seed_home.mkdir()
+        cls.repository_seed = seed_root / "repository"
+        cls.repository_seed.mkdir()
+        builder = cls()
+        builder.base = seed_root
+        builder.root = seed_root / "buildlog"
+        builder.repo = cls.repository_seed
+        with mock.patch.dict(os.environ, {"HOME": str(seed_home), "XDG_CONFIG_HOME": str(seed_home / ".config")}):
+            _ = builder.git("init", "-q", "-b", "main", cwd=builder.repo)
+            _ = builder.git("commit", "-q", "--allow-empty", "-m", "first", cwd=builder.repo)
+
     @override
     def setUp(self) -> None:
+        # Other test modules also construct this fixture without class setup.
+        cls = type(self)
+        if not hasattr(cls, "repository_seed") or not cls.repository_seed.is_dir():
+            self.addCleanup(cls.doClassCleanups)
+            cls.setUpClass()
         self.base = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
         self.enterContext(mock.patch.dict(os.environ))
         if "BUILDLOG_REPO_IDENTITY" in os.environ:
@@ -124,9 +146,7 @@ class RecordTests(unittest.TestCase):
         self.root = self.base / "buildlog"
         point_root_at(self, self.root)
         self.repo = self.base / "hana"
-        self.repo.mkdir()
-        _ = self.git("init", "-q", "-b", "main", cwd=self.repo)
-        _ = self.git("commit", "-q", "--allow-empty", "-m", "first", cwd=self.repo)
+        _ = shutil.copytree(cls.repository_seed, self.repo)
         _ = self.admission
         self.enterContext(mock.patch.dict(os.environ, {"USER_ZONE": "America/Los_Angeles"}))
 
