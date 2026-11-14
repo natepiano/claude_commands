@@ -93,7 +93,7 @@ def _managed_review(review: Path, log: Path, target: str) -> int:
             "bash", str(SCRIPTS / "direct/assign.sh"), "--role", "review", "--operation", "astra-review",
             "--target", target, "--policy", "astra-reviewer",
             "--new-worker", f"astra-reviewer{os.getpid()}", "--session-dir", str(run), "--cwd", str(Path.cwd()),
-            "--prompt", str(run / "prompt.md"), "--summary", str(review), "--log", str(run / "turn.log"),
+            "--prompt", str(run / "prompt.md"), "--reply-file", str(review.resolve()), "--log", str(run / "turn.log"),
             "--model", MODEL, "--effort", REASONING,
         ], stdout=output, stderr=subprocess.STDOUT, text=True, check=False)
     if result.returncode == 0 and log.read_text(encoding="utf-8").splitlines()[-1:] == ["submitted"]:

@@ -58,7 +58,7 @@ class PaneAstraReviewTests(HeldRolePaneCase):
         run.mkdir(exist_ok=True)
         return invoke_cli(assign, assign.main, ["--role", "review", "--operation", "astra-review",
             "--new-worker", "astra-reviewer", "--session-dir", str(run), "--cwd", str(self.panes.root),
-            "--prompt", str(self.panes.command_case.prompt), "--summary", str(run / "review.md")],
+            "--prompt", str(self.panes.command_case.prompt), "--reply-file", str(run / "review.md")],
             os.environ.copy(), ROOT)
 
     def test_named_review_done_records_the_status_style_and_one_notice(self) -> None:

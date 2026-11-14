@@ -125,7 +125,7 @@ Results return to the worker or its current holder. Callers do not poll.
 | --- | --- |
 | Session discovery | `scripts/message/roster.py` reads local and peer evidence. |
 | One recipient | `scripts/message/send.py` resolves staff identity before selecting transport. |
-| Groups | `scripts/production/broadcast.py` selects roles or a unit's workers. |
+| Groups | `scripts/production/broadcast.py` selects roles, a production's unit directors, or a unit's workers. |
 | Assignment status | `scripts/direct/board.sh` records worker status for the director. |
 | Native completion | `scripts/herdr/turn_end.py` saves the reply and sends its result notice. |
 | User question | `scripts/production/update_registration.py` records the question and its asker. |

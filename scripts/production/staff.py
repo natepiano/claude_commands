@@ -11,7 +11,6 @@ import fcntl
 import json
 import os
 import re
-import stat
 import sys
 import time
 from collections.abc import Mapping, Callable, Generator, Sequence
@@ -23,6 +22,8 @@ from importlib import import_module
 from pathlib import Path
 from typing import TYPE_CHECKING, ClassVar, Literal, NewType, Protocol, Self, TypeVar, cast
 from uuid import UUID
+
+from scripts.lib import git_files
 
 if __name__ == "__main__":
     # Lazy runtime readers share these exact row and exception classes in the CLI.
@@ -533,51 +534,16 @@ class UnreadableGitCheckout:
 
 def _document_checkout(path: Path) -> CheckoutDocument | OutsideGitCheckout | UnreadableGitCheckout:
     """Read document identity from Git metadata without starting a process."""
-    metadata = path
     try:
         document = path.resolve()
-        for folder in document.parents:
-            metadata = folder / ".git"
-            try:
-                mode = metadata.lstat().st_mode
-            except FileNotFoundError:
-                continue
-            if stat.S_ISDIR(mode):
-                git_directory = metadata
-            elif stat.S_ISREG(mode) or stat.S_ISLNK(mode):
-                if metadata.is_dir():
-                    git_directory = metadata
-                else:
-                    directive = metadata.read_text(encoding="utf-8").strip()
-                    if not directive.startswith("gitdir:"):
-                        raise ValueError("expected a gitdir: line")
-                    location = directive.removeprefix("gitdir:").strip()
-                    if not location:
-                        raise ValueError("empty gitdir path")
-                    git_directory = folder / location
-            else:
-                raise ValueError("expected a Git metadata file or directory")
-            metadata = git_directory
-            git_directory = git_directory.resolve(strict=True)
-            if not stat.S_ISDIR(git_directory.stat().st_mode):
-                raise ValueError("Git directory is not a directory")
-            metadata = git_directory / "commondir"
-            try:
-                _ = metadata.lstat()
-            except FileNotFoundError:
-                common_directory = git_directory
-            else:
-                location = metadata.read_text(encoding="utf-8").strip()
-                if not location:
-                    raise ValueError("empty commondir path")
-                common_directory = (git_directory / location).resolve(strict=True)
-            metadata = common_directory
-            if not stat.S_ISDIR(common_directory.stat().st_mode):
-                raise ValueError("Git common directory is not a directory")
-            return CheckoutDocument(common_directory, document.relative_to(folder))
-    except (OSError, UnicodeError, RuntimeError, ValueError) as error:
-        return UnreadableGitCheckout(metadata, str(error))
-    return OutsideGitCheckout()
+        checkout = git_files.locate(next(folder for folder in document.parents if folder.is_dir()))
+    except git_files.NotACheckout:
+        return OutsideGitCheckout()
+    except git_files.UnreadableGitFiles as error:
+        return UnreadableGitCheckout(error.path, error.reason)
+    except (OSError, RuntimeError) as error:
+        return UnreadableGitCheckout(path, str(error))
+    return CheckoutDocument(checkout.common_dir, document.relative_to(checkout.toplevel))
 
 
 @dataclass(frozen=True)

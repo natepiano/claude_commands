@@ -1087,6 +1087,9 @@ def restore(parent: StaffId, *, record: staff.StaffSnapshot | None = None,
     launch_account = ((worker_panes.DestinationWorkerAccount(account) if account else
                        worker_panes.ConfiguredWorkerAccount.CURRENT) if isinstance(account, str) else account)
     observed = _read_workers(holder, record, only=only, scanned=runs)
+    from scripts.whoami import quota_alert
+
+    workers_held = quota_alert.no_worker_mode()
     held_runs = list(dict.fromkeys(path.resolve() for path in observed.runs))
     selected_workers = tuple(dict.fromkeys(state.row.name for state in observed.states
         if state.row.id in only and isinstance(state, (worker_panes.OpenWorker,
@@ -1133,6 +1136,9 @@ def restore(parent: StaffId, *, record: staff.StaffSnapshot | None = None,
                             changed = True
                         if only != "all":
                             print(f"{state.row.name}: closed; its next assign resumes it")
+                        continue
+                    if workers_held and isinstance(staff.backend(state.row), staff.CodexBackend):
+                        print(f"{state.row.name}: not resumed: no-worker mode")
                         continue
                     resume = partial(_resume_launcher, detached=detached) if detached else _resume_launcher
                     if not isinstance(state, worker_panes.OpenWorker):

@@ -286,7 +286,12 @@ from scripts.production.showrunners import (
 
 
 Config = ShowrunnerSettings
-STATE = Path(os.environ.get("XDG_STATE_HOME") or Path.home() / ".local" / "state") / "quota_alert.json"
+def state_path() -> Path:
+    """The quota state file under the current XDG_STATE_HOME."""
+    return Path(os.environ.get("XDG_STATE_HOME") or Path.home() / ".local" / "state") / "quota_alert.json"
+
+
+STATE = state_path()
 SESSIONS = Path.home() / ".claude" / "sessions"
 PROTOCOL = Path.home() / ".claude" / "docs" / "quota_alerts.md"
 AGENTS = Path(__file__).resolve().parent.parent / "agents" / "models_config.sh"
@@ -692,6 +697,23 @@ def _write_state(state: State) -> None:
     os.replace(tmp, STATE)
 
 
+def no_worker_mode() -> bool:
+    """Whether Codex workers have no capacity now; a missing or unreadable state reads as False.
+
+    The path is read at each call, so a test with its own XDG_STATE_HOME never reads the live state.
+    """
+    try:
+        saved = cast(StoredState, json.loads(state_path().read_text(encoding="utf-8")))
+    except (OSError, ValueError):
+        return False
+    return saved.get("no_worker_mode", False)
+
+
+def no_worker_notice() -> str:
+    """The notice that starts no-worker mode."""
+    return conf.read("accounts").text("no_worker_mode_on")
+
+
 def _start_detached(what: str, script: str, arguments: Callable[[], list[str]]) -> None:
     """Start one transient unit for a script; a failed start prints one line."""
     try:
@@ -710,8 +732,7 @@ def _start_detached(what: str, script: str, arguments: Callable[[], list[str]]) 
 def _broadcast_worker_mode(active: bool) -> None:
     """Announce the mode after the state lock closes; when it goes on, also stop the Codex workers."""
     def notice() -> list[str]:
-        account_config = conf.read("accounts")
-        text = account_config.text("no_worker_mode_on") if active else account_config.text("no_worker_mode_off")
+        text = no_worker_notice() if active else conf.read("accounts").text("no_worker_mode_off")
         return ["--from", NO_WORKER_MODE_SENDER, "--showrunners", text, "--units", text]
 
     _start_detached("no-worker mode broadcast", "production/broadcast.py", notice)

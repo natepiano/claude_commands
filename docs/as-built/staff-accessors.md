@@ -213,7 +213,7 @@ The shared pane launch builder uses `set_home`.
 | `scripts/mac_test/mac_test.py` | read | initial_snapshot, by_id, StaffId; holder_name shows the current name of a fixed holder key, delivery_target sends to the staff id |
 | `scripts/message/escalate.py` | read | active, snapshot |
 | `scripts/message/failed_lookup.py` | read | snapshot |
-| `scripts/message/morty_identity.py` | read | native_id |
+| `scripts/message/morty_identity.py` | read | snapshot; holder returns the current_session of the producer row named morty |
 | `scripts/message/postmaster.py` | read | snapshot, StaffSnapshot, by_id |
 | `scripts/message/rca.py` | read | active, snapshot |
 | `scripts/message/recipient_test_support.py` | read | staff.json path |

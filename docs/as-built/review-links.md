@@ -318,7 +318,7 @@ Each showrunner group orders its prepared change rows with `urgency.queue_order`
 The page keeps row entries during ordering and does not format the text that `/next` prints.
 The existing urgency order, pin, dependencies, and moved rows determine its order.
 Queue keys and prerequisites retain their list-based IDs.
-The Details line and `/next` show the responsible showrunner's ID, such as `sdlc/C1514`.
+The `change` line and `/next` show the responsible showrunner's ID, such as `sdlc/C1514`.
 The shared staff resolver supplies the prefix used by the showrunner filter.
 Rows without a staff producer use the list's showrunner through the same resolver.
 `verdict` and `answer-question` print the same responsible-showrunner ID.
@@ -339,16 +339,16 @@ Set it with `change_review.py set-kind --production <showrunner name> --row C27 
 Use **See in action** for a change to something the user runs or sees.
 Use **Read only** for other changes.
 Both kinds appear.
-An older row without Kind appears as **Kind not recorded**.
-The page shows every row with its recorded kind or the missing-kind notice.
+An older row without Kind shows no kind line.
+The page shows every row with its recorded kind.
 
 The short URL ends in `/changes.html`.
 The page retains the plain, narrow layout and fits a phone.
-Each card starts with its title.
-One closed **Details** disclosure holds the ID, date, commit, and kind.
-How to check or Proof stays in the main view.
+Each card starts with its title, then How to check or Proof.
 The title uses 20px text; section labels use 17px text.
-A 16px gap separates the title and metadata.
+Aligned detail lines follow the buttons and are always shown: `change`, `date`, `time`, `commit`, and `kind`.
+A line is left out when its value is unknown.
+`time` is the time of day that the row was added, in the user's zone; older rows have no time.
 How to check and Proof show text lines in preformatted blocks.
 Consecutive lines that start with `- ` form a bulleted list.
 Consecutive lines that start with a number, a dot, and a space form a numbered list.
@@ -358,8 +358,8 @@ The list file stores cell line breaks as `<br>` and reads them as line breaks.
 A typed `<br>` takes one more backslash in storage and reads back unchanged.
 Every line separator that Python's `splitlines` recognizes is a line break.
 Each row stays on one table line.
-Works and Does not work are the main actions.
-Ask showrunner to check, Ask a question, and Send feedback are secondary actions.
+Works, Does not work, Ask showrunner to check, Ask a question, Send feedback, and Skip for now share one wrapping row in that order.
+A desktop width shows two button rows; a 390px phone shows three.
 The **Comment, question or feedback** field is a textarea with `feedback_rows` rows.
 The setting starts at 5.
 The box accepts line breaks for every outcome.

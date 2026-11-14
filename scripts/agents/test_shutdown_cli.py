@@ -24,6 +24,7 @@ from typing import cast, final, override
 from unittest import mock
 
 from scripts.accounts import accounts
+from scripts.lib.state_home_test_support import isolate_state_home
 from scripts.herdr import herdr_types
 from scripts.agents import worker_lifecycle
 from scripts.direct import progress_history
@@ -159,6 +160,7 @@ STOP_SESSION = stop_resume.stop
 def setUpModule() -> None:
     unittest.enterModuleContext(foreign_hostname())
     unittest.enterModuleContext(mock.patch.dict(os.environ, {"USER_ZONE": "America/New_York"}))
+    isolate_state_home()
 
 def git(where: Path, *arguments: str) -> str:
     return subprocess.run(["git", "-C", str(where), *arguments], check=True, capture_output=True,
@@ -350,7 +352,10 @@ class RetireUnitTests(unittest.TestCase):
         path = self.root / "production.conf"
         _ = path.write_text(f"# range: 5e-324..\nRETIRE_POLL_SECONDS={poll}\n# range: 5e-324..\nRETIRE_TERM_WAIT_SECONDS={wait}\n"
                             + f"# range: 5e-324..\nRETIRE_COMMAND_TIMEOUT_SECONDS={command}\n"
-                            + "# whole: 40..\nunits_table_columns=170\n")
+                            + "# whole: 40..\nunits_table_columns=170\n"
+                            + "# whole: 40..\nunits_table_floor_columns=120\n"
+                            + "# whole: 1..4\nunits_table_cell_lines=4\n"
+                            + "# whole: 2..\nunits_table_break_columns=30\n")
         return path
 
 

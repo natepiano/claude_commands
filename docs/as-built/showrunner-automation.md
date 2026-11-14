@@ -653,11 +653,10 @@ An unstaffed session requires an explicit native id and an explicit unit name.
   The phase tables use `display_cells.wrapped(headers, rows)` before escaping cells.
   It preserves full cells and omits columns whose cells are all `—`.
   A table without rows keeps its columns.
-  The command emits one Markdown row per phase for Claude Code's native wrapping.
+  The command emits one Markdown row per phase, plus continuation rows for cells over the line cap.
   The renderer sets column widths from the terminal width and wraps text inside each cell.
-  Print the output as Markdown without code fences, `<br>`, or continuation rows.
-  Claude Code 2.1.319 displays `<br>` as text and adds row borders around continuation rows.
-  Renderer trials at 170 columns showed that native wrapping keeps each Markdown row together.
+  Print the output as Markdown without code fences or `<br>`.
+  Claude Code 2.1.319 displays `<br>` as text.
   The style table uses `display_cells.fitted(headers, rows, *, cuttable, columns, cut_order)` before escaping cells.
   `cuttable` contains original column indexes, so equal header text does not change the selected columns.
   `cut_order` uses `CutOrder.LISTED` by default and accepts `CutOrder.WIDEST_FIRST`.
@@ -695,8 +694,8 @@ An unstaffed session requires an explicit native id and an explicit unit name.
     A client that shares the foreground with another process has no thread. It prints one line and refuses nothing.
     The worker scanner uses this reader before it joins the current thread to its staff row.
     A missing pane launch record does not make a resolved staff worker unknown.
-    `scripts/message/morty_identity.py` supplies the shared match against `MORTY_NATIVE_ID` from `config/send.conf`.
-    A match produces no anomaly.
+    `scripts/message/morty_identity.py` supplies the native ID on the producer staff row named `morty`.
+    `CodexProcessThreads` reads it one time for each report. A process with that ID produces no anomaly.
     `unit_phases.send_anomalies` sends all lines once to `UNIT_ANOMALIES_TO` from `config/production.conf` (`sdlc`).
     A failed send adds one anomaly line and preserves the table and exit code.
   - **Pause and exit:** `agents pause <unit> --why "<why>"` records `paused: {since, by, why}` and stops the workers.
@@ -760,9 +759,27 @@ An unstaffed session requires an explicit native id and an explicit unit name.
     Notes, Non-Phase Work, and Queued preserve every word of each displayed item or title.
     Each phase table calls `display_cells.wrapped` separately.
     Each table removes columns whose cells are all `—`.
-    Native Markdown wrapping keeps each phase's text in one row inside its cells.
-    Workers uses the same wrapping form when the status table exceeds the terminal width.
-    Unit, Status, Machine, Progress, Phase, and both ETA cells keep their text.
+    `claude_table_layout.py` models the width rule in Claude Code 2.1.319.
+    `unit_phases.py` run as a script reads its pane width once through `herdr.own_pane_columns`.
+    The read sends `pane.layout` for `HERDR_PANE_ID` to `HERDR_SOCKET_PATH`.
+    `units_table_width_read_milliseconds` limits the read; the median is under 1 ms.
+    Without a width, the tables use `units_table_floor_columns` in `config/production.conf` and print no anomaly.
+    Calls to `main` or `table` from tests pass the width or use the floor; they never read a live pane.
+    `units_table_cell_lines` sets the cell line cap, which defaults to four.
+    Cells that exceed the cap continue on rows that repeat Unit and fill one work cell.
+    Item marks take priority over word boundaries when the script splits cells.
+    When the column minimums exceed that width, a space follows a `-`, `/` or `_` inside the longest ID.
+    The mark must join two letters or digits.
+    A word without a mark breaks at the column share only from `units_table_break_columns` columns; shorter words stay whole.
+    When no such word is left and the minimums still exceed the width, the longest word over 3 columns breaks at the share.
+    Unit, Status, Machine, and Progress keep their text.
+    The script fits both tables at that width without changing the style table.
+    Each column can only grow in a wider terminal.
+    The minimums depend on live data: a long unit name or id can put them over the floor.
+    About 6% of width reads meet a herdr wait of about 100 ms; those runs shape for the floor, so a wide window can show break spaces.
+    `:` is no break mark, because it splits times such as `17:24`.
+    A zero-width space cannot replace the break space: Claude Code 2.1.319 wraps only at plain spaces.
+    A renderer change needs a new measure of the width rule.
     When the plan has no phases, an open run supplies Progress, Phase, and both ETA cells from its full event history.
     Notes uses this fallback when it has phase rows; otherwise, it keeps the plan state.
     The fallback does not change Queued.
@@ -871,8 +888,7 @@ An unstaffed session requires an explicit native id and an explicit unit name.
 
 - **Queued messages.** `sessions.addressed` resolves a staff name through its fixed staff ID and `current_session`. Explicit `session:` and `uds:` addresses select native records. Registry names and former names do not select recipients. A named recipient uses `STATE/queue/staff_<staff id>.jsonl`. An explicit session address uses `session-<session id>.jsonl`. A session drains its native keys, its socket key, and its fixed staff key. Queue entries retain their stable owner across session changes. A delivered keyed message removes its queued copy. `send.py retire` removes the selected queued messages. The one-off `convert_queue_keys.py` program moves current staff-name queue files into their staff ID files. Its default mode only prints the moves.
   Unit names also accept the form from `copies.unit_owner`.
-  Morty uses its staff row when present.
-  Without that row, `send.py` matches Morty's configured `MORTY_NATIVE_ID` against native transport addresses.
+  Morty uses its staff row. Without that row, `send.py` refuses the name `morty` as it refuses each name without a row.
   Postmaster replies use explicit session addresses.
   `postmaster`, `sdlc-merge-gate`, and `natedev` have staff rows.
 

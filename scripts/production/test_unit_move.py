@@ -823,7 +823,7 @@ class UnitFolderMoveTests(FolderRenameFixture):
               mock.patch.object(sessions, "running_sessions", return_value=[]),
               mock.patch.object(herdr, "running_codex_threads", return_value=set()) as threads,
               mock.patch.object(os, "kill") as killed, redirect_stderr(io.StringIO()) as output):
-            self.assertEqual(restart.live_rows(staff.StaffSnapshot((self.owner,)), client), [])
+            self.assertEqual(restart.live_rows(staff.StaffSnapshot((self.owner,)), client), restart.PartialLiveRows([]))
         read.assert_called_once_with(self.owner.current_session, codex=threads.call_args.kwargs["codex"])
         killed.assert_not_called()
         self.assertEqual(output.getvalue().splitlines(), [

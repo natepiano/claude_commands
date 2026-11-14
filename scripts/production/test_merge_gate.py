@@ -385,7 +385,8 @@ class MergeGateCheckpointTests(MergeGateFixture):
         merged = self.git(self.checkout, "rev-parse", "--short=8", "HEAD")
         written = review.read_text(encoding="utf-8").splitlines()[-1]
         rows = {f"| C8 | The grid fades gently | {day} · {merged} | not yet | Run `hana` in a natedev terminal. You see: The grid lines fade out farther away | {production} | {producer} |" for day in days}
-        self.assertIn(written, rows)
+        self.assertRegex(written, r"^\| C8 \| [^|]+ \| \d{4}-\d\d-\d\d \d\d:\d\d · ")
+        self.assertIn(re.sub(r" \d\d:\d\d · ", " · ", written, count=1), rows)
         self.assertIn(f"Change review: {written}", result.stdout)
         self.assertNotIn("drift", result.stderr)
         self.assertEqual(self.git(self.checkout, "status", "--porcelain"), "")
@@ -414,7 +415,7 @@ class MergeGateCheckpointTests(MergeGateFixture):
         with mock.patch.object(change_review, "datetime", mock.Mock(wraps=datetime, now=now)):
             result = self.run_gate("--promote", "--production", "fixture-showrunner", checkpoint=checkpoint)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertEqual(change_review.pending(review)[-1]["Merged"].split(" · ")[0], "2026-11-03")
+        self.assertEqual(change_review.pending(review)[-1]["Merged"].split(" · ")[0], "2026-11-03 20:00")
 
     def test_without_production_the_calling_showrunners_list_takes_the_rows(self) -> None:
         review, doc = self.review_list()
