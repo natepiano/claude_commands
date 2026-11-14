@@ -2178,7 +2178,9 @@ class RestartTests(RestartTestCase):
                                              herdr.Herdr("agents")), "w1:p0")
         self.assertEqual(self.launches, [(row.name, herdr.NewTab("saved", row.name))])
 
-    def test_saved_tab_reuses_only_the_targets_shell_and_splits_beside_a_sibling(self) -> None:
+    def test_saved_tab_waits_for_its_own_shell_and_never_splits(self) -> None:
+        settings = Path(os.environ["CONF_DIR"]) / "shutdown.conf"
+        write_text_atomic(settings, settings.read_text().replace("OWN_PANE_SHELL_SECONDS=30", "OWN_PANE_SHELL_SECONDS=0.2"))
         layout: herdr.SavedLayout = {"at": 1, "workspaces": [{"name": "saved", "seen": 1,
             "tabs": [{"staff_id": "row-0", "seen": 1}]}]}
         self.rows = (self.rows[0], replace(self.rows[1], kind="worker", parent=staff.ReportsTo(self.rows[0].id)), self.rows[2])
@@ -2228,11 +2230,20 @@ class RestartTests(RestartTestCase):
               patch.object(client, "pane_activity", return_value=herdr.PaneAtShell()) as activity):
             self.assertEqual(client.saved_row_tab("row-0", "unit-0", "fallback"), herdr.ExistingPane("w1:own", "own-terminal"))
             activity.assert_called_once_with("w1:own")
+            # The move race: the stopped agent and the shell setup still hold the own pane for a moment.
+            activity.side_effect = [herdr.PaneRunning(("claude",)), herdr.PaneRunning(("direnv",)), herdr.PaneAtShell()]
+            self.assertEqual(client.saved_row_tab("row-0", "unit-0", "fallback"), herdr.ExistingPane("w1:own", "own-terminal"))
+            activity.side_effect = None
             activity.return_value = herdr.PaneRunning(("codex",))
-            self.assertEqual(client.saved_row_tab("row-0", "unit-0", "fallback"), herdr.SplitPane("w1:sibling", "right", 0.5, "unit-0"))
+            with self.assertRaises(herdr.OwnPaneNotAtShell) as refused:
+                _ = client.saved_row_tab("row-0", "unit-0", "fallback")
+            self.assertEqual(str(refused.exception),
+                f"unit-0: restart refused: own pane w1:own is not at the shell after 0.2 s; session {self.rows[0].current_session} "
+                + "stays stopped; when that pane is at the shell, run: agents resume unit-0")
             pane_launch.save(path, {})
             activity.reset_mock()
-            self.assertEqual(client.saved_row_tab("row-0", "unit-0", "fallback"), herdr.SplitPane("w1:sibling", "right", 0.5, "unit-0"))
+            self.assertEqual(client.saved_row_tab("row-0", "unit-0", "fallback"),
+                             herdr.NewTab(herdr.row_workspace(self.rows[0], staff.StaffSnapshot(self.rows), "fallback"), "unit-0"))
             activity.assert_not_called()
 
         producer = replace(self.rows[0], kind="producer", unit_type=staff.NotUnit())
@@ -2245,7 +2256,7 @@ class RestartTests(RestartTestCase):
             return restart.producer_launch(row)
 
         _ = self.enterContext(patch.object(restart, "producer_resume", side_effect=resume))
-        for workspace_label, own_only, shell in (("morty", True, True), ("producers", False, False),
+        for workspace_label, own_only, shell in (("morty", True, True), ("producers", False, False), ("producers", True, False),
                                                  ("producers", False, True), ("producers", True, True)):
             with self.subTest(workspace=workspace_label, own_only=own_only, shell=shell):
                 layout["workspaces"][0]["name"] = workspace_label
@@ -2257,9 +2268,13 @@ class RestartTests(RestartTestCase):
                       patch.object(client, "panes", return_value=[]),
                       patch.object(client, "pane_activity", return_value=herdr.PaneAtShell()
                                    if shell else herdr.PaneRunning(("codex",)))):
+                    if not shell and own_only:
+                        self.assertRaises(herdr.OwnPaneNotAtShell, restart.start_row, producer, record, client)
+                        self.assertEqual(self.launches, [])
+                        continue
                     self.assertEqual(restart.start_row(producer, record, client), "w1:p0")
                 expected = (herdr.ExistingPane("w1:own", "own-terminal") if workspace_label == "producers"
-                            and own_only and shell else herdr.NewTab("producers", producer.name))
+                            and own_only else herdr.NewTab("producers", producer.name))
                 self.assertEqual(self.launches, [(producer.name, expected)])
 
         from scripts.agents.test_pane_restore import FakeClient
@@ -3340,7 +3355,7 @@ class RestartTests(RestartTestCase):
     def test_retained_shell_from_another_session_keeps_the_saved_destination(self) -> None:
         row = self.rows[0]
         self.running.clear()
-        destination = herdr.SplitPane("w1:sibling", "right", 0.5, row.name)
+        destination = herdr.NewTab("saved", row.name)
         pane: herdr.PaneIdentity = {"pane_id": "w1:p0", "workspace_id": "w1", "session_id": None,
                                      "terminal_id": "other-terminal"}
         with (patch.object(pane_record, "publication_for_session", return_value=self.retained_director("other")),
@@ -3355,7 +3370,7 @@ class RestartTests(RestartTestCase):
     def test_row_without_a_retained_launch_keeps_the_saved_destination(self) -> None:
         row = self.rows[0]
         self.running.clear()
-        destination = herdr.SplitPane("w1:sibling", "down", 0.5, row.name)
+        destination = herdr.NewTab("other", row.name)
         with (patch.object(pane_record, "publication_for_session", return_value=None),
               patch.object(herdr.Herdr, "saved_row_tab", return_value=destination)):
             _ = restart.start_row(row, staff.StaffSnapshot(self.rows), herdr.Herdr("agents"))

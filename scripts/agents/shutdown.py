@@ -28,7 +28,7 @@ from scripts.agents import worker_lifecycle
 from scripts.copies import copies
 from scripts.direct import progress_history
 from scripts.herdr import herdr, pane_launch, worker_panes
-from scripts.lib import process_group, process_start, conf, berth_board, unit_runs
+from scripts.lib import process_group, process_start, conf, berth_board, git_files, unit_runs
 from scripts.lib.conf import UseConfiguredValue
 from scripts.message import sessions, session_send, send_budget, send_result
 from scripts.production import (
@@ -822,6 +822,13 @@ def retirement_run(argv: list[str], cwd: Path | None = None, *, settings: conf.C
     return subprocess.run(argv, pass_fds=staff.operation_fds(), cwd=cwd, env=environment, capture_output=True, text=True, check=False,
                           timeout=min(limit, remaining))
 
+def retirement_branch(folder: Path) -> str:
+    """The checked-out branch from Git's files; "" when HEAD is detached or the folder is no checkout."""
+    try:
+        return git_files.current_branch(folder)
+    except git_files.GitFilesError:
+        return ""
+
 def retirement_failure(result: subprocess.CompletedProcess[str]) -> str:
     return (result.stderr or result.stdout).strip() or f"exit {result.returncode}"
 
@@ -1102,8 +1109,7 @@ def retirement_command_name(pid: int) -> str:
         return "?"
 
 def retirement_find_unit(production_name: str, given: str, *,
-              record: staff.StaffSnapshot | None = None,
-              settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT) -> RetiringUnit:
+              record: staff.StaffSnapshot | None = None) -> RetiringUnit:
     record = staff.snapshot() if record is None else record
     production = retirement_production_of(production_name, record=record)
     member = record.by_id(staff.StaffId(given))
@@ -1117,8 +1123,7 @@ def retirement_find_unit(production_name: str, given: str, *,
         raise ValueError(f"{member.name}: staff worktree is unfilled")
     branch = location.branch.value if isinstance(location, staff.RemovedWorktree) and isinstance(location.branch, staff.ParkedBranch) else ""
     if unit_machine_is_local(location.machine) and location.path.is_dir():
-        result = retirement_run(["git", "-C", str(location.path), "branch", "--show-current"], settings=settings)
-        branch = result.stdout.strip()
+        branch = retirement_branch(location.path)
     return RetiringUnit(production, member.name, location.path, branch, member)
 
 def retirement_last_session(unit: RetiringUnit) -> str:
@@ -1306,9 +1311,12 @@ def unit_local_command() -> int:
                 journal = retirement_journal(row)
                 pane = retirement_pane(row, record)
                 if location.path.exists():
-                    common = retirement_run(["git", "-C", str(location.path), "rev-parse", "--path-format=absolute", "--git-common-dir"], settings=settings)
-                    branch = retirement_run(["git", "-C", str(location.path), "branch", "--show-current"], settings=settings)
-                    if common.returncode or branch.returncode or not common.stdout.strip() or not branch.stdout.strip():
+                    try:
+                        common = git_files.locate(location.path).common_dir
+                        branch = git_files.current_branch(location.path)
+                    except git_files.GitFilesError as error:
+                        raise ValueError("cannot read the worktree Git identity") from error
+                    if not branch:
                         raise ValueError("cannot read the worktree Git identity")
                     config_path = location.path / ".unit.toml"
                     config = config_path.read_text(encoding="utf-8") if config_path.exists() else ""
@@ -1318,7 +1326,7 @@ def unit_local_command() -> int:
                                 "pane_session": pane.session if isinstance(pane, RetiringPane) else "",
                                 "pane_id": pane.pane if isinstance(pane, RetiringPane) else "",
                                 "pane_terminal": pane.terminal if isinstance(pane, RetiringPane) else "",
-                                "checkout": common.stdout.strip(), "branch": branch.stdout.strip(), "config": config,
+                                "checkout": str(common), "branch": branch, "config": config,
                                 "date": datetime.now(ZoneInfo(str(fields["zone"]))).date().isoformat(),
                                 "merge_branch": str(fields["merge_branch"])}
                     journal.parent.mkdir(parents=True, exist_ok=True)
@@ -1649,12 +1657,10 @@ def recovery_find_unit(production_name: str, given: str, *, record: staff.StaffS
     return RetiredUnitRecovery(production, name, worktree, member.row.name, saved.plan, member.row.current_session)
 
 def recovery_resume_record(production: Production, name: str) -> Path:
-    result = retirement_run(["git", "-C", str(production.checkout), "rev-parse", "--git-path",
-                              f"resume-units/{name}"])
-    if result.returncode:
-        raise RecoveryRefused(f"cannot find the resume record: {retirement_failure(result)}")
-    path = Path(result.stdout.strip())
-    return path if path.is_absolute() else production.checkout / path
+    try:
+        return git_files.locate(production.checkout).git_dir / "resume-units" / name
+    except git_files.GitFilesError as error:
+        raise RecoveryRefused(f"cannot find the resume record: {error}") from error
 
 def recovery_git(unit: RetiredUnitRecovery, *arguments: str) -> str:
     result = retirement_run(["git", "-C", str(unit.production.checkout), *arguments])
@@ -1663,8 +1669,7 @@ def recovery_git(unit: RetiredUnitRecovery, *arguments: str) -> str:
 def recovery_has_worktree(unit: RetiredUnitRecovery) -> bool:
     """Whether the worktree path holds the unit's worktree on its branch."""
     return ((unit.worktree / ".git").is_file()
-            and retirement_run(["git", "-C", str(unit.worktree), "branch", "--show-current"]).stdout.strip()
-            == unit.branch)
+            and retirement_branch(unit.worktree) == unit.branch)
 
 def recovery_has_transcript(unit: RetiredUnitRecovery) -> bool:
     return bool(sessions.transcript_locations(unit.session_id))
@@ -1776,7 +1781,7 @@ def retire_named_unit(name: str) -> int:
             settings = conf.read("production")
             record = staff.snapshot()
             row = named_staff_unit(name, record)
-            unit = retirement_find_unit(unit_production_name(row, record), str(row.id), record=record, settings=settings)
+            unit = retirement_find_unit(unit_production_name(row, record), str(row.id), record=record)
             return retirement_retire(unit, settings=settings, record=record)
         except (RetirementRefused, Refusal, ValueError, OSError, copies.CopyError, conf.Unusable,
                 unit_config.ConfigRefused, subprocess.SubprocessError) as error:
@@ -1889,7 +1894,7 @@ def rename_member(old: str, new: str, record: staff.StaffSnapshot) -> staff.Staf
 
 def rename_check_branch(checkout: Path, target: str) -> str:
     _ = unit_move.git(checkout, "check-ref-format", "--branch", target)
-    branch = unit_move.git(checkout, "branch", "--show-current")
+    branch = unit_move.checked_out_branch(checkout)
     if not branch:
         raise RenameRefused(f"{checkout}: the checkout has no current branch")
     if branch != target and unit_move.branch_tip(checkout, target):
@@ -1940,7 +1945,7 @@ def rename_plan(old: str, new: str, *, to_doc: str = "", to_branch: str = "") ->
     if doc.machine != remote.local_machine():
         raise RenameRefused(f"{row.name}: run the document move on {doc.machine}")
     destination = Path(to_doc).expanduser().resolve()
-    checkout = Path(unit_move.git(doc.path.parent, "rev-parse", "--show-toplevel"))
+    checkout = unit_move.checkout_folders(doc.path.parent).toplevel
     _ = destination.relative_to(checkout)
     branch = rename_check_branch(checkout, to_branch)
     if doc.path != destination and doc.path.exists() and unit_move.exists(destination):
@@ -2203,7 +2208,7 @@ def rename_apply_unit(request: RenamePlan) -> RenamePlan:
                 destination = folder.with_name(target) if target is not None else folder
                 unit_move.require_move_destination(record, row, destination)
                 checkout = unit_move.move_checkout(record, row)
-                branch = unit_move.git(checkout, "branch", "--show-current") if checkout.exists() else ""
+                branch = unit_move.checked_out_branch(checkout) if checkout.exists() else ""
                 renamed_branch = (request.move.branch if isinstance(request.move, UnitBranchMove) else
                                   unit_names.swap_stem(branch, row.name, request.name))
                 if changed and target is None:

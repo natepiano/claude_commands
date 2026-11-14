@@ -802,6 +802,14 @@ class PaneRunning:
     commands: tuple[str, ...]
 
 
+class OwnPaneNotAtShell(HerdrFailure):
+    """A restart refused: the session's own pane did not reach the shell in time."""
+
+    def __init__(self, name: str, session: str, pane: str, seconds: float) -> None:
+        super().__init__(f"{name}: restart refused: own pane {pane} is not at the shell after {seconds:g} s; "
+                         + f"session {session} stays stopped; when that pane is at the shell, run: agents resume {name}")
+
+
 @dataclass(frozen=True)
 class ProcessGenerationUnavailable:
     """The process start time cannot prove its generation."""
@@ -1046,6 +1054,31 @@ def herdr_binary() -> str:
     if not binary:
         raise HerdrMissing("herdr is not installed")
     return binary
+
+
+def own_pane_columns(timeout: float) -> int | None:
+    """Return the width in columns of the pane that runs this process, or None when herdr cannot tell in time."""
+    pane = os.environ.get("HERDR_PANE_ID")
+    path = os.environ.get("HERDR_SOCKET_PATH")
+    if not pane or not path:
+        return None
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as stream:
+            stream.settimeout(timeout)
+            stream.connect(path)
+            stream.sendall((json.dumps({"id": "pane-columns", "method": "pane.layout",
+                                        "params": {"pane_id": pane}}) + "\n").encode())
+            with stream.makefile("r", encoding="utf-8") as reply:
+                response = decode_object(reply.readline(), "herdr pane.layout")
+        layout = json_object(json_object(response.get("result"), "herdr pane.layout").get("layout"), "herdr pane.layout")
+        for item in json_items(layout.get("panes"), "herdr pane.layout"):
+            row = json_object(item, "herdr pane")
+            width = json_object(row.get("rect"), "herdr pane rect").get("width")
+            if row.get("pane_id") == pane and isinstance(width, int):
+                return width
+    except (OSError, HerdrFailure):
+        return None
+    return None
 
 
 # A tab or workspace gone from the shared session keeps its saved place this long, so a restart
@@ -1808,38 +1841,72 @@ class Herdr:
             _ = _bind_row_tab(saved, workspace, row_id, target, max(0, index - 1))
             _write_layout(self.session, saved)
 
-    def saved_row_tab(self, row_id: str, title: str, fallback_workspace: str) -> NewTab | SplitPane | ExistingPane:
-        """Select current native placement and leave an unowned shell unowned."""
-        record = _tab_staff()
+    def saved_row_tab(self, row_id: str, title: str, fallback_workspace: str,
+                      *, record: staff.StaffSnapshot | ReadStaffAtUse = _READ_STAFF_AT_USE) -> NewTab | ExistingPane:
+        """Reuse the member's own pane once it is at the shell; open a tab only when it has none."""
+        record = _tab_staff() if isinstance(record, ReadStaffAtUse) else record
         member = record.by_id(staff.StaffId(row_id))
         if member is None:
             return NewTab(fallback_workspace, title)
-        if not any(tab["staff_id"] == row_id for space in saved_layout(self.session)["workspaces"] for tab in space["tabs"]):
+        own = self._own_pane(member, record)
+        if own is None:
             return NewTab(row_workspace(member, record, fallback_workspace), title)
+        return self._own_pane_at_shell(member, own)
+
+    def _own_pane(self, member: staff.StaffRow, record: staff.StaffSnapshot) -> dict[str, object] | None:
+        """The pane that runs the member, else the newest pane launched for it that no other member runs in."""
         panes = self.listed("pane")
         scan = self.scan_row_panes(record, panes)
         entries = pane_launch.read(pane_launch.record_directory() / f"{self.session}.json")
-        matches = pane_launch.reference_panes(pane_launch.StaffLaunchReference(member.id), record, self, entries,
-                                             evidence=pane_launch.NativePaneEvidence(panes, scan))
-        for pane in matches:
-            identity = json_text(pane.get("pane_id"), "pane id")
-            if isinstance(self.pane_activity(identity), PaneAtShell):
-                return ExistingPane(identity, json_text(pane.get("terminal_id"), "terminal id"))
-        tabs = {pane.get("tab_id") for pane in matches}
-        children = {row.id for row in record.find(parent=member.id)}
-        siblings = [pane for identity, found in scan.found.items() for pane in found
-                    if (pane.get("tab_id") in tabs and pane not in matches) or identity in children]
-        if siblings:
-            return SplitPane(json_text(siblings[0].get("pane_id"), "pane id"), "right", 0.5, title)
-        return NewTab(row_workspace(member, record, fallback_workspace), title)
+        reference = pane_launch.StaffLaunchReference(member.id)
+        own = pane_launch.reference_panes(reference, record, self, entries, evidence=pane_launch.NativePaneEvidence(panes, scan))
+        if own:
+            return own[0]
+        others = [pane for owner, found in scan.found.items() if owner != member.id for pane in found]
+        launched = [pane for pane in panes if pane not in others
+                    and (entry := entries.get(str(pane.get("pane_id")))) is not None
+                    and pane_launch.launch_reference(entry, record) == reference]
+        return max(launched, key=lambda pane: entries[str(pane.get("pane_id"))]["written_at"], default=None)
+
+    def _own_pane_at_shell(self, member: staff.StaffRow, pane: dict[str, object]) -> ExistingPane:
+        """Wait for the own pane to reach the shell; refuse the start when the time passes first."""
+        identity = json_text(pane.get("pane_id"), "pane id")
+        if not isinstance(self.pane_activity(identity), PaneAtShell):
+            limit = conf.read("shutdown").number("OWN_PANE_SHELL_SECONDS")
+            if not self._shell_within(identity, limit):
+                raise OwnPaneNotAtShell(member.name, str(member.current_session), identity, limit)
+        return ExistingPane(identity, json_text(pane.get("terminal_id"), "terminal id"))
+
+    def _shell_within(self, pane: str, seconds: float) -> bool:
+        """Read the pane until it is at the shell or the time passes."""
+        end = time.monotonic() + operation_deadline.remaining(seconds)
+        while not isinstance(self.pane_activity(pane), PaneAtShell):
+            remaining = end - time.monotonic()
+            if remaining <= 0:
+                return False
+            time.sleep(min(0.1, remaining))
+        return True
 
     def producer_row_tab(self, row_id: str, title: str, workspace: str,
                          *, record: staff.StaffSnapshot | ReadStaffAtUse = _READ_STAFF_AT_USE) -> NewTab | ExistingPane:
         """Reuse a producer's shell only in its own tab in the configured workspace."""
-        destination = self.saved_row_tab(row_id, title, workspace)
-        if isinstance(destination, ExistingPane) and self.producer_pane(destination.pane, row_id, workspace, record=record):
+        membership = _tab_staff() if isinstance(record, ReadStaffAtUse) else record
+        member = membership.by_id(staff.StaffId(row_id))
+        own = self._own_pane(member, membership) if member is not None else None
+        if member is None or own is None or not self._producer_place(own, workspace):
+            return NewTab(workspace, title)
+        destination = self._own_pane_at_shell(member, own)
+        if self.producer_pane(destination.pane, row_id, workspace, record=membership):
             return destination
         return NewTab(workspace, title)
+
+    def _producer_place(self, pane: dict[str, object], workspace: str) -> bool:
+        """The pane is alone in its tab, and the tab is in the producer workspace."""
+        panes = self.listed("pane")
+        tab = next((tab for tab in self.listed("tab") if tab.get("tab_id") == pane.get("tab_id")), None)
+        return (tab is not None and sum(item.get("tab_id") == tab.get("tab_id") for item in panes) == 1
+                and any(space.get("label") == workspace and space.get("workspace_id") == tab.get("workspace_id")
+                        for space in self.listed("workspace")))
 
     def producer_pane(self, pane_id: str, row_id: str, workspace: str,
                       *, record: staff.StaffSnapshot | ReadStaffAtUse = _READ_STAFF_AT_USE) -> bool:
@@ -1852,10 +1919,7 @@ class Herdr:
         own = next((pane for pane in panes if pane.get("pane_id") == pane_id), None)
         if own is None or not isinstance(self.pane_activity(pane_id), PaneAtShell):
             return False
-        tab = next((tab for tab in self.listed("tab") if tab.get("tab_id") == own.get("tab_id")), None)
-        if (tab is None or sum(pane.get("tab_id") == tab.get("tab_id") for pane in panes) != 1
-                or not any(space.get("label") == workspace and space.get("workspace_id") == tab.get("workspace_id")
-                           for space in self.listed("workspace"))):
+        if not self._producer_place(own, workspace):
             return False
         entries = pane_launch.read(pane_launch.record_directory() / f"{self.session}.json")
         scan = self.scan_row_panes(record, panes)

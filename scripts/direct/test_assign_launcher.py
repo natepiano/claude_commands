@@ -365,7 +365,7 @@ class PaneReviewLauncherTests(unittest.TestCase):
                     reply = case.fixture.run_dir / "astra-review.md"
                     arguments = ["--role", "review", "--operation", "astra-review", "--new-worker", "astra-reviewer",
                                  "--cwd", str(case.fixture.fixture.root), "--session-dir", str(case.fixture.run_dir),
-                                 "--prompt", str(case.fixture.prompt), "--summary", str(reply)]
+                                 "--prompt", str(case.fixture.prompt), "--reply-file", str(reply)]
                     with patch.dict(os.environ, {"ASTRA_ROLES_STATE": str(case.fixture.fixture.root / "roles")}), \
                             case.fixture.fixture.world.process_starts():
                         result = invoke_cli(assign, assign.main, arguments, os.environ.copy(), ROOT)
@@ -1028,7 +1028,27 @@ class AssignLauncherTests(HookAssignmentFixture):
         self.assertEqual(self.native.fixture.world.launches, [])
 
     def test_writer_dispatch_records_paths_rules_identity_and_a_finished_pass(self) -> None:
-        _ = self.successful()
+        reply_file = self.project / "worker reply.md"
+        for option, value in (("--reply-file", "Work completes without findings."),
+                              ("--reply-file", "relative-reply.md"),
+                              ("--reply-file", ""),
+                              ("--summary", str(reply_file))):
+            with self.subTest(option=option, value=value):
+                files = {path: path.read_bytes() for path in self.project.rglob("*") if path.is_file()}
+                submitted = self.native.agent.submitted.copy()
+                launched = self.native.fixture.world.launches.copy()
+                result = self.launch("implement", option, value, execution=InProcessAssignment())
+                self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+                if option == "--reply-file":
+                    self.assertEqual(result.stderr.splitlines(), [
+                        f"assign: --reply-file takes an absolute path to the reply file, not text: {value}"])
+                else:
+                    self.assertEqual(len(result.stderr.splitlines()), 1, result.stderr)
+                    self.assertIn("--reply-file", result.stderr)
+                self.assertEqual(self.native.agent.submitted, submitted)
+                self.assertEqual(self.native.fixture.world.launches, launched)
+                self.assertEqual({path: path.read_bytes() for path in self.project.rglob("*") if path.is_file()}, files)
+        _ = self.successful("implement", "--reply-file", str(reply_file))
         name, record = next(iter(self.assignment_records().items()))
         self.assertEqual(self.turn_starts, 1)
         prompt = (self.session_dir / f"phases/7/{name}_prompt.txt").read_text()
@@ -1040,6 +1060,7 @@ class AssignLauncherTests(HookAssignmentFixture):
                                                "paths": ["src/worker.py", "tests/test_worker.py"]})
         self.assertEqual((manifest.parent / f"{name}_status").read_text().strip(), "done")
         self.assertTrue((manifest.parent / f"{name}_summary.txt").read_text().strip())
+        self.assertEqual(reply_file.read_text(), (manifest.parent / f"{name}_summary.txt").read_text())
         self.assertTrue((manifest.parent / f"{name}_agent.log").is_file())
         finished = [event for event in self.events() if event.get("event_type") == "pass_finished"]
         self.assertEqual(len(finished), 1, self.events())

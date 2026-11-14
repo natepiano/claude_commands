@@ -21,6 +21,7 @@ from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import BinaryIO, Literal, TypedDict, cast, final, override
 
+from scripts.lib import git_files
 from scripts.lib.git_blob import git_blob_id
 from scripts.style.git_process import GitBlob, read_batch_blob
 
@@ -256,15 +257,10 @@ class RuleRepositoryIdentity:
 
     @classmethod
     def at(cls, repo: Path) -> RuleRepositoryIdentity:
-        git_dir = repo / ".git"
-        if git_dir.is_file():
-            marker = git_dir.read_text().strip()
-            if not marker.startswith("gitdir: "):
-                raise OSError("unreadable Git directory marker")
-            git_dir = repo / marker.removeprefix("gitdir: ")
-        git_dir = git_dir.resolve(strict=True)
-        common = git_dir / "commondir"
-        common_dir = (git_dir / common.read_text().strip()).resolve(strict=True) if common.is_file() else git_dir
+        try:
+            common_dir = git_files.at(repo).common_dir
+        except git_files.GitFilesError as error:
+            raise OSError(str(error)) from error
         objects = (common_dir / "objects").resolve(strict=True)
         object_stat = objects.stat()
         return cls(common_dir, (object_stat.st_dev, object_stat.st_ino))

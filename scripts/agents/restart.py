@@ -570,7 +570,7 @@ def start_row(row: staff.StaffRow, record: staff.StaffSnapshot, client: herdr.He
                                                       herdr.NO_ENVIRONMENT_REMOVALS)
         if isinstance(prepared, nix_env.Refused):
             raise OSError(str(prepared))
-        target: herdr.NewTab | herdr.SplitPane | herdr.ExistingPane = destination
+        target: herdr.NewTab | herdr.ExistingPane = destination
         source_pane: pane_launch.ResumeSourcePane | pane_launch.ResumeSourceAbsent = pane_launch.ResumeSourceAbsent.CURRENT
         exiting_source: RetainedRestartPane | pane_launch.ResumeSourceAbsent = pane_launch.ResumeSourceAbsent.CURRENT
         source_client = client
