@@ -427,10 +427,14 @@ Local role counts read the registry, staff, pane launches, and worker records wi
 `session_state.classify` supplies the shared unit status for the accounts board and the units table.
 An exit record takes precedence over a pause record.
 A busy or starting pane gives `busy`. Live detached work also gives `busy`.
+On Linux, live detached work comes from one /proc scan for `detached_runs.py supervise` processes.
+The read opens only the records that those supervisors name. Without /proc, it reads each record.
 Exit and pause records take priority over all activity states.
 Without a live detached run, a missing live session gives `exited`.
 Other live activity gives `idle`.
 Role counts are `busy`, `idle`, `paused`, `exited` and `total`.
+The accounts board has no activity column, the same as the cargo-handler accounts table.
+The activity of each session shows only in the cargo-handler tiles, from `cargo-handler census --json`.
 An older peer's document holds waiting within busy and starting within idle, with separate `starting` and `waiting` fields.
 The decoder moves that peer's `starting` count from idle to busy.
 Claude producers count under `showrunners` with the same hold and activity rules.

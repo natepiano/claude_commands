@@ -51,11 +51,11 @@ NO_DETACHED_WORK = RunningDetachedWork()
 
 
 def running_detached_work(record: staff.StaffSnapshot, *, additional_runs: Sequence[Path] = ()) -> RunningDetachedWork:
-    """Read each run folder once for the complete display."""
+    """Read each run folder once and only the records that live supervisors name."""
     from scripts.agents.worker_lifecycle import DETACHED_RUNS_DIR
 
-    live_runs = cast(Callable[[Path, frozenset[staff.StaffId]], Sequence[Mapping[str, object]]],
-                     import_module("scripts.agents.detached_runs").live_runs_for_staff)
+    live_runs = cast(Callable[[Mapping[Path, frozenset[staff.StaffId]]], Sequence[Mapping[str, object]]],
+                     import_module("scripts.agents.detached_runs").live_runs_in_folders)
     worker_directories = cast(Callable[[staff.StaffSnapshot], LauncherRunDirectories],
                               import_module("scripts.herdr.worker_panes").worker_run_directories)
 
@@ -81,18 +81,15 @@ def running_detached_work(record: staff.StaffSnapshot, *, additional_runs: Seque
         owned(folder).update(identities)
     busy: set[staff.StaffId] = set()
     labels: dict[staff.StaffId, list[str]] = {}
-    inputs: set[Path] = set()
-    for folder, identities in owners.items():
-        directory = folder / DETACHED_RUNS_DIR
-        inputs.add(directory)
-        inputs.update(directory.glob("*.json"))
-        for run in live_runs(directory, frozenset(identities)):
-            row = record.by_id(staff.StaffId(str(run.get("staff_id", ""))))
-            if row is not None:
-                busy.add(row.id)
-                label = run.get("label")
-                if isinstance(label, str):
-                    labels.setdefault(row.id, []).append(label)
+    # A start or a finish adds or renames a record, so each folder's change shows on the folder.
+    inputs = {folder / DETACHED_RUNS_DIR for folder in owners}
+    for run in live_runs({folder: frozenset(identities) for folder, identities in owners.items()}):
+        row = record.by_id(staff.StaffId(str(run.get("staff_id", ""))))
+        if row is not None:
+            busy.add(row.id)
+            label = run.get("label")
+            if isinstance(label, str):
+                labels.setdefault(row.id, []).append(label)
     return RunningDetachedWork(frozenset(busy), tuple(sorted(inputs)),
                                {identity: tuple(items) for identity, items in labels.items()}, directories)
 
