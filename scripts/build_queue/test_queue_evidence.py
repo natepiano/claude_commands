@@ -75,12 +75,13 @@ class RoomTextTests(unittest.TestCase):
         self.assertIn("sccache.service: idle; 0.0 GiB RAM", queue_evidence.service_text(compiler, 0.0))
 
     def test_cap_text_names_ci_use_and_its_printed_terms_sum_to_the_cap(self) -> None:
-        for ci_use, text in (
-            (0, "Cap 20.0 GiB; anonymous use 3.0 GiB + free 20.0 GiB − safety 3.0 GiB; kept aside 5.0 GiB; room 12.0 GiB"),
-            (4 * GIB, "Cap 24.0 GiB; anonymous use 3.0 GiB + CI use 4.0 GiB + free 20.0 GiB − safety 3.0 GiB; kept aside 5.0 GiB; room 12.0 GiB"),
+        for ci_use, swap_free, text in (
+            (0, 32 * GIB, "Cap 20.0 GiB; anonymous use 3.0 GiB + free 20.0 GiB − safety 3.0 GiB; kept aside 5.0 GiB; room 12.0 GiB"),
+            (4 * GIB, 32 * GIB, "Cap 24.0 GiB; anonymous use 3.0 GiB + CI use 4.0 GiB + free 20.0 GiB − safety 3.0 GiB; kept aside 5.0 GiB; room 12.0 GiB"),
+            (0, 22 * GIB, "Cap 20.0 GiB; anonymous use 3.0 GiB + free 20.0 GiB − safety 3.0 GiB; kept aside 5.0 GiB; − 10.0 GiB swapped outside builds; room 2.0 GiB"),
         ):
-            with self.subTest(ci_use=ci_use):
-                room = gate.memory_room(records.HostMemory(20 * GIB, 64 * GIB),
+            with self.subTest(ci_use=ci_use, swap_free=swap_free):
+                room = gate.memory_room(records.HostMemory(20 * GIB, 64 * GIB, 32 * GIB, swap_free),
                     (records.RunMemory("run", 8 * GIB, records.AnonymousRunUse(3 * GIB)),),
                     admission_policy_fixture(), ci_use=ci_use)
                 assert isinstance(room, records.MemoryRoom)
