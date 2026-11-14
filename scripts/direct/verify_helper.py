@@ -158,8 +158,7 @@ def run_call(call: HelperCall, programs: dict[str, LoadedProgram | SeparateProce
             with open(trace, "a") as target:
                 _ = target.write(f"{Path(call.program).name}\t{round((time.time() - started) * 1000)}\t{round((time.process_time() - cpu) * 1000)}\n")
             with open(trace + ".calls", "a") as target:
-                argument = call.arguments[0] if call.arguments else ""
-                _ = target.write(f"{Path(call.program).name}\t{argument}\n")
+                _ = target.write("\t".join([Path(call.program).name, *call.arguments]) + "\n")
         except OSError:
             pass
     return status, output, errors
