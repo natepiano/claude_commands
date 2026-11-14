@@ -3850,19 +3850,10 @@ Checkpoint 298f77624. Changed `scripts/message/test_repeat_guard.py` (`NOTICE_FI
 **Depends on:** none
 **Owner:** builds gave the go 2026-11-13.
 
-#### Work Order
+#### As-built
 
-**Goal:** `message/test_notifier.py` uses less CPU in aws pairs; every behavior check stays.
+Checkpoint 2cfdd87f1. Changed `scripts/message/test_notifier.py` (launcher stubs); no test is removed or folded.
 
-**Spec:**
-- Profile: 7.3 local CPU s. The production helpers `sessions.py member-socket` and `update_registration.py delivery` use about 4.3 of it; that part goes to sdlc as a proposal.
-- The fake `systemd-run` is a Python launcher that starts a Python monitor for each run-only job. Replace both with one `/bin/sh` stub that starts the command under `setsid` and writes the same `run-exit-<pid>` file and launch pid marker.
-- The drain test's fake `systemd-run` records its arguments one per line from `/bin/sh`, not JSON from Python.
-- The fake `launchctl` is a Python program for each action. Replace it with a `zsh` stub with the same submit, kickstart, loop and remove behavior.
-- Test file only.
-
-**Files:** `scripts/message/test_notifier.py`.
-
-**Workers:** director only (no-worker mode).
-
-**Acceptance gate:** the module passes; basedpyright reports zero errors and warnings; the aws pair shows a CPU gain.
+- The fake `systemd-run` is one `/bin/sh` stub: it starts the command under `setsid` and writes `run-exit-<pid>` and the launch pid marker. The drain test's stub writes one argument per line.
+- The fake `launchctl` is one `zsh -f` stub with the same submit, kickstart, loop and remove behavior.
+- AWS pair (c7a.8xlarge, 3 rounds): median 7.22 → 6.59 CPU s. Most of the rest is the production helpers `sessions.py member-socket` and `update_registration.py delivery`; their import cost went to sdlc as a proposal.
