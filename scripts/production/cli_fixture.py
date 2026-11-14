@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Generator, Mapping
-from contextlib import AbstractContextManager, ExitStack, contextmanager, redirect_stderr, redirect_stdout
+from contextlib import ExitStack, contextmanager, redirect_stderr, redirect_stdout
 from dataclasses import dataclass
 from importlib import import_module
 import io
@@ -16,7 +16,6 @@ import subprocess
 import sys
 import unittest
 from types import ModuleType
-from typing import cast
 from unittest.mock import patch
 
 from scripts.lib.git_test_support import write_fixture_git_config
@@ -81,6 +80,29 @@ def production_paths(environment: Mapping[str, str]) -> Generator[None]:
         yield
 
 
+@contextmanager
+def _exact_environment(environment: Mapping[str, str]) -> Generator[None]:
+    """Make `os.environ` equal `environment`; restore the caller's values on exit.
+
+    `patch.dict(clear=True)` removes one key at a time and copies the key list for each
+    removal. This swap reads `os.environ` once and changes only the keys that differ.
+    """
+    caller = dict(os.environ)
+    try:
+        _replace_environment(caller, dict(environment))
+        yield
+    finally:
+        _replace_environment(dict(os.environ), caller)
+
+
+def _replace_environment(current: dict[str, str], values: dict[str, str]) -> None:
+    for key in current.keys() - values.keys():
+        del os.environ[key]
+    for key, value in values.items():
+        if current.get(key) != value:
+            os.environ[key] = value
+
+
 def invoke_cli(module: ModuleType, main: Callable[[], int], arguments: list[str],
                environment: Mapping[str, str], cwd: Path, *, combined_output: bool = False,
                production_state: bool = False) -> subprocess.CompletedProcess[str]:
@@ -105,7 +127,7 @@ def invoke_cli(module: ModuleType, main: Callable[[], int], arguments: list[str]
                 (signal.SIGINT, signal.SIGTERM, signal.SIGHUP, signal.SIGQUIT)}
     try:
         with ExitStack() as scope:
-            _ = scope.enter_context(cast(AbstractContextManager[object], patch.dict(os.environ, environment, clear=True)))
+            scope.enter_context(_exact_environment(environment))
             _ = scope.enter_context(patch.object(sys, "argv", [str(module.__file__), *arguments]))
             _ = scope.enter_context(patch.object(sys, "path", sys.path.copy()))
             _ = scope.enter_context(redirect_stdout(stdout))

@@ -1,7 +1,7 @@
 """Workspace bulk runs use temporary Git repos and a fake command runner; never build Rust."""
 from __future__ import annotations
 
-from scripts.production.staff_test_support import foreign_hostname
+from scripts.production.staff_test_support import foreign_hostname, isolated_staff_file
 
 import json
 import fcntl
@@ -19,7 +19,7 @@ from collections.abc import Callable, Iterable, Sequence
 from contextlib import closing, nullcontext, redirect_stderr, redirect_stdout
 from dataclasses import replace
 from pathlib import Path
-from typing import TypedDict, cast, final, override
+from typing import ClassVar, TypedDict, cast, final, override
 from types import SimpleNamespace
 
 
@@ -86,7 +86,47 @@ class FakeRunner:
         return run.CommandResult(0)
 
 
-class WorkspaceRunTests(CargoProjectTests):
+class BulkRunFixture(CargoProjectTests):
+    fixture_root: ClassVar[Path]
+    fixture_seed: ClassVar[Path]
+    fixture_environment: ClassVar[dict[str, str]]
+
+    @classmethod
+    @override
+    def setUpClass(cls) -> None:
+        super().setUpClass()
+        cls.prepare_project_seed()
+        cls.fixture_seed = cls.project_seed.parent / "fixture"
+        fixture = cls(methodName="runTest")
+        environment = os.environ.copy()
+        try:
+            CargoProjectTests.setUp(fixture)
+            cls.fixture_root = fixture.root
+            cls.fixture_environment = {key: value for key, value in os.environ.items()
+                                       if environment.get(key) != value}
+            _ = shutil.copytree(fixture.root, cls.fixture_seed, symlinks=True)
+        finally:
+            fixture.doCleanups()
+
+    @classmethod
+    def prepare_project_seed(cls) -> None:
+        pass
+
+    @override
+    def setUp(self) -> None:
+        if self.fixture_root.exists():
+            super().setUp()
+            return
+        self.root: Path = self.fixture_root
+        self.addCleanup(shutil.rmtree, self.root, ignore_errors=True)
+        _ = shutil.copytree(self.fixture_seed, self.root, symlinks=True)
+        self.repo: Path = self.root / "project"
+        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, self.fixture_environment)))
+        _ = self.enterContext(isolated_staff_file(self.root / "staff.json", {}))
+        self.queue: StyleQueueFake = self.enterContext(unqueued_style_children())
+
+
+class WorkspaceRunTests(BulkRunFixture):
     base: str = ""
     tree: str = ""
     runner: FakeRunner = FakeRunner()
@@ -94,8 +134,7 @@ class WorkspaceRunTests(CargoProjectTests):
 
     @classmethod
     @override
-    def setUpClass(cls) -> None:
-        super().setUpClass()
+    def prepare_project_seed(cls) -> None:
         fixture = cls(methodName="runTest")
         fixture.repo = cls.project_seed
         _ = (fixture.repo / "Cargo.toml").write_text(
@@ -2224,7 +2263,7 @@ class WorkspaceRunTests(CargoProjectTests):
         self.assertTrue(all("let number" in file.edited for file in planned.files))
 
 
-class FreshMachineJudgmentTests(CargoProjectTests):
+class FreshMachineJudgmentTests(BulkRunFixture):
     def fresh_case(self, current: str = MACHINE_RENAME_AFTER
                    ) -> tuple[ledger_api.Ledger, ledger_api.HeldFinding, str]:
         ledger = self.ledger()

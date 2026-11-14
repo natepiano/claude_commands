@@ -40,17 +40,20 @@ DEADLINE_CEILING_FACTOR = 10
 
 NOTICE_FIXTURE = r'''import sys,os,json,signal,io
 from pathlib import Path
+from scripts.message import repeat_guard as g
+role,mode,root,sink=sys.argv[1:]
+if role=='supervise':
+    # The supervisor runs only the guard's job; it skips the send and staff imports.
+    limits=g.configuration()
+    g.notice_job([sys.executable,__file__,'drain',mode,root,sink],limits.drain_timeout_seconds)
+    raise SystemExit
 from unittest.mock import patch
-from scripts.message import send, repeat_guard as g, roster
+from scripts.message import send, roster
 from scripts.message import send_result
 from scripts.production import staff
 staff.snapshot=lambda: staff.StaffSnapshot((staff.StaffRow(
     staff.StaffId('owner'), 'producer', 'owner', staff.StaffRoot(), current_session=staff.StaffId('owner')),))
-role,mode,root,sink=sys.argv[1:]
-if role=='supervise':
-    limits=g.configuration()
-    g.notice_job([sys.executable,__file__,'drain',mode,root,sink],limits.drain_timeout_seconds)
-elif role=='drain':
+if role=='drain':
     real_run=send.run
     def attempt(command,stdin,timeout):
         return real_run([sys.executable,__file__,'attempt',mode,root,sink],stdin,timeout)

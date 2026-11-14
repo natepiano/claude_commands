@@ -3584,39 +3584,14 @@ The transitive config closure is deleted. An index read error gives `FullSuite` 
 - `ImmutableGitSeed.copy_to` (`production/cli_fixture.py`) raises `ValueError` when the config does not hold the seed origin text, so an escaped path never leaves a copy that points at the seed. Its 11 caller modules (470 tests) pass. All 120 test bodies and 602 assertion expressions did not change.
 - aws paired trial, 3 rounds on m7a.8xlarge: CPU 30.596 to 26.526 s; peak 119.8 to 119.2 MiB. Checkpoint `3ff00e6ad`.
 
-### Phase 236 — The shutdown CLI tests copy retired and resume snapshots  · status: todo
+### Phase 236 — The shutdown CLI tests copy retired and resume snapshots  · status: done
 **Depends on:** Phase 234
 
-#### Work Order
+#### As-built
 
-**Goal:** `agents/test_shutdown_cli.py` uses less CPU in aws pairs, with the same tests and assertions.
-
-**Decision:** architect 29 trial queue row 2; sdlc owner go 2026-11-13 13:38. Cached gate median 38.41 CPU s. `RetireUnitTests.setUp` (`test_shutdown_cli.py:544`) runs about 13 Git commands in each of its tests: bare init, clone, three config, add, commit, push, worktree add, add, commit, push, merge. `ResumeUnitTests.setUp` (`:1394`) runs about 8: bare init, clone, three config, add, commit, push.
-
-**Spec:**
-1. Profile first: `python3 ~/.claude/scripts/test_times/module_cost.py --tree $PWD agents/test_shutdown_cli.py --tests 10 --commands 10`, under `systemd-run --user --scope -q -p MemoryMax=2G --unit=<a new name>`. Name the top costs by test, fixture and command.
-2. If the setup Git work is a top cost: build a retired-state snapshot and a resume-state snapshot once per class, and copy it in `setUp`. The production doc holds the absolute checkout path, and the worktree links are absolute. So either keep one fixed root path per class and restore into it (as Phase 233 did), or rewrite every absolute path after the copy. Keep the per-test staff rows, configs, run folder, holds, pane world, unit config and patches.
-3. If the profile names a larger cost, report it to the director before you change the plan.
-4. Keep every test and assertion. Map each changed fixture step to the assertions that read its result.
-5. Run the module three times and basedpyright on each changed file. Give the before and after `module_cost.py` CPU.
-6. The director runs the aws pairs.
-
-**Files:**
-- `scripts/agents/test_shutdown_cli.py`
-
-**Workers:** 1 writer; one test module.
-- impl: all files.
-
-**Constraints from prior phases:**
-- Phase 229: the move process scan reads the selected process root; keep that.
-- Phase 232: no signal handlers anywhere.
-- Phase 233: a class snapshot restored to the same path keeps Git worktree links valid.
-- sdlc terms: test files only; every test and assertion stays; land only on a measured aws gain; report paired peak memory.
-
-**Acceptance gate:**
-- The same test count and assertions; the module passes three times.
-- `module_cost.py` CPU before and after, with the top costs named.
-- aws pairs (3 rounds) show a gain; peak memory reported.
+- `RetireUnitTests` and `ResumeUnitTests` (`agents/test_shutdown_cli.py`) build the retired and resume repository states once per class at fixed roots. Each test copies its snapshot back. Nested retirement fixtures keep separate roots.
+- `restore_repository` registers the removal of the destination before the copy, so a failed copy leaves no partial folder (closure of review finding F001). All 136 test bodies and 943 assertion sites did not change.
+- aws paired trial, 3 rounds on m7a.8xlarge: CPU 37.478 to 34.466 s; peak 226.1 to 225.4 MiB. FolderRename pending move (16.6 natedev CPU s) and UnitRename identity (9.9 s) are the next costs. Checkpoint `f65598a5a`.
 
 ### Phase 237 — The build record tests copy one seed repository  · status: done
 **Depends on:** Phase 234
@@ -3630,29 +3605,165 @@ The transitive config closure is deleted. An index read error gives `FullSuite` 
 ### Phase 238 — The models publication tests copy one publication fixture  · status: done
 **Depends on:** Phase 234
 
+#### As-built
+
+- `RegistryPublishingTests.setUpClass` (`agents/test_models_conf_publish.py`) builds the checkout, bare remote, competitor clone, registry and the dirty, staged and unstaged states once. Each test copies the whole seed back to the same fixed class root, so both absolute origin URLs stay valid, and refreshes both copied indexes. Each test gets its own environment dictionary; `initial` is a class value.
+- Real writers, locks, rejected pushes and publication checks did not change. All 51 test bodies and 214 assertions did not change.
+- aws paired trial, 3 rounds on m7a.8xlarge: CPU 32.828 to 31.491 s; peak 104.2 to 104.4 MiB. Git (17.3 natedev CPU s) and `models_registry.py` (6.8 s) stay the top commands. Checkpoint `0a5f1f853`.
+
+### Phase 239 — The unit config fixtures write formatted configs without Taplo  · status: done
+**Depends on:** Phase 234
+
+#### As-built
+
+- `production_lifecycle_test_support.py` writes the alpha and beta unit configs once before `running_snapshot`; `running()` copies them with the repository. Lifecycle fixture Taplo starts fell from 112 to 2. All 70 lifecycle test bodies did not change.
+- The repair (sdlc review) removed the `ParkedConfigBaseline` cache from `unit_config_test_support.py`: it copied the side effects of park by hand, so a change to park would leave the fixture wrong without an error. `park_config` runs real park again.
+- aws paired trial of the lifecycle part alone, 3 rounds: `test_production_lifecycle` CPU 29.450 to 28.069 s, peak 160.9 to 156.9 MiB; `test_unit_config` unchanged. Checkpoint `dc08e6574` and the repair checkpoint.
+
+### Phase 240 — The message process fixture finds descendants without a host scan  · status: done
+**Depends on:** none
+
+#### As-built
+
+- `OwnedTestProcesses.pin_descendants` (`message/process_test_support.py`) walks the descendant task trees (`/proc/<pid>/task/<tid>/children`) under the subreaper on Linux and revisits each parent after its descendants, so a child forked during the walk is found. It no longer scans every process on the host. Owner markers, pidfd pinning, the stop, kill and reap order and the macOS branch did not change.
+- All 198 test bodies and 829 assertion calls in the 7 importers did not change. natedev attribution: `pin_descendants` 47.8 to 0.05 CPU s; the old scan cost grows with the host's process count.
+- aws paired trial, 3 rounds, sum of 7 modules: CPU 57.11 to 55.19 s (notifier 11.67 to 9.94; `repeat_guard` 15.55 to 15.90). Peak per module changed by -13.5 to +1.9 MiB. Checkpoint `f16184193`.
+
+### Phase 241 — The CI points tests copy one seed repository  · status: done
+**Depends on:** none
+
+#### As-built
+
+- `production/test_ci_points.py` builds the full fixture once per class (`build_fixture` keeps the old setup body) and copies it per test to the same fixed root. Origin, document, staff and environment paths select the restored root. Each test gets its own environment dictionary and a refreshed checkout index; cleanup registrations precede each build or copy.
+- setUp ran 11 Git commands in each of 34 tests; it now copies. Tested fetches, commits, locks, races and recovery stay real. All 34 test bodies and 277 assertion expressions did not change.
+- aws paired trial, 3 rounds: CPU 13.399 to 11.942 s; peak 165.2 to 152.2 MiB. Checkpoint `07a15ce4c`.
+
+### Phase 242 — The notifier tests start fewer shells  · status: done
+**Depends on:** none
+
+#### As-built
+
+- `run_cli` in `message/test_notifier.py` computes the shown zone in process (`invoke_cli`, `user_zone.CONF` bound per call) and passes `SHOWN_ZONE` to zsh; two zone-read cases keep the real shell (`@process_boundary`).
+- aws pairs: median CPU 11.749 -> 9.014 s; peak 112.8 -> 109.2 MiB. 35 tests and 172 assertions unchanged.
+- Review F001 (config binding, then relative paths) and F002 (helper failure keeps the shell start) closed in two repair rounds. Checkpoint 4afd7c4f5.
+
+### Phase 243 — The rename tests reuse their restored fixture state  · status: done
+**Depends on:** none
+
+#### As-built
+
+- Folded into Phase 252; no separate checkpoint. The change binds `RUN_ROOT` and `FORMER_RUN_ROOT` to each rename fixture root in `agents/test_shutdown_cli.py`.
+- natedev module CPU 81.5 -> 37.8 s: the rename fixtures read 422,583 live run JSON files on the host. aws pairs 34.319 -> 34.423 CPU s, peak 224.5 -> 227.1 MiB: the aws host has no live run folders, so no gain.
+- The finding is a test-isolation defect; Phase 252 owns the fix for every module.
+
+### Phase 244 — The verify wait holder tests start fewer recorder and target helpers  · status: done
+**Depends on:** none
+
+#### As-built
+
+- `direct/test_verify_wait_holder.py`: the recorder and admission-client observers run the real code in the child interpreter that already started (runpy), not in a second exec; `RecordedHoldWaitFixture` shares the class target seed with the hold and memory-route classes.
+- aws pairs: 71.700 -> 71.039 CPU s (paired median saving 0.664 s); peak 274.4 -> 272.3 MiB. natedev showed 82.4 -> 67.3 s, mostly host state.
+- 27 tests and 133 assertions unchanged; two blind reviews approve with no findings.
+
+### Phase 245 — The crate run tests copy class seed repositories  · status: done
+**Depends on:** none
+
+#### As-built
+
+- Profile only; no source change. `setUpClass` already builds the initial, frozen and single-file frozen seeds; each test restores one seed at the fixed root. Class setup 0.28 CPU s and all 96 `setUp` calls 0.85 s: 2% of the suite.
+- Module 56.2 natedev CPU s: Git 24,125 starts (26.3 s) run inside tested crate run behavior; `module_run.py` 17.6 s. A test-only change has no budget left.
+- Found: `setUp` registers its cleanup after `copytree`, the Phase 236 F001 defect class. Architecture proposal to sdlc: the crate run code starts about 250 Git commands per test.
+
+### Phase 246 — The fast track tests copy class seed repositories  · status: done
+**Depends on:** none
+
+#### As-built
+
+- Profile only; no source change. `MergeCheckpointFixture.setUpClass` already builds the repositories once and saves a class snapshot; per-test setup starts no Git command (`FastTrackTests.setUp` 2.6 CPU s over 50 tests).
+- Module 49.1 natedev CPU s: Git 7,446 starts (17.5 s) and `fast_track.py` 22 starts (11.9 s) run inside tested `fast_track.py` behavior (restores, patches, retries, publication, recovery). A test-only change has no budget left.
+- Architecture proposal to sdlc: profile `fast_track.py` itself (0.54 CPU s and about 340 Git starts per run).
+
+### Phase 247 — The offload cleanup tests do less repeated work  · status: done
+**Depends on:** none
+
+#### As-built
+
+- No source change lands. The candidate built one bytecode cache per class for the `python3 -c` children of `mac_test/test_offload_cleanup.py`.
+- aws pairs: 26.793 -> 27.657 CPU s (paired median saving -0.866 s); peak 98.3 -> 98.8 MiB. No gain, so the change is dropped; the diff is in the phase folder as `rejected_change.diff`.
+- natedev shows 46.5 CPU s and 96 `python3 -c` starts at 0.40 CPU s each; aws shows 26.8 s for the module. The extra cost is natedev Python start-up, not the test.
+
+### Phase 248 — The verify SSH routing tests do less repeated work  · status: done
+**Depends on:** none
+
+#### As-built
+
+- Profile only; no source change. The fixture already copies a class seed at fixed paths; class setup 0.09 CPU s and all per-test setup 0.29 s: 0.56% of the suite.
+- Module 50.3 natedev CPU s, 4,355 processes: real `verify.sh` routing runs. `build_targets.py` 49 starts 7.8 s, `python3 -c` 40 starts 3.0 s, `verify_helper.py` 17 starts 2.6 s, `build_folders.py` 46 starts 2.5 s, `detached_runs.py` 17 starts 2.0 s.
+- Top test `pinned_target_refusal_keeps_the_reason_and_never_runs_locally` 10.1 s runs four real refusals, about 2.5 CPU s each. Architecture proposal to sdlc: a verify refusal costs about 2.5 CPU s in helper starts.
+
+### Phase 249 — The bulk run tests do less repeated work  · status: done
+**Depends on:** none
+
+#### As-built
+
+- `style/test_bulk_run.py`: `BulkRunFixture` builds the Cargo project, tools and style staff once per class and copies the seed to the same absolute root for each test; an existing root falls back to the full setup.
+- aws pairs: 49.820 -> 36.245 CPU s (paired median saving 13.592 s); peak 272.6 -> 265.5 MiB. Base round 1 timed out; the changed variant passed all rounds.
+- 108 tests and 617 assertions unchanged; director review (no-worker mode) approves with no findings. Checkpoint 0a13c9aa4.
+
+### Phase 250 — The verify Mac-only tests do less repeated work  · status: done
+**Depends on:** none
+
+#### As-built
+
+- `direct/verify_mac_offload_test_support.py`: the private test environment removes every inherited `UNIT_*` variable before it sets its private values. Before, a test under a unit supervisor kept `UNIT_DETACHED_RECORD` and wrote record exits to the outer supervisor's real record.
+- Correctness fix; `test_verify_mac_only.py` unchanged, no CPU gain. aws regression: 20 of 69 consumer modules pass with the same CPU; the cloud refused boxes for the rest, so the land runs the full gate. Two blind reviews approve. Checkpoint 9f570a5db.
+
+### Phase 251 — The crate run setup removes a partial seed copy  · status: done
+**Depends on:** none
+
+#### As-built
+
+- `setUp` in `style/test_crate_run.py` registers `shutil.rmtree(self.root, ignore_errors=True)` before `copytree`; a failed copy leaves no partial root.
+- Correctness fix with no aws trial. Probes inject a failure before and after root creation; each gives one setup error, and the next test passes.
+- 96 tests and 589 assertions unchanged; two blind reviews approve with no findings. Checkpoint 536f8eb74.
+
+### Phase 252 — Tests never reach the real unit run roots  · status: done
+**Depends on:** none
+
+#### As-built
+
+- `scripts/lib/unit_runs_test_support.py`: `bind_private_run_roots(case, root)` patches `RUN_ROOT`, `FORMER_RUN_ROOT` and `ASTRA_RUN_ROOT` to folders under `root` only while each equals its `/tmp/claude` default; cleanup registers before each start.
+- The rename fixtures (`test_shutdown_cli`, `rename_unit_test_support`, `rename_test_support`, `test_rename_unit_processes`) and `AddUnitTestCase` (`add_unit_test_support`) bind through the helper.
+- `scripts/test_times/module_run.py` gives each gate module a private `SCRATCH_ROOT` and `ASTRA_REVIEW_DIR`, removed at the end and before a signal exit.
+- Probe: zero real-root reads in 5 modules over 3 rounds. natedev CPU `test_shutdown_cli` 37.9 -> 30.1 s; correctness fix (the aws host has no live run folders). Every test stays; one assertion in `test_both_roots_are_read_the_new_name_first` now reads `run_roots()` from a fresh interpreter's stdout, with the same expected tuple. Director reviews approve. Checkpoint 87396194c.
+- Observation: a `test_shutdown_cli` child reads host `/proc/<pid>/cwd` and `fd` links (a host process scan, not a run-root read).
+
+### Phase 253 — The shutdown CLI tests copy class-built Git repositories  · status: todo
+**Depends on:** Phase 252
+
 #### Work Order
 
-**Goal:** `agents/test_models_conf_publish.py` uses less CPU in aws pairs, with the same tests and assertions.
+**Goal:** `agents/test_shutdown_cli.py` uses less CPU in aws pairs, with the same tests and assertions.
 
-**Decision:** architect 29 trial queue row 3; sdlc owner go 2026-11-13 13:38. Cached gate median 33.79 CPU s. `RegistryPublishingTests.setUp` (`test_models_conf_publish.py:284-295`) runs nine Git commands in each of 43 tests: bare init, init, add, commit, remote add, push, clone of a competitor, rev-parse, then a staged add after the dirty and staged edits.
+**Decision:** sdlc go 2026-11-13 15:25, option (a) after Phase 252. After Phase 243 the module costs 37.8 natedev CPU s for 136 tests: Git 7,380 starts (8.3 s), git-upload-pack and git-receive-pack 976 starts (2.8 s), taplo 231 starts (1.1 s). Top tests: RetireUnitTests unowned_or_live_sessions 3.7 s, retirement_without_saved_work 3.3 s, remote_retirement_retries_failed_steps 3.2 s; UnitRename preserve identity 1.9 s; WorkerRename owner_rename 1.8 s.
 
 **Spec:**
-1. Profile first: `python3 ~/.claude/scripts/test_times/module_cost.py --tree $PWD agents/test_models_conf_publish.py --tests 10 --commands 10`, under `systemd-run --user --scope -q -p MemoryMax=2G --unit=<a new name>`. Name the top costs by test, fixture and command.
-2. If the setup Git work is a top cost: build the checkout, remote and competitor once per class, with the dirty, staged and unstaged states, and copy them per test. The checkout's origin URL and the competitor's origin URL are absolute: use a fixed per-class root or rewrite them after the copy. Keep `initial` as a class value. Keep real writers, locks, rejected pushes and publication checks.
+1. Profile first: `python3 ~/.claude/scripts/test_times/module_cost.py --tree $PWD agents/test_shutdown_cli.py --tests 10 --commands 10`, under `systemd-run --user --scope -q -p MemoryMax=2G --unit=<a new name>`. Name the top costs by test, fixture and command.
+2. Build each Git repository, bare remote and checkout that `ShutdownRepositoryFixture` (`test_shutdown_cli.py:214`), `UnitRenameFixture`, `FolderRenameFixture` and `WorkerRenameTests` make in `setUp` once per class, and copy it per test, as Phases 235-238 did. Absolute origin or worktree paths need a fixed per-class root or a rewrite after the copy. A copy must hold no path into the seed. Keep tested fetches, pushes, commits, retries and recovery real; copy only the state a test reads before its tested step.
 3. If the profile names a larger cost, report it to the director before you change the plan.
-4. Keep every test and assertion. Map each changed fixture step to the assertions that read its result.
+4. Keep every test and assertion. Map each changed fixture step to the assertions that read its result. Register each cleanup before the step that can leave a partial folder.
 5. Run the module three times and basedpyright on each changed file. Give the before and after `module_cost.py` CPU.
 6. The director runs the aws pairs.
 
 **Files:**
-- `scripts/agents/test_models_conf_publish.py`
+- `scripts/agents/test_shutdown_cli.py`
 
 **Workers:** 1 writer; one test module.
 - impl: all files.
 
 **Constraints from prior phases:**
 - Phase 232: no signal handlers anywhere.
-- Phases 233–234: a class seed copy replaces per-test Git setup; a copy to a new path must hold no absolute path into the seed.
+- Phase 252: every fixture binds private run roots through `bind_private_run_roots`; keep it. Phases 235-238 and 251: class seed copies; register cleanup before a copy.
 - sdlc terms: test files only; every test and assertion stays; land only on a measured aws gain; report paired peak memory.
 
 **Acceptance gate:**
@@ -3660,73 +3771,149 @@ The transitive config closure is deleted. An index read error gives `FullSuite` 
 - `module_cost.py` CPU before and after, with the top costs named.
 - aws pairs (3 rounds) show a gain; peak memory reported.
 
-### Phase 239 — The unit config fixtures write formatted configs without Taplo  · status: todo
-**Depends on:** Phase 234
-
-#### Work Order
-
-**Goal:** The unit config fixture callers start fewer Taplo processes and use less CPU in aws pairs, with the same tests and assertions.
-
-**Decision:** architect 29 trial queue row 5; sdlc owner go 2026-11-13 13:38 (sdlc owns configuration behavior). `unit_config._formatted` (`scripts/production/unit_config.py:387`) starts Taplo for each config write. `test_unit_config.py` starts Taplo 158 times (1.16 natedev CPU s). The lifecycle fixture writes two configs in each of 56 `running()` calls.
-
-**Spec:**
-1. Profile first, each module under `systemd-run --user --scope -q -p MemoryMax=2G --unit=<a new name>`: `python3 ~/.claude/scripts/test_times/module_cost.py --tree $PWD production/test_unit_config.py production/test_production_lifecycle.py --tests 10 --commands 10`. Name the Taplo starts that fixture setup makes, apart from the starts that tests under test make.
-2. Remove only fixture-setup Taplo starts. Write formatted baseline bytes once per class, or copy them with the class seed or snapshot, so setup writes no config through Taplo again. Keep real Taplo in every format, refusal and publication test.
-3. Change test support files only. Do not change `unit_config.py` or any production code.
-4. If the profile shows that fixture setup makes few Taplo starts, report it to the director and stop before you change code.
-5. Keep every test and assertion. Map each changed fixture step to the assertions that read its result.
-6. Run each changed module and each caller of a changed support file three times, and basedpyright on each changed file. Give the before and after `module_cost.py` CPU.
-7. The director runs the aws pairs.
-
-**Files:**
-- `scripts/production/unit_config_test_support.py`
-- `scripts/production/production_lifecycle_test_support.py`
-
-**Workers:** 1 writer; shared fixture support.
-- impl: all files.
-
-**Constraints from prior phases:**
-- Phase 232: no signal handlers anywhere.
-- Phase 233: the lifecycle fixture copies a running snapshot per test from `running_snapshot`.
-- Phase 234: `UnitConfigFixture` copies a class seed repository per test.
-- sdlc terms: test files only; every test and assertion stays; land only on a measured aws gain; report paired peak memory.
-
-**Acceptance gate:**
-- The same test counts and assertions; each changed module passes three times.
-- `module_cost.py` CPU and Taplo starts before and after, with the top costs named.
-- aws pairs (3 rounds) show a gain; peak memory reported.
-
-### Phase 240 — The message process fixture finds descendants without a host scan  · status: todo
+### Phase 254 — The roster tests do less repeated work  · status: done
 **Depends on:** none
 
-#### Work Order
+#### As-built
 
-**Goal:** The message process fixture finds owned descendants without a scan of every host process, and its importers use less CPU in aws pairs, with the same tests and assertions.
+- `message/test_roster.py`: `RosterTests` runs `fake_herdr.py` commands through `invoke_cli` with the child environment `herdr.run_program` builds; three tests that check failures, unreadable sessions and the process identity fallback keep the real process (`@process_boundary`).
+- `RosterTests` and `CodexHolderLabelsTests` bind private run roots (Phase 252 helper).
+- aws pairs: 38.211 -> 23.541 CPU s (paired median saving 14.672 s); peak 114.8 -> 116.2 MiB. 126 tests and their assertions unchanged; director reviews approve. Checkpoint f69b7ecdf.
 
-**Decision:** next-items row 0a (host scans); sdlc owner go 2026-11-13 13:38. `OwnedTestProcesses.pin_descendants` (`scripts/message/process_test_support.py:90`) reads `/proc/<pid>/environ` for every process on the host, each time `stop_and_kill` (`:218`) loops. Phase 230 measured 53.9 natedev CPU s in 7 modules. The cost grows with the host process count, not with the test.
+### Phase 255 — The send tests do less repeated work  · status: done
+**Depends on:** none
 
-**Spec:**
-1. Profile first, under `systemd-run --user --scope -q -p MemoryMax=2G --unit=<a new name>`: `python3 ~/.claude/scripts/test_times/module_cost.py --tree $PWD <each importer module> --tests 10`. Importers: `message/test_process_test_support.py`, `message/test_top_level.py`, `message/test_repeat_guard.py`, `message/test_notifier.py`, `message/test_rca.py`, `production/test_merge_gate_suites_resources.py`, `test_times/test_module_run.py`. Name the CPU in `pin_descendants`.
-2. On Linux, find owned descendants from the process tree under the test process, not from all of `/proc`. `scripts/lib/descendants.py` `adopt_descendants()` makes a process a child subreaper, so orphaned descendants stay in its tree. Read the tree through `/proc/<pid>/task/<tid>/children`, then check the owner marker only on those processes. Keep the pidfd pin and the stop, kill and reap order.
-3. A descendant that leaves the tree (a new session that is not reparented to the subreaper) must still be found, or the change must prove that the subreaper keeps it. Map each case to the test that proves it.
-4. Keep the macOS path (`darwin.user_processes`) unchanged unless the profile shows a cost there.
-5. Change test support files only. No signal handlers.
-6. Keep every test and assertion. Map each changed step to the assertions that read its result.
-7. Run each importer three times, and basedpyright on each changed file. Give the before and after `module_cost.py` CPU.
-8. The director runs the aws pairs.
+#### As-built
 
-**Files:**
-- `scripts/message/process_test_support.py`
+- `message/repeat_guard_test_support.py`: `run_guard_in_process()` patches `repeat_guard.isolated` with `guard_worker_in_process` for the module; the real worker decode and storage run in process, and a fault warns once and admits delivery. Child interpreters keep the process boundary.
+- `message/test_send.py`: `setUpModule` calls it; `repeat_guard.py` starts 262 -> 5.
+- aws pairs: 31.409 -> 13.550 CPU s (paired median saving 17.865 s); peak 180.2 -> 180.4 MiB. 317 tests and their assertions unchanged; director reviews approve. Checkpoint 8fc1fdc55.
 
-**Workers:** 1 writer; one shared fixture and its importers.
-- impl: all files.
+### Phase 256 — The stall watch tests do less repeated work  · status: done
+**Depends on:** none
 
-**Constraints from prior phases:**
-- Phase 230: the host-scan census that measured this cost.
-- Phase 232: no signal handlers anywhere.
-- sdlc terms: test files only; every test and assertion stays; land only on a measured aws gain; report paired peak memory.
+#### As-built
 
-**Acceptance gate:**
-- The same test counts and assertions; each importer passes three times.
-- `module_cost.py` CPU before and after, with the top costs named.
-- aws pairs (3 rounds) show a gain; peak memory reported.
+Checkpoint d7113b552. Changed `scripts/production/cli_fixture.py`, `fake_unit_host.py` and `test_stall_watch.py`; no test is removed or folded.
+
+- `invoke_cli` swaps the environment in place through `_exact_environment`. It changes only differing keys and restores the caller's environment when the swap fails.
+- `fake_unit_host` writes the children file once for each host write, not once for each process.
+- The ps stub uses shell builtins. The send.py stub writes `repr(record)`; `sent()` reads it with `ast.literal_eval`.
+- Local module CPU: 35.3 s before, 25.1 s after. AWS pair (c7a.8xlarge, 3 rounds): median 29.06 → 23.47 CPU s. `cli_fixture.py` is shared, so the land runs the full gate.
+
+### Phase 257 — The verify result environment tests do less repeated work  · status: done
+**Depends on:** Phase 250
+
+#### As-built
+
+- Profile only; no source change. Module 36.750 natedev CPU s, 4,281 processes, 14 real `verify.sh` runs; class setup 0.12 CPU s.
+- Each run starts about 16 Python helpers: `build_targets.py` 30 starts 5.2 s, `verify_helper.py` 16 starts 2.5 s, `admission_client.py` 18 starts 2.4 s, `build_folders.py` 39 starts 2.1 s, `tree_watch.py` 49 starts 2.1 s. Imports are 15-20 ms of each start.
+- Every run is read by an assertion, so the test-only floor is the current cost. Architecture proposal to sdlc: one helper process per `verify.sh` run; the 69 verify fixture modules are 868 of 4,763 CPU s in a full gate (18%).
+
+### Phase 258 — The lint sweep tests use less CPU  · status: done
+**Depends on:** Phase 257
+**Owner:** report unit; builds gave the go 2026-11-13 (no open change to the file).
+
+#### As-built
+
+Checkpoint 6d2acbfb9. Only `scripts/lint/test_sweep.py` changed; no test is removed or folded.
+
+- `write()` allocates fixture file blocks with `posix_fallocate` on Linux, not random bytes. The sweep reads only `st_size` and `st_blocks`. Other platforms keep the random-byte write. The crossing recommendation test went from 12.7 to 0.3 local CPU s.
+- `skip_host_ci_targets` points `sweep_ci_targets` at a missing folder. `SweepCase.setUp` calls it, and the claim subtest calls it again after `local_remote_transport`. On natedev, floor tests had walked the real CI folders (about 730,000 entries).
+- Local module CPU: 40.1 s before, 13.2–13.9 s after. AWS pair (c7a.8xlarge, 3 rounds): median 15.88 → 10.95 CPU s.
+
+### Phase 259 — The production lifecycle tests start fewer processes  · status: done
+**Depends on:** none
+**Owner:** builds gave the go 2026-11-13.
+
+#### As-built
+
+Checkpoint 215299cb2. Changed `production_lifecycle_test_support.py` and added `session_records_test_support.py`; no test is removed or folded.
+
+- One POSIX shell stub replaces the Python stub for the executable fixture commands, with the same `calls` lines, exit codes and board output.
+- `showrunners.py` keeps a Python stub, because only an interpreter runs it; a wrong call still records its name.
+- `session_records_test_support.socket_path` answers the in-process `socket_for` and serves as the `SHOWRUNNERS_SESSIONS` script for process runs.
+- AWS pair (c7a.8xlarge, 3 rounds): median 29.54 → 24.55 CPU s. The rest is production `git` and `phase_table.py` starts.
+
+### Phase 260 — The repeat guard notice fixture starts lighter supervisors  · status: done
+**Depends on:** none
+**Owner:** builds gave the go 2026-11-13.
+
+#### As-built
+
+Checkpoint 298f77624. Changed `scripts/message/test_repeat_guard.py` (`NOTICE_FIXTURE`); no test is removed or folded.
+
+- The supervise role runs only `repeat_guard.notice_job`, imports only `repeat_guard` and exits. The drain and attempt roles keep their imports and patches.
+- AWS pair (c7a.8xlarge, 3 rounds): median 14.54 → 12.03 CPU s. Most of the rest is the drain and attempt processes, which import `send` and `staff`.
+
+### Phase 261 — The notifier tests start lighter launcher stubs  · status: done
+**Depends on:** none
+**Owner:** builds gave the go 2026-11-13.
+
+#### As-built
+
+Checkpoint 2cfdd87f1. Changed `scripts/message/test_notifier.py` (launcher stubs); no test is removed or folded.
+
+- The fake `systemd-run` is one `/bin/sh` stub: `set -m` starts the command in its own process group, and the stub writes `run-exit-<pid>` and the launch pid marker. The Mac has no `setsid`; `/bin/sh set -m` works on both machines. The drain test's stub writes one argument per line.
+- The fake `launchctl` is one `zsh -f` stub with the same submit, kickstart, loop and remove behavior. Kickstart starts the loop through `/bin/sh set -m`, because zsh cannot start a job group without a terminal.
+- AWS pair (c7a.8xlarge, 3 rounds): median 7.22 → 6.59 CPU s. Most of the rest is the production helpers `sessions.py member-socket` and `update_registration.py delivery`; their import cost went to sdlc as a proposal.
+
+### Phase 262 — The unit move tests copy a class-built Git seed and read snapshots faster  · status: done
+**Depends on:** none
+**Owner:** builds gave the go 2026-11-13.
+
+#### As-built
+
+- `FolderRenameFixture.setUpClass` builds the Git seed once per class with `build_folder_repositories`. Each `setUp` calls `copy_folder_repositories`, which copies the checkout, the bare origin and the unit worktree with symlinks kept.
+- The copy rewrites the seed path in three files: the checkout config (`root` as given), the worktree `gitdir` and the worktree `.git` file (`root.resolve()`). It raises AssertionError when a file does not name the seed.
+- `final_files` and `file_versions` share one `os.scandir` walker, `_files`, with the old filters. Symlinked folders are not followed; a symlink to a file is read through.
+- AWS pair (c7a.8xlarge, 3 rounds): `production/test_unit_move.py` 17.30 -> 15.29 CPU s; `agents/test_shutdown_cli.py` 34.51 -> 34.01 CPU s; `production/test_rename_unit_style.py` no change.
+- Commit 10c48884a. The land runs all three modules.
+
+### Phase 263 — The statusline role tests start no counts program  · status: done
+**Depends on:** none
+**Owner:** builds set the order 2026-11-13.
+
+#### As-built
+
+- `RoleTests.command_lines` calls `seed_empty_counts` before each render. It writes a fresh empty counts cache (due 9999999999) for each staff row; a unit cache names `source=unit:<id>`.
+- The shell reads the timer and the fresh cache and starts no `counts_row.py`. RoleTests checks the assignment line; CountsRowTests checks the counts row.
+- The seed reads staff with `assignment.staff_record` and follows the `STAFF_FILE` and `SHOWRUNNER_STATE_DIR` marks. A damaged staff file seeds no cache.
+- AWS pair (c7a.8xlarge, 3 rounds): 51.77 -> 44.62 CPU s.
+- Commit fb2511020.
+
+### Phase 264 — copies.py starts fewer git processes  · status: done
+**Depends on:** none
+**Owner:** sdlc gave the go through builds 2026-11-13 (production cut 1 of 4).
+
+#### As-built
+
+- `origin_url` runs one `git remote get-url origin`. Exit 2 (`NO_SUCH_REMOTE`) returns None; other failures raise.
+- `git` raises `GitExit(CopyError)` with `returncode`; each `except CopyError` caller keeps its behavior.
+- `refresh_remotes` deletes the stale `refs/remotes/<remote>/HEAD` refs in one `update-ref --no-deref --stdin` call before the fetch. It still reads two ref lists, one for each repository.
+- AWS pair (c7a.8xlarge, 3 rounds): `copies/test_copies.py` 26.56 -> 24.83 CPU s; `style/test_crate_run.py` 55.97 -> 55.26; `production/test_fast_track.py` 57.56 -> 56.93.
+- Commit b1c950141. Production change with the sdlc go; the land runs the full gate.
+
+### Phase 265 — copies.py reads the main checkout with one git call  · status: done
+**Depends on:** Phase 264
+**Owner:** sdlc asked for this cut 2026-11-13, after phase 264 ("measure them before the lazy-import cuts").
+
+#### As-built
+
+- `main_checkout` adds `--show-cdup` to its first `rev-parse` call. In a work tree it returns `(source / cdup).resolve()` and runs no `--show-toplevel` call.
+- With no cdup line (inside `.git` or a metadata folder), the `--show-toplevel` call stays and raises as before.
+- Old and new agree on 8 layouts: top, subfolder, symlink, linked worktree, bare, separate metadata, metadata folder, `.git`.
+- AWS pair (c7a.8xlarge, 3 rounds): `copies/test_copies.py` 24.75 -> 24.32 CPU s; `style/test_crate_run.py` 55.16 -> 54.26; `production/test_fast_track.py` 56.82 -> 56.75.
+- Commit 5469f0791. Production change with the sdlc go; the land runs the full gate.
+
+### Phase 266 — The offload cleanup tests run the real lint sweep only where they test the trim  · status: done
+**Depends on:** none
+**Owner:** natest (test-only change).
+
+#### As-built
+
+- `MacTargetCleanupShellTests.setUp` writes a `py` stub that exits 0, so the shell-text tests start no lint sweep.
+- `real_sweep()` writes the `exec python3` stub. The budget trim subtests and the trim success subtest call it.
+- The trim failure subtest keeps its `exit 9` stub.
+- AWS pair (c7a.8xlarge, 3 rounds): `mac_test/test_offload_cleanup.py` 26.76 -> 7.77 CPU s.
+- Commit 6f6840546. Test-only change.

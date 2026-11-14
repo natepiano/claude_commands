@@ -39,6 +39,7 @@ from scripts.production import unit_names
 from scripts.production import unit_lookup
 from scripts.production.cli_fixture import invoke_cli, process_boundary_for_case
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.lib.unit_runs_test_support import bind_private_run_roots
 
 SCRIPT = Path(__file__).resolve().parents[1] / "agents/shutdown.py"
 READ_HERDR_PANES = herdr.Herdr.panes
@@ -274,6 +275,7 @@ class FolderMoveFixture(StaffTestCase):
         _ = self.enterContext(mock.patch("scripts.production.stall_watch.STATE_DIR", self.root / "stall-watch"))
         _ = self.enterContext(mock.patch.object(progress_history, "SESSION_ROOTS", (self.run_dir.parent,)))
         _ = self.enterContext(mock.patch.object(unit_runs, "RUN_ROOT", self.run_dir.parent))
+        bind_private_run_roots(self, self.root)
         _ = self.folder_git(self.checkout, "init", "-b", "kept-branch")
         _ = self.folder_git(self.checkout, "config", "user.name", "Folder Move Test")
         _ = self.folder_git(self.checkout, "config", "user.email", "move@example.invalid")

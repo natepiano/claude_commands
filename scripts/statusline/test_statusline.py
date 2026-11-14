@@ -488,12 +488,31 @@ class RoleTests(unittest.TestCase):
             with self.subTest(home_identity="directory", shell=shell):
                 self.assertNotIn("claude2", ANSI.sub("", "\n".join(self.command_lines({}, shell=shell))))
 
+    @staticmethod
+    def seed_empty_counts(record: Path, state: Path) -> None:
+        """Keep a fresh empty counts cache for each staff row, so the shell starts no counts_row.py.
+
+        These tests check the assignment line; CountsRowTests checks the counts row and its cache.
+        A unit cache names its source, as statusline.sh requires; a showrunner cache names none.
+        """
+        try:
+            rows = assignment.staff_record(record.read_text(encoding="utf-8")).rows
+        except OSError:
+            return
+        folder = state / "counts"
+        folder.mkdir(parents=True, exist_ok=True)
+        for row in rows:
+            source = f"source=unit:{row.id}\n" if row.kind == "unit" else ""
+            _ = (folder / row.id).write_text(f"\n9999999999\n{source}", encoding="utf-8")
+
     def first_line(self, session_id: str = "aaaa-1111", **marks: str) -> str:
         return ANSI.sub("", self.command_lines({"session_id": session_id}, **marks)[0])
 
     def command_lines(self, payload: object, *, command: str = COMMAND, shell: str = "/bin/sh", **marks: str) -> list[str]:
         """Run the statusLine command as Claude Code does, with only `marks` beside a bare environment."""
         seed_rebuild_cache(self.home)
+        self.seed_empty_counts(Path(marks.get("STAFF_FILE", self.home / ".local/state/staff/staff.json")),
+                               Path(marks.get("SHOWRUNNER_STATE_DIR", self.home / ".local/state/showrunner")))
         read_log = {"CONF_READ_LOG": os.environ["CONF_READ_LOG"]} if "CONF_READ_LOG" in os.environ else {}
         env = {**SHELL_ENVIRONMENT, "PATH": os.environ["PATH"], "HOME": str(self.home), **read_log, **marks}
         result = subprocess.run(
