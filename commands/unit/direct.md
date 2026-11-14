@@ -201,6 +201,8 @@ A no-capacity broadcast turns this mode on until the workers-back notice arrives
 A real worker launch or turn failure containing `hit your usage limit` also turns this mode on.
 That self-on mode lasts through the current phase; try a normal assign at the next phase start.
 A broadcast-on mode keeps its longer lifetime if both triggers occur.
+The no-capacity broadcast also stops every Codex worker and ends each of their open passes as canceled.
+A stop report names your stopped workers, your canceled passes, and each worker that is not proved stopped.
 Send no assign while this mode is on.
 Read `~/.claude/docs/direct/no_worker_mode.md` in full when this mode turns on.
 </NoWorkerMode>

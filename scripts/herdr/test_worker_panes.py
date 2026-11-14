@@ -1228,6 +1228,31 @@ class WorkerPaneTests(StaffTestCase):
             self.assertIsInstance(opened, worker_panes.OpenWorker)
         self.assertEqual(len(self.world.launches), 1)
 
+    def test_deadline_waits_for_a_held_worker_lock_and_keeps_out_when_the_time_ends(self) -> None:
+        row = self.worker(family="codex")
+        name = staff.WorkerName.parse(row.name)
+        flock = fcntl.flock
+        refusals = 0
+
+        def release_on_third_attempt(handle: int | worker_lifecycle.LockFileDescriptor, operation: int) -> None:
+            nonlocal refusals
+            if Path(str(cast(object, getattr(handle, "name", "")))).stem == row.id and refusals < 2:
+                refusals += 1
+                raise BlockingIOError(11, "Resource temporarily unavailable")
+            flock(handle, operation)
+
+        with patch.object(fcntl, "flock", side_effect=release_on_third_attempt):
+            with worker_panes.worker_lock(self.parent.id, name, deadline=time.monotonic() + TEST_HANG_GUARD_SECS) as waited:
+                assert isinstance(waited, worker_panes.WorkerLockHold)
+                self.assertTrue(waited.owns(row))
+        self.assertEqual(refusals, 2)
+        with worker_panes.worker_lock(self.parent.id, name) as hold:
+            assert isinstance(hold, worker_panes.WorkerLockHold)
+            started = time.monotonic()
+            with worker_panes.worker_lock(self.parent.id, name, deadline=started + 0.1) as competing:
+                self.assertEqual(competing, worker_panes.Kept("dispatch lock is held"))
+            self.assertGreaterEqual(time.monotonic() - started, 0.1)
+
     def test_published_worker_retries_a_fixed_id_flock_that_clears(self) -> None:
         name = staff.WorkerName.parse("brief-lock")
         flock = fcntl.flock
