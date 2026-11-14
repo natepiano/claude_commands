@@ -261,6 +261,24 @@ def _staff_paths(fields: dict[str, object], row: staff.StaffRow) -> None:
         fields.update(working_dir=str(row.worktree.path), worktree=row.worktree.path.name)
 
 
+_BRANCHES: dict[Path, str] = {}
+
+
+def _worktree_branch(path: Path) -> str:
+    """Trial ceiling: one branch lookup for each worktree in a process."""
+    if path in _BRANCHES:
+        return _BRANCHES[path]
+    branch = subprocess.run(["git", "-C", str(path), "branch", "--show-current"],
+                            capture_output=True, text=True, check=False)
+    name = branch.stdout.strip()
+    if branch.returncode == 0 and not name:
+        commit = subprocess.run(["git", "-C", str(path), "rev-parse", "--short", "HEAD"],
+                                capture_output=True, text=True, check=False)
+        name = f"detached@{commit.stdout.strip() or 'unknown'}"
+    _BRANCHES[path] = name
+    return name
+
+
 def staff_directory(fields: dict[str, object], record: staff.StaffSnapshot) -> dict[str, object]:
     """Resolve current state through staff and preserve recorded events."""
     if fields.get("event_type"):
@@ -271,13 +289,7 @@ def staff_directory(fields: dict[str, object], record: staff.StaffSnapshot) -> d
     _staff_paths(fields, row)
     if not isinstance(row.worktree, staff.WorktreeUnfilled):
         if not fields.get("event_type"):
-            branch = subprocess.run(["git", "-C", str(row.worktree.path), "branch", "--show-current"],
-                                    capture_output=True, text=True, check=False)
-            fields["branch"] = branch.stdout.strip()
-            if branch.returncode == 0 and not fields["branch"]:
-                commit = subprocess.run(["git", "-C", str(row.worktree.path), "rev-parse", "--short", "HEAD"],
-                                        capture_output=True, text=True, check=False)
-                fields["branch"] = f"detached@{commit.stdout.strip() or 'unknown'}"
+            fields["branch"] = _worktree_branch(row.worktree.path)
     if not fields.get("event_type"):
         main = fields.get("main_agent")
         identity = dict(cast(dict[str, object], main)) if isinstance(main, dict) else {}
