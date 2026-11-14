@@ -3854,6 +3854,6 @@ Checkpoint 298f77624. Changed `scripts/message/test_repeat_guard.py` (`NOTICE_FI
 
 Checkpoint 2cfdd87f1. Changed `scripts/message/test_notifier.py` (launcher stubs); no test is removed or folded.
 
-- The fake `systemd-run` is one `/bin/sh` stub: it starts the command under `setsid` and writes `run-exit-<pid>` and the launch pid marker. The drain test's stub writes one argument per line.
-- The fake `launchctl` is one `zsh -f` stub with the same submit, kickstart, loop and remove behavior.
+- The fake `systemd-run` is one `/bin/sh` stub: `set -m` starts the command in its own process group, and the stub writes `run-exit-<pid>` and the launch pid marker. The Mac has no `setsid`; `/bin/sh set -m` works on both machines. The drain test's stub writes one argument per line.
+- The fake `launchctl` is one `zsh -f` stub with the same submit, kickstart, loop and remove behavior. Kickstart starts the loop through `/bin/sh set -m`, because zsh cannot start a job group without a terminal.
 - AWS pair (c7a.8xlarge, 3 rounds): median 7.22 → 6.59 CPU s. Most of the rest is the production helpers `sessions.py member-socket` and `update_registration.py delivery`; their import cost went to sdlc as a proposal.

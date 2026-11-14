@@ -71,13 +71,14 @@ class NotifierTests(unittest.TestCase):
         launcher_dir.mkdir()
         launcher = launcher_dir / "systemd-run"
         # The caller installs the inherited ownership marker before launch.
-        # setsid runs the monitor shell in this background child, so $! and the monitor's $$ are one pid.
+        # set -m starts the monitor shell in its own process group on Linux and macOS; $! is its pid and group.
         _ = launcher.write_text(
             "\n".join((
                 "#!/bin/sh",
+                "set -m",
                 'while [ "$1" != -- ]; do shift; done',
                 "shift",
-                """setsid /bin/sh -c '"$@"; code=$?; printf %s "$code" > "$0/run-exit-$$"' """
+                """/bin/sh -c '"$@"; code=$?; printf %s "$code" > "$0/run-exit-$$"' """
                 + f'{shlex.quote(str(self.root))} "$@" </dev/null >/dev/null 2>&1 &',
                 f'printf "%s\\n" "$!" >> {shlex.quote(str(self.launch_pids))}',
             )) + "\n"
@@ -741,9 +742,8 @@ case $1 in
     (( FAKE_LAUNCHCTL_KICKSTART_RC )) && exit $FAKE_LAUNCHCTL_KICKSTART_RC
     label=${2#*/*/}
     command=(${(Q)${(z)"$(<$state/$label.command)"}})
-    # setsid runs the loop in this background child, so $! is the loop's own group.
-    setsid $0 loop $label $command </dev/null >/dev/null 2>&1 &
-    print -r -- $! > $state/pid.tmp
+    # zsh cannot start a job group without a terminal; /bin/sh set -m can on Linux and macOS.
+    /bin/sh -c 'set -m; "$@" </dev/null >/dev/null 2>&1 & echo $!' sh $0 loop $label $command > $state/pid.tmp
     zf_mv $state/pid.tmp $state/pid ;;
   loop)
     label=$2
