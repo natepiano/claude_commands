@@ -12,7 +12,7 @@ import tempfile
 import unittest
 from contextlib import redirect_stdout
 from pathlib import Path
-from typing import Literal, final, override
+from typing import ClassVar, Literal, final, override
 from unittest import mock
 
 from scripts.lib.py_floor_test_support import interpreter_cache_environment
@@ -270,10 +270,42 @@ class RegistryPublishingTests(RegistryFixture):
     checkout: Path = Path()
     competitor: Path = Path()
     remote: Path = Path()
-    initial: str = ""
+    initial: ClassVar[str]
+    publication_root: ClassVar[Path]
+    publication_seed: ClassVar[Path]
+    publication_environment: ClassVar[dict[str, str]]
+
+    @classmethod
+    @override
+    def setUpClass(cls) -> None:
+        super().setUpClass()
+        builder = cls(methodName="runTest")
+        cls.addClassCleanup(builder.doCleanups)
+        cls.initial = builder.build_publication_fixture()
+        cls.publication_root = builder.root
+        cls.publication_environment = dict(builder.environment)
+        seed_root = Path(cls.enterClassContext(tempfile.TemporaryDirectory(prefix="agents-publication-seed-")))
+        cls.publication_seed = seed_root / "case"
+        _ = shutil.copytree(builder.root, cls.publication_seed, symlinks=True)
+        shutil.rmtree(builder.root)
 
     @override
     def setUp(self) -> None:
+        self.root = self.publication_root
+        self.addCleanup(shutil.rmtree, self.root)
+        _ = shutil.copytree(self.publication_seed, self.root, symlinks=True)
+        self.home = self.root / "home"
+        self.registry = self.home / ".claude/config/models.conf"
+        self.checkout = self.home / ".claude"
+        self.command_directory = self.checkout
+        self.competitor = self.root / "competitor"
+        self.remote = self.root / "origin.git"
+        self.environment = dict(self.publication_environment)
+        refreshed = self.command(GIT, "update-index", "--refresh")
+        self.assertEqual(refreshed.returncode, 1, refreshed.stdout + refreshed.stderr)
+        _ = self.git("update-index", "--refresh", cwd=self.competitor)
+
+    def build_publication_fixture(self) -> str:
         self.set_up_registry("home/.claude/config/models.conf", publishing=True)
         self.checkout = self.home / ".claude"
         self.command_directory = self.checkout
@@ -288,11 +320,12 @@ class RegistryPublishingTests(RegistryFixture):
         _ = self.git("remote", "add", "origin", str(self.remote))
         _ = self.git("push", "--set-upstream", "origin", "main")
         _ = self.git("clone", str(self.remote), str(self.competitor), cwd=self.root)
-        self.initial = self.git("rev-parse", "HEAD").strip()
+        initial = self.git("rev-parse", "HEAD").strip()
         _ = (self.checkout / "dirty.txt").write_text("uncommitted dirty edit\n")
         _ = (self.checkout / "staged.txt").write_text("staged user edit\n")
         _ = self.git("add", "staged.txt")
         _ = (self.checkout / "staged.txt").write_text("staged user edit plus unstaged edit\n")
+        return initial
 
     def git(self, *arguments: str, cwd: Path | None = None) -> str:
         result = self.command(GIT, *arguments, cwd=cwd)

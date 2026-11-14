@@ -73,7 +73,7 @@ Phases 181 (`68da1fa10`), 183 (`8fe4448ec`), 184 (`0a6f179eb`), 185 (`cbe16dd36`
 
    | Order | Modules and owner | Change | Split and limits | Bound and effort |
    | --- | --- | --- | --- | --- |
-   | 1 | `copies/test_copies.py`; copies owner | Build the published and unpushed source states once; copy private repositories per test (`StandingTests.setUp:108`). | One fixture writer. | 120 tests × 12 Git commands = 1,440 calls; module 30.18 s; 2–3 h |
+   | done | `copies/test_copies.py` (Phase 235, `3ff00e6ad`) | The class stores the published and unpushed source states once; `copy_to` copies them per test and refuses an origin it cannot rewrite. | One fixture writer. | aws CPU 30.60 to 26.53 s; peak 119.8 to 119.2 MiB |
    | 2 | `agents/test_shutdown_cli.py`; sdlc devtools | Separate retired-state and resume-state class snapshots (`RetireUnitTests.setUp:526`, `ResumeUnitTests.setUp:1374`). | One writer owns both fixtures and the fixed worktree paths. | 682 calls; module 38.41 s; 3–5 h |
    | 3 | `agents/test_models_conf_publish.py`; models owner with sdlc | Copy one baseline publication fixture, with its private dirty and staged states (`RegistryPublishingTests.setUp:284`). Keep real writers, locks, rejected pushes and publication checks. | One fixture writer. | 43 × 9 = 387 calls; module 33.79 s; 2–4 h |
    | done | `buildlog/test_record.py` (Phase 237, `4f9a19c62`) | One class seed repository replaces `git init` and the empty commit in 84 tests. | One writer. | aws CPU 11.87 to 11.49 s; peak 136.6 to 135.5 MiB |
