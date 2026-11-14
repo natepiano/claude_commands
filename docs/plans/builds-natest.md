@@ -3874,19 +3874,10 @@ Checkpoint 2cfdd87f1. Changed `scripts/message/test_notifier.py` (launcher stubs
 **Depends on:** none
 **Owner:** builds set the order 2026-11-13.
 
-#### Work Order
+#### As-built
 
-**Goal:** `statusline/test_statusline.py` uses less CPU in aws pairs; every behavior check stays.
-
-**Spec:**
-- Profile: 40.9 local CPU s. A `counts_row.py` start costs about 0.19 CPU s; it imports `update_registration`. RoleTests renders the statusline through the shell about 250 times. A staff unit row or a showrunner timer makes the shell start `counts_row.py` on each render.
-- RoleTests checks the assignment line, not the counts row. CountsRowTests checks the counts row and its cache.
-- `RoleTests.command_lines` writes a fresh empty counts cache for each staff row before each render. A unit cache names `source=unit:<id>`, as `statusline.sh` requires. The shell still reads the timer and the cache, but starts no `counts_row.py`.
-- The seed reads the staff file with `assignment.staff_record`, so a damaged file seeds no cache.
-- Test file only.
-
-**Files:** `scripts/statusline/test_statusline.py`.
-
-**Workers:** director only (no-worker mode).
-
-**Acceptance gate:** the module passes; basedpyright reports zero errors and warnings; the aws pair shows a CPU gain.
+- `RoleTests.command_lines` calls `seed_empty_counts` before each render. It writes a fresh empty counts cache (due 9999999999) for each staff row; a unit cache names `source=unit:<id>`.
+- The shell reads the timer and the fresh cache and starts no `counts_row.py`. RoleTests checks the assignment line; CountsRowTests checks the counts row.
+- The seed reads staff with `assignment.staff_record` and follows the `STAFF_FILE` and `SHOWRUNNER_STATE_DIR` marks. A damaged staff file seeds no cache.
+- AWS pair (c7a.8xlarge, 3 rounds): 51.77 -> 44.62 CPU s.
+- Commit fb2511020.
