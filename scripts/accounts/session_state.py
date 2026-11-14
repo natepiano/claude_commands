@@ -10,7 +10,7 @@ from typing import Literal, cast
 from scripts.lib.unit_runs import LauncherRunDirectories
 from scripts.production import staff
 
-SessionState = Literal["busy", "starting", "waiting", "idle", "paused", "exited"]
+SessionState = Literal["busy", "idle", "paused", "exited"]
 StaffState = Literal["active", "paused", "exited"]
 
 
@@ -91,17 +91,14 @@ def running_detached_work(record: staff.StaffSnapshot, *, additional_runs: Seque
 def classify(member: staff.StaffRow | UnrecordedStaff,
              activity: LiveActivity | NoLiveSession, *,
              detached: RunningDetachedWork = NO_DETACHED_WORK) -> SessionState:
-    """Staff exit and pause records take precedence over observed activity."""
+    """Staff exit and pause records take precedence; a start or a detached run counts as busy."""
     hold = staff_state(member)
     if hold != "active":
         return hold
-    if isinstance(activity, LiveActivity):
-        if activity.status == "busy":
-            return "busy"
-        if activity.status == "starting":
-            return "starting"
+    if isinstance(activity, LiveActivity) and activity.status in ("busy", "starting"):
+        return "busy"
     if isinstance(member, staff.StaffRow) and member.id in detached.staff_ids:
-        return "waiting"
+        return "busy"
     if isinstance(activity, NoLiveSession):
         return "exited"
     return "idle"

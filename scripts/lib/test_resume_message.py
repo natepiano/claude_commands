@@ -3,7 +3,9 @@ from __future__ import annotations
 
 import unittest
 
-from scripts.lib.resume_message import AccountMove, BusyPass, NO_OWN_PASS, resume_message
+from scripts.lib.resume_message import (AccountMove, BusyPass, NO_OWN_PASS, PaneWorkerResume, ResumeWorkers,
+                                        WorkersHeld, resume_message)
+from scripts.production import staff
 
 
 class DetachedResumeTests(unittest.TestCase):
@@ -17,3 +19,19 @@ class DetachedResumeTests(unittest.TestCase):
                 self.assertNotIn("ended with no result", text)
                 if isinstance(own, BusyPass):
                     self.assertIn("Continue pass dispatch-one", text)
+
+
+class HeldWorkersTests(unittest.TestCase):
+    def test_held_workers_give_the_notice_and_no_worker_line(self) -> None:
+        notice = "Codex workers have no capacity. Send no assign."
+        resumable = resume_message("restart", workers=ResumeWorkers(
+            panes=(PaneWorkerResume(staff.StaffId("worker-one"), BusyPass("dispatch-one")),)))
+        self.assertIn("Worker worker-one: busy dispatch dispatch-one", resumable)
+        for detached in ("", "Detached run test-run remains live."):
+            with self.subTest(detached=detached):
+                text = resume_message("restart", workers=WorkersHeld(notice), detached=detached)
+                self.assertIn("Continue where you stopped.", text)
+                self.assertIn(notice, text)
+                self.assertIn(detached, text)
+                self.assertNotIn("Worker ", text)
+                self.assertNotIn("Resume your workers", text)

@@ -4,7 +4,7 @@
 
 ## What it is
 
-One roster lists every session of interest on natedev and the Mac: Claude showrunners, unit directors, workers and freestanding sessions; Codex workers with their unit director and showrunner; and the user's own Codex windows across account daemons. `scripts/message/roster.py` only lists. `send.py` selects identity from staff and checks transport through the roster. It reaches a staff member on either machine, and `broadcast.py` reaches groups (showrunners, unit directors, workers, a unit's workers, agents, top-level sessions, everyone) on both machines. Each kind of session lists its own kind natively where it can and uses the roster for the rest; the instruction texts say which tool to use. Every message to the user passes one gate, `scripts/notify/pushover.py`, which refuses a message that neither states the user's action (`--action`) nor says none is needed (`--no-action`). A headless reviewer then checks each push for clarity before it is posted (`docs/as-built/message-clarity.md`). Shutdown tests run under a guard that fails a test, instead of sending, when it reaches a real send.
+One roster lists every session of interest on natedev and the Mac: Claude showrunners, unit directors, workers and freestanding sessions; Codex workers with their unit director and showrunner; and the user's own Codex windows across account daemons. `scripts/message/roster.py` only lists. `send.py` selects identity from staff and checks transport through the roster. It reaches a staff member on either machine. `broadcast.py` selects roles, a production's unit directors, or a unit's workers on both machines. Each kind of session lists its own kind natively where it can and uses the roster for the rest; the instruction texts say which tool to use. Every message to the user passes one gate, `scripts/notify/pushover.py`, which refuses a message that neither states the user's action (`--action`) nor says none is needed (`--no-action`). A headless reviewer then checks each push for clarity before it is posted (`docs/as-built/message-clarity.md`). Shutdown tests run under a guard that fails a test, instead of sending, when it reaches a real send.
 
 ### Data flow
 
@@ -142,10 +142,28 @@ Codex rows:
 
 `roster.py [--json] [--kind claude|codex] [--here]`. Without `--here` it reads `AllMachines`: `ssh -o BatchMode=yes <other machine> '"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/message/roster.py" --here --snapshot'`. The command has a 20 s timeout and removes session identity variables. It runs beside the local read and merges entries with this machine first.
 
-- **Text** — per machine: a machine line, then showrunner → unit director → worker, unit directors with no running showrunner and their workers, `director not running: <session dir>` groups for workers with no listed director, freestanding Claude, and `your Codex sessions`. Each row: `<role> <name>[ (you)][ (context)] — <kind>, <status>[, <slot role>][, <unit>][, <cwd with ~>]`. `(you)` marks the sender's row on this machine. No pids or ports.
+- **Text** starts each machine's section with its SSH alias (`natedev` or `mac`).
+  `send.py --machine` accepts this alias or a host name from `config/machines.conf`, without regard to case.
+  Both values select the configured SSH alias.
+  Rows follow this order: showrunner → unit director → worker, then unit directors with no running showrunner and their workers.
+  Next come `director not running: <session dir>` groups for workers with no listed director, freestanding Claude, and `your Codex sessions`.
+  Each row uses `<role> <name>[ (you)][ (context)] — <kind>, <status>[, <slot role>][, <unit>][, <cwd with ~>]`.
+  `(you)` marks the sender's row on this machine.
+  A freestanding Claude row without a staff name shows its registry name, then its address in brackets.
+  A row without a registry name shows its address alone.
+  Rows omit pids and ports.
 - **`--kind`** keeps rows of that kind and adds each listed worker's unit director and showrunner (same machine) as `(context)` rows; `--json` includes them unmarked.
-- **`--json`** prints `{"entries": [...], "problems": [...]}`. Each entry is flat: `machine`, `kind`, `role`, `name`, `status`, `address`, `cwd`, `production`, `showrunner`, `showrunner_address`, `unit`, `director`, `director_address`, `slot_role`, `session_dir`, `thread` (id or `null`). Link fields are empty for no-link states and for a showrunner's or director's own row; `address` is empty for `CannotReceiveMessages`. There is no `session` field.
-- **`--snapshot`** (hidden from `--help`) prints `RosterSnapshot`: tagged JSON that decodes back into the same variants, used only between machines.
+- **`--json`** prints `{"entries": [...], "problems": [...]}`.
+  Each entry is flat: `machine`, `kind`, `role`, `name`, `status`, `address`, `cwd`, `production`, `showrunner`, `showrunner_address`, `unit`, `director`, `director_address`, `slot_role`, `session_dir`, `thread` (id or `null`).
+  The `machine` field holds the SSH alias (`natedev` or `mac`) that `send.py --machine` accepts.
+  `name` holds only the staff name.
+  `shown_name` uses the registry name for a freestanding Claude session without a staff name.
+  Link fields are empty for no-link states and for a showrunner's or director's own row.
+  The `address` field is empty for `CannotReceiveMessages`.
+  Entries omit the `session` field.
+- **`--snapshot`** (hidden from `--help`) prints `RosterSnapshot`: tagged JSON for exchange between machines.
+  The `registry_name` field holds `RegistryName` or `NoRegistryName`.
+  An older snapshot without this field decodes as `NoRegistryName`.
 - **Problems** go to stderr as `could not read: <source>: <detail>`; the other machine's are prefixed with its host; an unreachable machine, timeout or undecodable snapshot is `<host>: not reached: <why>`. A decodable snapshot is used whatever the remote exit status. Exit 0 clean, 1 with any problem.
 
 Durable-role warnings print once on stderr with `warning:`. JSON and snapshots carry an optional `warnings` list; older snapshots without it have no warnings. Warnings alone leave exit status 0. `send.py` prints them once and continues transport resolution; they do not trigger the incomplete-roster refusal. `top_level.py` and `broadcast.py` display the same diagnostics while retaining readable recipients.
@@ -234,10 +252,9 @@ A proved miss permits the relay: `absent`, `stale`, `self`, `unclaimed`, `outbox
 The fallback is a headless `command claude -p` relay (sonnet, auto mode, tools `SendMessage` plus `ListAgents` for a name, hooks, MCP and slash commands off, `CLAUDE_*` variables removed, named by `relay_identity.relay_session_name(--from)` as `relay/<sender>`); delivery is read from the `SendMessage` tool result in the stream, which stays in `STATE/relay/<to>.jsonl`. `--timeout` defaults to 40 s for every transport. Where `~/.config/claude/oauth-token.gpg` exists (the Mac, whose keychain ssh cannot open) the relay decrypts it, and queues with `gpg-agent is cold on <machine>: run github-warmup there` when it cannot. Undelivered Claude messages go to `STATE/queue/`, latest per `--key`, under the recipient's session id; `pending` prints and clears them. `--key` with `--repeat-minutes` skips a repeat within the window; `ack` skips every later send with the key until `reopen`.
 
 The relay name has the form `relay/<sender>`. A name alone does not identify a relay: a real session can use the same form. The message body always carries `Shown sender: <display name>`, even when the display name equals `--from`. The conversation-pause hook reads the original sender with `relay_identity.message_sender_name` for scheduled messages and its return question. The native SendMessage miss hook resolves the exact target through staff. A non-staff name can use a live roster row. Verified relay recovery retains its saved sender lookup. This name is display text. `send.py` records the runtime sender ID separately.
-The generated `Authority: morty (speaks for the user)` mark requires the configured native ID.
-Caller lines that start with `Authority:` or `Sender native id:` get a `> ` prefix in delivered text.
+Caller lines that start with `Sender native id:` get a `> ` prefix in delivered text.
 Rendering converts line separators to LF before it quotes caller labels, including sender and forwarded display text.
-Only the generated metadata block directly after the preview grants authority. Quoted labels elsewhere grant none.
+Only the metadata block directly after the preview is generated. A quoted label elsewhere is caller text.
 Forwarded stamps require `SSH_CONNECTION` as a context check against accidental use.
 A session can inherit this variable. The check does not prove that `remote()` supplied the stamp.
 Code under the same account can set that environment. The mark is not authentication.
@@ -407,28 +424,40 @@ Each evidence cell names the request id and the report, receive or transcript li
 ### `broadcast.py`: groups on both machines
 
 ```
-broadcast.py [--here] --from NAME (--all TEXT | --showrunners TEXT | --units TEXT |
+broadcast.py [--here] --from NAME (--all TEXT | --showrunners TEXT | [--production SHOWRUNNER] --units TEXT |
              --agents TEXT | [--of UNIT] --workers TEXT | --top-level TEXT)...
 ```
 
-`BroadcastGroup = AllRoles | Showrunners | UnitDirectors | Agents | Workers | WorkersOfUnit(address, unit, machine) | TopLevel`, closed and separate from the roster's `Role` because flags overlap.
+`BroadcastGroup = AllRoles | Showrunners | UnitDirectors | UnitsOfProduction(address, production) | Agents | Workers | WorkersOfUnit(address, unit, machine) | TopLevel`.
+The group type stays separate from the roster's `Role` because flags overlap.
 
 | Flag | Members |
 |---|---|
 | `--all` | every row |
 | `--showrunners` | role `showrunner` |
-| `--units` | role `unit director` |
+| `--units` | every unit director; after `--production <showrunner name or session: address>`, unit directors whose `UnderShowrunner.address` matches that showrunner |
 | `--agents` | every worker and freestanding session, Claude and Codex |
 | `--workers` | every worker; after `--of <unit, director name, or session: address>`, workers whose `director` is `UnderDirector(<that director's address>)` |
 | `--top-level` | `roster.is_top_level` rows |
 
-- Selection is by identity: the sender is left out by `is_sender`, and unit membership by director address, never by name. `RunsProduction`, `DirectsUnit`, `ProductionWithoutRunningShowrunner` and `NoDirector` rows join no unit group.
+- `is_sender` excludes the sender by identity. Scoped groups select members by the director's or showrunner's address.
+- `RunsProduction`, `DirectsUnit`, `ProductionWithoutRunningShowrunner` and `NoDirector` rows join no unit worker group.
 - A row several flags select gets one delivery, carrying the last selecting flag's text, so a role flag after `--all` keeps its own text.
 - Each message is `<text>`, a blank line, and the closing line `Sent directly to <groups> on <machine> and <other machine>; do not pass it on.` (`on this machine` under `--here`).
 - Delivery is `send.py --to <address> --from <sender> --here --text ...` per `Messageable` row, 24 at once (`AT_ONCE`), never with action flags. A recipient gone since the roster read is a failed delivery here. A `CannotReceiveMessages` row prints `send.py`'s refusal line and is neither sent nor a failure.
 - Without `--here`, `ssh <other machine> env -u CODEX_THREAD_ID -u CLAUDE_CODE_SESSION_ID [BROADCAST_SEND=...] BROADCAST_CLOSING_MACHINES=... broadcast.py --here --from <sender> <same groups>` runs in parallel (120 s timeout); its lines print under `<host>: `. The replay spells an all-workers group `--all-workers` (accepted by `main`, absent from `USAGE`) so it does not inherit an earlier `--of`. ssh exit 255, a timeout, or a nonzero exit with no `NOT sent` line yields `<host>: NOT sent: <why>`.
 - `--of` is resolved once across both machines before any delivery: one director gives its machine and address; several give exit 2 with `<target> matches more than one unit director:` and their addresses; none gives `unknown unit <target>; known units:`. If the other machine is not reached, `--of` sends nothing: one `NOT sent` line, exit 1. `--of` without a following `--workers` is a usage error.
-- Output: `<shown name> [<address>] - <outcome>[: <detail>]`. The outcomes are `sent`, `no live session` and `NOT sent`. The address appears in brackets only when it differs from the shown name. The shown name includes the job, so there is no role column. A group with no member besides the sender prints `<group> - none on this machine` on each machine. The report ends with `<N> sent in <S> s` and the closing line. Exit 0 when nothing is `NOT sent`, 1 otherwise, 2 for usage. Roster problems print as `broadcast: roster: <problem>`; delivery to the other rows continues.
+- `--production` resolves a showrunner's staff name or session address across both machines before delivery.
+  An unknown or ambiguous target exits 2 and lists the known or matching showrunners.
+  Any roster problem on either machine stops the whole command before delivery.
+  The command prints one `NOT sent: <first problem>` line and exits 1.
+  Roster warnings permit delivery.
+  A scope without a later `--units` exits 2 with the usage line.
+  The closing line names `unit directors of <production>`.
+- Remote replay carries the resolved address and production through the internal `--resolved-production` spelling.
+  The replay also requires a roster without problems before delivery.
+  The internal `--all-units` spelling keeps an unscoped group independent of an earlier production scope.
+- Output: `<shown name> [<address>] - <outcome>[: <detail>]`. The outcomes are `sent`, `no live session` and `NOT sent`. The address appears in brackets only when it differs from the shown name. The shown name includes the job, so there is no role column. A group with no member besides the sender prints `<group> - none on this machine` on each machine. The report ends with `<N> sent in <S> s` and the closing line. Exit 0 when nothing is `NOT sent`, 1 otherwise, 2 for usage. Roster problems print as `broadcast: roster: <problem>`. Without a production scope, delivery to the other rows continues.
 - Library API: `broadcast(sender, texts: Mapping[BroadcastGroup, str], *, scope=ALL_MACHINES) -> list[Delivery]` runs the same orchestration as the command; `report(deliveries) -> bool`; `send(session, sender, text, *options) -> str` (empty on success). `codex_winddown.announce()` calls `broadcast.broadcast(sender, {Showrunners(): ..., UnitDirectors(): ...})` and `broadcast.report`.
 
 Callers: `/announce` (`--all`), `/unit:announce` (`--units`), `/showrunner:announce` (`--showrunners`), each on both machines, and `/codex_winddown`.

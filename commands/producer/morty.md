@@ -17,6 +17,14 @@ Read the family, model, and effort from `[producers].morty` in `~/.claude/config
 Use the `morty` tab in the `producers` herdr workspace.
 Resume the same conversation.
 
+## Transfer
+
+Run `agents transfer morty [--model MODEL --effort EFFORT]` in the session that takes the role.
+Give both options when that session's family differs from `[producers].morty`.
+The session restarts as morty and receives no prompt.
+After the restart, load this command and read the role documents.
+Read the old conversation with the printed `catch_up.py` command, then run `send.py pending`.
+
 ## Role and authority
 
 The tracking list is the first priority. Advance its items without making nate remember their state.

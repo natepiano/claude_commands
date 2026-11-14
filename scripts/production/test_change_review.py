@@ -894,6 +894,10 @@ class StampTest(unittest.TestCase):
             '  - "~/worktrees/demo-trunk/docs/plans/demo-production.md"', "showrunner: natedev", "---"])
 
 
+ADD_TIME = datetime(2026, 11, 13, 16, 20, tzinfo=ZoneInfo("America/New_York"))
+"""The clock that the add tests read: the Merged cell holds its date and time."""
+
+
 def run(*arguments: str) -> tuple[int, str, str]:
     """The command line's exit code, standard output and standard error."""
     output, error = io.StringIO(), io.StringIO()
@@ -1589,10 +1593,11 @@ class MergedAddTests(unittest.TestCase):
                    "--change", "Ready change", "--check", "Read", "--see", "The change", *options)
 
     def test_add_accepts_an_ancestor_of_origin_main(self) -> None:
-        self.assertEqual(self.add("--merged", self.merged), (0, "C81\n", ""))
+        with mock.patch.object(change_review, "now", return_value=ADD_TIME):
+            self.assertEqual(self.add("--merged", self.merged), (0, "C81\n", ""))
         row = change_review.pending(self.path)[-1]
         self.assertEqual(row["Change"], "Ready change")
-        self.assertEqual(row["Merged"], f"{change_review.today().isoformat()} · {self.merged}")
+        self.assertEqual(row["Merged"], f"2026-11-13 16:20 · {self.merged}")
 
     def assert_merge_refused(self, merged: str) -> None:
         before = self.path.read_bytes()
@@ -1612,10 +1617,11 @@ class MergedAddTests(unittest.TestCase):
 
     def test_add_without_merged_does_not_require_a_repository(self) -> None:
         self.repo = self.root / "not-a-repository"
-        self.assertEqual(self.add(), (0, "C81\n", ""))
+        with mock.patch.object(change_review, "now", return_value=ADD_TIME):
+            self.assertEqual(self.add(), (0, "C81\n", ""))
         row = change_review.pending(self.path)[-1]
         self.assertEqual(row["Change"], "Ready change")
-        self.assertEqual(row["Merged"], change_review.today().isoformat())
+        self.assertEqual(row["Merged"], "2026-11-13 16:20")
 
 
 class ChangeIdentityTests(unittest.TestCase):
@@ -1782,13 +1788,14 @@ class ActionTest(unittest.TestCase):
     def test_add_takes_the_next_number_and_fills_the_mac_build_column_only_where_the_table_has_one(self) -> None:
         repo, *commits = origin_commits(self.path.parent)
         merged = commits[-1][:8]
-        self.assertEqual(run("add", "--repo", str(repo), "--production", DOC, "--list", str(self.path), "--change", "Tabs | spaces", "--check", "Look", "--see", "It",
-                             "--merged", merged), (0, "C81\n", ""))
-        day = change_review.today().isoformat()
-        self.assertIn(f"| C81 | Tabs \\| spaces | {day} · {merged} | not yet | Look. You see: It | {DEMO_ID} |  |\n\n## Questions",
+        with mock.patch.object(change_review, "now", return_value=ADD_TIME):
+            self.assertEqual(run("add", "--repo", str(repo), "--production", DOC, "--list", str(self.path), "--change", "Tabs | spaces", "--check", "Look",
+                                 "--see", "It", "--merged", merged), (0, "C81\n", ""))
+        self.assertIn(f"| C81 | Tabs \\| spaces | 2026-11-13 16:20 · {merged} | not yet | Look. You see: It | {DEMO_ID} |  |\n\n## Questions",
                       self.path.read_text(encoding="utf-8"))
-        self.assertEqual(run("add", "--production", DOC, "--list", str(self.fresh), "--change", "A", "--check", "B", "--see", "C")[1], "C1\n")
-        self.assertIn(f"| C1 | A | {day} | B. You see: C |", self.fresh.read_text(encoding="utf-8"))
+        with mock.patch.object(change_review, "now", return_value=ADD_TIME):
+            self.assertEqual(run("add", "--production", DOC, "--list", str(self.fresh), "--change", "A", "--check", "B", "--see", "C")[1], "C1\n")
+        self.assertIn("| C1 | A | 2026-11-13 16:20 | B. You see: C |", self.fresh.read_text(encoding="utf-8"))
 
     def test_add_refuses_a_second_row_for_the_same_merge_and_change_in_a_short_or_long_hash(self) -> None:
         repo, first, second = origin_commits(self.path.parent)

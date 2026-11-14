@@ -65,7 +65,7 @@ class Arguments(argparse.Namespace):
     new_worker: str = ""
     model: str = ""
     effort: str = ""
-    summary: str = ""
+    reply_file: str = ""
     log: str = ""
     fix_cause: str = ""
     paths: str = ""
@@ -112,7 +112,17 @@ def call(command: list[str], env: dict[str, str], *, capture: bool = False,
     return result
 
 
+def absolute_reply_file(value: str) -> str:
+    if not Path(value).is_absolute():
+        print(f"assign: --reply-file takes an absolute path to the reply file, not text: {value}", file=sys.stderr)
+        raise SystemExit(2)
+    return value
+
+
 def parse_arguments() -> Arguments:
+    if any(argument.partition("=")[0] == "--summary" for argument in sys.argv[1:]):
+        print("assign: --summary was renamed to --reply-file; give an absolute path to the reply file", file=sys.stderr)
+        raise SystemExit(2)
     parser = argparse.ArgumentParser(prog="assign.sh", allow_abbrev=False)
     _ = parser.add_argument("--role", required=True,
                             choices=("implement", "test", "fix", "review", "research", "propose", "simplify"))
@@ -124,9 +134,10 @@ def parse_arguments() -> Arguments:
     choice = parser.add_mutually_exclusive_group()
     _ = choice.add_argument("--to", default="")
     _ = choice.add_argument("--new-worker", default="")
-    for option in ("model", "effort", "summary", "log", "fix-cause", "paths", "phase", "early-ready", "session-dir",
+    for option in ("model", "effort", "log", "fix-cause", "paths", "phase", "early-ready", "session-dir",
                    "style-since", "style-until"):
         _ = parser.add_argument("--" + option, default="")
+    _ = parser.add_argument("--reply-file", type=absolute_reply_file, default=argparse.SUPPRESS)
     _ = parser.add_argument("--completion-actions", default="{}")
     _ = parser.add_argument("--prompt", default="")
     _ = parser.add_argument("--cwd", default=str(Path.cwd()))
@@ -402,8 +413,8 @@ def settle_dispatch(dispatch: AssignmentResult, code: int, completed: bool, show
     record_review(dispatch, completed, summary)
     if shown not in summary.read_text():
         _ = summary.write_text(shown + "\n\n" + summary.read_text())
-    if dispatch.args.summary:
-        _ = Path(dispatch.args.summary).write_text(summary.read_text())
+    if dispatch.args.reply_file:
+        _ = Path(dispatch.args.reply_file).write_text(summary.read_text())
     if not 3 <= code <= 8:
         if dispatch.role == "fix" and dispatch.env.get("UNIT_RESOLVES_ROUND") == "1":
             if not finish_repair(dispatch, 0 if completed else code or 1):
@@ -495,7 +506,7 @@ def execute_herdr(args: Arguments, run: Path, phase: str, prompt: Path,
     number = sum(entry.get("event_type") == "pass_started" for entry in recorded_passes(run)) + 1
     write_text_atomic(directory / f"dispatch_{number}_paths.json",
                       json.dumps({"worker": slot, "round": number, "paths": paths}))
-    actions = progress_history.CompletionActions(str(summary), str(status), args.summary,
+    actions = progress_history.CompletionActions(str(summary), str(status), args.reply_file,
         str(style.directory) if isinstance(style, StyleAssignment) else "",
         resolve_fix=role == "fix" and env.get("UNIT_RESOLVES_ROUND") == "1", review_pass=args.pass_number)
     command += ["--launcher-command", json.dumps(launcher), "--completion-actions", json.dumps(asdict(actions))]
@@ -644,7 +655,7 @@ def execute_consultation(args: Arguments, cwd: Path) -> int:
         home = Path(herdr.process_environment(process.pid).get("CODEX_HOME") or Path.home() / ".codex")
         source = worker_admission.codex_transcript_source(thread, home)
         reply = staff_worker.consultation_reply(client, current.pane, source, question)
-        write_text_atomic(Path(args.summary), reply + "\n")
+        write_text_atomic(Path(args.reply_file), reply + "\n")
         result = 0
     except side_pane.SidePaneRefused as error:
         print(str(error), file=sys.stderr)
@@ -683,7 +694,7 @@ def execute_durable(args: Arguments) -> int:
         refuse("durable dispatch requires --prompt, --session-dir, and --phase")
     result = staff_worker.dispatch(target.parent, name, role, prompt, session_dir=Path(args.session_dir),
         slot=name.value, phase=args.phase, kind="astra",
-        reply=Path(args.summary) if args.summary else staff_worker.REPLY_BESIDE_PROMPT, policy=policy,
+        reply=Path(args.reply_file) if args.reply_file else staff_worker.REPLY_BESIDE_PROMPT, policy=policy,
         completion_actions=progress_history.dispatch_delivery({"delivery": {"actions": cast(object, json.loads(args.completion_actions))}}).actions,
         launcher_command=launcher_command())
     return result
@@ -730,7 +741,7 @@ def execute_astra_review_herdr(args: Arguments, run: Path, cwd: Path, prompt: Pa
                 return 1
             result = staff_worker.dispatch(target.parent, target.name, target.role, prompt,
                 session_dir=run, slot=args.new_worker, phase="astra-review", kind="astra",
-                reply=Path(args.summary), policy=policy, started=current,
+                reply=Path(args.reply_file), policy=policy, started=current,
                 completion_actions=progress_history.CompletionActions(end_worker=True, held_role=role["staff_id"],
                     finish_phase="astra-review", finish_run=True),
                 launcher_command=launcher_command(), on_submission=cleanup.pop_all, lock=hold, notices=notices)

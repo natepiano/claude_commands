@@ -88,7 +88,8 @@ type; `--see` is what the person then sees. Example: `--change "The Units table
 shows each unit's phase" --check "In a showrunner session on natedev, type
 /showrunner:units" --see "Each row has a Phase column"`. The row's How to
 check cell is `<how to try it> You see: <what you see>`. Pass `--merged` when a
-commit holds the change. It prints the new row's id, such as `C12`.
+commit holds the change. The Merged cell holds the date and time of the add, in the
+user's zone, then the commit: `2026-11-13 16:20 · 31770c75`. It prints the new row's id, such as `C12`.
 
 ## list-ready and live
 
@@ -191,10 +192,9 @@ It combines these needs with cached system comparisons without duplicate machine
 
 The Changes tab contains every waiting change.
 Each card starts with its 20px title; section labels use 17px text.
-One closed Details disclosure holds the ID, date, commit, and kind, with 16px space after the title.
-How to check or Proof stays in the main view.
-Works and Does not work are the main actions.
-Ask showrunner to check, Ask a question, and Send feedback are secondary actions.
+How to check or Proof follows the title.
+Works, Does not work, Ask showrunner to check, Ask a question, Send feedback, and Skip for now share one wrapping row.
+Aligned lines under the buttons always show `change`, `date`, `time`, `commit`, and `kind`; an unknown value has no line.
 The Does not work button submits `not works` and saves `not works: <text>` when the user supplies text.
 An open Production cell holds the unit's fixed staff id or the showrunner's fixed staff id.
 The reader follows a unit's current staff parent and displays current names.
