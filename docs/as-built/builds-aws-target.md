@@ -208,10 +208,56 @@ It must distinguish a completed request from an unresolved request before report
 The provider refreshes bootstrap access before a demand start.
 It must verify root receiver responses against deployment and demand-start identities.
 It must install a renewed generation and permit together before acknowledging publication.
-Phase D2 supplies the concrete AWS and root receiver transport with approved setup.
-The D1 default refuses provider calls for a registered deployment until that transport exists.
+`hana_provider.AwsHanaProvider` supplies the concrete AWS provider.
+The controller constructs it with the scaler profile and a sanitized credential environment.
 An unprovisioned tick makes no provider call.
-D1 adds no setup command, resource, target registration, or placement activation.
+`Deployment.prepare_hana` and `Deployment.hana_setup` in `deploy.py` prepare and provision a separate Hana stack through the existing deployment helpers.
+The user runs `prepare --workload hana`, then `hana-setup --approve-resources`.
+Without approval, `hana-setup` prints only its local plan.
+The existing preparation writer, preflight verifier, encrypted admin executor, stack waiter, and progress display serve both workloads.
+The separate template is `docs/plans/builds-aws/hana-cloudformation.json`.
+It creates a retained data volume, retained root disk, launch template, persistent Spot instance, security group, private control bucket, and scaler policy.
+Its Spot interruption behavior is `stop`.
+Setup uses Hana sizes and prices from `config/hana_aws.conf`.
+It reserves setup costs within both account and workload limits before the stack request.
+`reserve_setup()` permits only approved resource setup while placement remains disabled.
+It does not permit demand starts or guest command admission.
+Setup resumes an existing stack through reads before another mutation.
+It refuses changed resource inputs or an expired reservation before another stack request.
+It registers the deployment only after the Spot request and stopped state match.
+Setup adds no route, target, or slot capacity.
+
+The provider maps every remote operation through `PROVIDER_OPERATIONS`.
+A policy test derives its required IAM actions from that mapping.
+Start and stop actions require this deployment's Hana instance tags.
+User-data changes also require `ec2:Attribute=userData`.
+EC2 describe actions use the required wildcard resource.
+Object reads and writes apply only to this deployment's control prefix.
+No guest instance role or SSH key is created.
+Every provider AWS request uses the configured `aws_timeout_s` bound.
+Provider errors expose safe action names rather than cloud identifiers or signed URLs.
+
+The provider persists its operation before dispatch and holds a separate mutation lock.
+Recovery takes that lock without blocking an active mutation.
+Recovery fences an operation that has not reached dispatch.
+A late worker cannot dispatch that fenced operation.
+A successful remote response remains saved when the controller response is lost.
+Recovery verifies lost bootstrap writes through `DescribeInstanceAttribute`.
+A lost start remains unresolved while the observed instance is stopped.
+A pending, running, or stopping instance confirms that the start reached EC2.
+Permit recovery remains unresolved until the permit deadline passes.
+No recovery call starts the instance or publishes another permit.
+
+The root receiver reads signed control objects and writes scoped acknowledgements.
+Each demand start has new signed URLs and a separate control prefix.
+The provider writes those URLs only into private runtime files and EC2 user data.
+The root receiver verifies the deployment, demand start, current boot, prior generation, and permit deadline.
+It acknowledges only an installed permit.
+The guest shutdown fence rejects renewals.
+The image must deny non-root IMDS access because user data contains runtime signed URLs.
+The image must install the guard, watchdog, data mount, receiver, and runtime settings before setup.
+The Natedev owner must provide that reviewed image through the separate `/etc/nixos` workflow.
+The empty image and network settings prevent setup before that image review.
 
 | New setting | Value | Reason |
 | --- | --- | --- |
@@ -704,3 +750,20 @@ The service uses no new signal handler.
 It includes the GPU driver, runtime, archive extraction, and two test runs.
 The service reserves the configured maximum compute cost plus `gpu_size_trial_box_extra_usd` for each box.
 The default extra is USD0.05.
+
+
+### Hana setup configuration
+
+Existing configuration values remain unchanged.
+
+| New key | Value | Reason |
+| --- | --- | --- |
+| `stack_name` | `hana-build` | Keep Hana resources separate from gate resources. |
+| `availability_zone` | `us-east-2b` | Keep the retained disk in one zone. |
+| `ami_id` | Empty | Require the reviewed Hana safety image. |
+| `ami_owner_id` | Empty | Require the reviewed image owner. |
+| `vpc_id` | Empty | Require an explicit network. |
+| `subnet_id` | Empty | Require an explicit public subnet in the disk zone. |
+| `aws_timeout_s` | `10` | Bound each provider and receiver request. |
+| `control_url_seconds` | `3600` | Bound signed access for one boot. |
+| `control_poll_seconds` | `1` | Read current permission before the watchdog interval ends. |
