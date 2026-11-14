@@ -11,6 +11,10 @@ The first line is `MAC IDLE` when no natedev build or test runs on the Mac for t
 - `free`: start work through its normal gate.
 - `running`: let the named job finish. The Mac lists each repository claim with its job and start time. `/build:mac status` shows remote work that remains after its owner exits. Confirm that the remote work ended. Read the identity fields from the claim record. Run `~/.claude/scripts/lib/py ~/.claude/scripts/mac_test/mac_test.py release --pid <pid> --claim-id <claim_id> --episode <episode> --attempt <attempt>`.
   Claims and holds with a known holder session add ` (showrunner <name>, unit <name>)` after `since <time>`. Missing relationships show `—`; an unknown holder or failed lookup keeps the original line.
-- `held`: wait for the named holder or release your own with `/build:hold release [target mac]`. A Mac hold past expiry remains until its block file is removed; use `/build:mac unblock`, after `github-warmup` if CI restore failed.
+- `held`: wait for the named holder or release your own with `/build:hold release`. A Mac hold past expiry remains until its block file is removed; use `/build:mac unblock`, after `github-warmup` if CI restore failed.
 - `unreachable`: run `/build:status --probe` to check the connection, then restore access before retrying Mac work.
-- `state unreadable`: inspect the named path. For `~/.local/state/build-hold/`, ask the holder to repeat `/build:hold hold <why>` or release the hold. `/build:hold release` sets a damaged release record aside. For a damaged Mac claim file, check its holder and any running job before you repair or remove it. Use `/build:mac block` or `unblock` for a block. Release a readable kept claim with `mac_test.py release --pid <pid> --claim-id <claim_id> --episode <episode> --attempt <attempt>`.
+- `state unreadable`: inspect the named path. Repair your natedev record with `/build:hold clear <why>`, or release it.
+  `/build:hold release` sets a damaged release record aside.
+  Check a damaged Mac claim's holder and running job before repairing its file.
+  Use `/build:mac block` or `/build:mac unblock` for a Mac block.
+  Release a readable claim with `mac_test.py release --pid <pid> --claim-id <claim_id> --episode <episode> --attempt <attempt>`.

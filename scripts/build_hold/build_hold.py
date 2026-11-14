@@ -11,6 +11,7 @@ import argparse
 import fcntl
 import json
 import os
+import pwd
 import re
 import shlex
 import subprocess
@@ -32,7 +33,7 @@ from scripts.lib.process_failure import failure_detail
 from scripts.lib.user_zone import user_zone
 from scripts.build_hold import owning_session as session_owner
 from scripts.build_hold import override_guard
-from scripts.build_targets.target_config import ConfigError, SshTarget, read_targets
+from scripts.build_targets.target_config import ConfigError, SshTarget, command_target_name, read_targets
 
 from scripts.message import session_send
 
@@ -575,7 +576,11 @@ class HoldEnforcer(Protocol):
                     claimed: frozenset[ProcessIdentity]) -> bool: ...
     def start(self) -> None: ...
     def drain(self, holder: Holder, proc_root: Path = PROC_ROOT) -> int: ...
-    def working_drain_identities(self, proc_root: Path) -> tuple[ProcessIdentity, ...]: ...
+    def clear_queued_runs(self, proc_root: Path) -> None: ...
+    def record_clear_cutoff(self, identity: HolderIdentity, since: datetime) -> None: ...
+    def drain_identities(self, proc_root: Path, identity: HolderIdentity) -> tuple[ProcessIdentity, ...]: ...
+    def wait_for_kept_runs(self, holder: Holder, proc_root: Path) -> int: ...
+    def ci_placement_lines(self, proc_root: Path) -> list[str]: ...
     def record_build(self, build: AuditedBuild, holder: Holder, proc_root: Path,
                      action: Literal["audit", "stopped"]) -> None: ...
     def report(self, proc_root: Path, directory: Path, *, drain: bool = False) -> list[str]: ...
@@ -858,6 +863,41 @@ def holder_text(holder: Holder) -> str:
     return f"{holder.name} (for {holder.purpose}, release eta {release_eta_text(holder.release)})"
 
 
+def live_kept_runs(holder: Holder, proc_root: Path = PROC_ROOT) -> tuple[ProcessIdentity, ...]:
+    """Count only kept identities whose process start times still match."""
+    return tuple(item for item in dict.fromkeys(holder.keep)
+                 if process_start_time(item.pid, proc_root) == item.start_time)
+
+
+def holder_state(holder: Holder, proc_root: Path = PROC_ROOT) -> str:
+    remaining = len(live_kept_runs(holder, proc_root))
+    return f"draining ({remaining} runs left)" if remaining else "held"
+
+
+def ci_process(pid: int, start_time: str, proc_root: Path) -> bool:
+    """Recognize a CI worker lineage without reading private process details."""
+    lineage = caller_processes(proc_root, pid)
+    if ProcessIdentity(pid, start_time) not in lineage:
+        return False
+    for identity in lineage:
+        directory = proc_root / str(identity.pid)
+        try:
+            if (directory / "comm").read_text().strip() == "Runner.Worker":
+                return True
+        except OSError:
+            pass
+        try:
+            if pwd.getpwuid(directory.stat().st_uid).pw_name == "hana-linux":
+                return True
+        except (OSError, KeyError):
+            pass
+    return False
+
+
+def ci_placement_lines(proc_root: Path) -> list[str]:
+    return hold_enforcer().ci_placement_lines(proc_root)
+
+
 def resume_refusal(holders: tuple[Holder, ...]) -> str:
     return ("a hold is in force (" + "; ".join(holder_text(holder) for holder in holders)
             + "); --resume only continues a release already begun. Release that hold without --resume.")
@@ -891,7 +931,8 @@ HoldFileRecord = TypedDict("HoldFileRecord", {
 
 
 def write_hold(directory: Path, identity: HolderIdentity, purpose: str, request: ReleaseRequest, now: datetime,
-               keep: Sequence[ProcessIdentity] = (), *, drain: bool = False) -> str:
+               keep: Sequence[ProcessIdentity] = (), *,
+               before_publish: Callable[[], None] | None = None) -> str:
     """Keep a hold under its resolved key and display name."""
     if not purpose.strip() or "\n" in purpose:
         raise ValueError("hold purpose must be one line of text")
@@ -911,13 +952,14 @@ def write_hold(directory: Path, identity: HolderIdentity, purpose: str, request:
     }
     temporary = directory.parent / f"{directory.name}.{path.name}.tmp"
     _ = temporary.write_text(json.dumps(record, ensure_ascii=False) + "\n")
+    if before_publish is not None:
+        before_publish()
     os.replace(temporary, path)
-    waiting = ("The drain stops waiting runs. An app launch is refused until the release, "
-               if drain else "verify.sh waits by itself; an app launch is refused until the release, ")
-    return (f"natedev is held for {purpose.strip()}. {waiting}"
-            "so launch again after it. Tests that can run on the Mac keep running there. "
-            "Every other test and build is stopped with the reason, including runs already started. "
-            "Use --keep <pid> to keep a run and its children. Stopped sessions get a release notice; run again then. "
+    return (f"natedev is held for {purpose.strip()}. "
+            "Existing queued runs and running work outside the allow rules stop. "
+            "New natedev work waits until release. "
+            "Kept runs and their children continue. Eligible tests can use the Mac. "
+            "Stopped sessions get a release notice. Repeat stopped work after release. "
             "No release after 2 h: ask me.")
 
 
@@ -1385,7 +1427,8 @@ def open_cycle(now: datetime) -> HoldCycle:
 
 
 def start_hold(directory: Path, identity: HolderIdentity, purpose: str, request: ReleaseRequest, now: datetime,
-               keep: Sequence[ProcessIdentity] = (), *, drain: bool = False) -> str:
+               keep: Sequence[ProcessIdentity] = (), *,
+               before_publish: Callable[[], None] | None = None) -> str:
     with release_lock():
         at = datetime.now(timezone.utc)
         new_hold = not holder_path(directory, identity.key).is_file()
@@ -1393,7 +1436,8 @@ def start_hold(directory: Path, identity: HolderIdentity, purpose: str, request:
             cycle = open_cycle(now)
         else:
             cycle = read_cycle_for_change()
-        notice = write_hold(directory, identity, purpose, request, now, keep, drain=drain)
+        notice = write_hold(directory, identity, purpose, request, now, keep,
+                            before_publish=before_publish)
         if new_hold:
             record_hold_event("began", read_holder(holder_path(directory, identity.key)), at)
         if not isinstance(cycle, (NoCycle, DamagedRecordSetAside)):
@@ -1708,26 +1752,30 @@ def wait_for_quiet(
 
 def main(arguments: list[str]) -> int:
     override_guard.refuse_overrides(Path(__file__), "build_hold/build_hold.py")
-    if arguments[:1] in (["hold"], ["release"]) and len(arguments) >= 3 and arguments[-2] == "target":
-        arguments = [*arguments[:-2], "--target", arguments[-1]]
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="action", required=True)
-    hold = commands.add_parser("hold")
-    _ = hold.add_argument("--holder")
-    _ = hold.add_argument("--for", dest="purpose", required=True)
-    _ = hold.add_argument("--release-eta")
-    _ = hold.add_argument("--zone")
-    _ = hold.add_argument("--target", type=parse_hold_target, default="natedev")
-    _ = hold.add_argument("--proc-root", type=Path, default=PROC_ROOT)
-    _ = hold.add_argument("--keep", type=int, action="append", default=[])
-    _ = hold.add_argument("--drain", action="store_true",
-                          help="stop waiting gate runs and wait for working runs; INT keeps the hold")
+    clear = commands.add_parser("clear")
+    _ = clear.add_argument("--holder")
+    _ = clear.add_argument("--for", dest="purpose", required=True)
+    _ = clear.add_argument("--release-eta")
+    _ = clear.add_argument("--zone")
+    _ = clear.add_argument("target", nargs="?")
+    _ = clear.add_argument("--proc-root", type=Path, default=PROC_ROOT)
+    _ = clear.add_argument("--keep", type=int, action="append", default=[])
+    drain = commands.add_parser("drain")
+    _ = drain.add_argument("--holder")
+    _ = drain.add_argument("--for", dest="purpose", required=True)
+    _ = drain.add_argument("--release-eta")
+    _ = drain.add_argument("--zone")
+    _ = drain.add_argument("target", nargs="?")
+    _ = drain.add_argument("--proc-root", type=Path, default=PROC_ROOT)
+    _ = drain.add_argument("--keep", type=int, action="append", default=[])
     quiet = commands.add_parser("quiet")
     _ = quiet.add_argument("--max-wait", type=float, default=600)
     release = commands.add_parser("release")
     _ = release.add_argument("--holder")
     _ = release.add_argument("--resume", action="store_true")
-    _ = release.add_argument("--target", type=parse_hold_target, default="natedev")
+    _ = release.add_argument("target", nargs="?")
     _ = commands.add_parser("wait")
     recipient = commands.add_parser("record-recipient")
     _ = recipient.add_argument("--session-id", required=True)
@@ -1738,8 +1786,16 @@ def main(arguments: list[str]) -> int:
     options = parser.parse_args(arguments)
     try:
         action = cast(str, options.action)
-        if action in {"hold", "release"}:
-            target = cast(HoldTarget, options.target)
+        if action in {"clear", "drain", "release"}:
+            try:
+                target_name = command_target_name(cast(str | None, options.target))
+            except (ConfigError, OSError, UnicodeError) as error:
+                print(f"target configuration cannot be read: {error}")
+                return 2
+            if target_name != "natedev":
+                print(f"{action} {target_name} is not supported yet")
+                return 2
+            target = parse_hold_target(target_name)
             if isinstance(target, UnknownHoldTarget):
                 print(f"unknown target {target.name}; configured targets: {', '.join(target.configured)}")
                 return 2
@@ -1748,10 +1804,11 @@ def main(arguments: list[str]) -> int:
                 return 2
             if isinstance(target, (MacHoldTarget, ConfiguredSshHoldTarget)):
                 target_name = "mac" if isinstance(target, MacHoldTarget) else target.name
+                if action == "drain":
+                    print(f"drain is not supported with --target {target_name}")
+                    return 2
                 refused: list[str] = []
-                if action == "hold":
-                    if cast(bool, options.drain):
-                        refused.append("--drain")
+                if action == "clear":
                     if cast(list[int], options.keep):
                         refused.append("--keep")
                     if cast(object, options.release_eta) is not None:
@@ -1764,13 +1821,46 @@ def main(arguments: list[str]) -> int:
                     print(f"{refused[0]} is not supported with --target {target_name}")
                     return 2
                 identity = holder_of(cast(str | None, options.holder))
-                if action == "hold":
+                if action == "clear":
                     command = ["block", "--holder", identity.key, "--for", cast(str, options.purpose)]
                     result = run_mac_hold(command, target_name)
                 else:
                     result = release_mac_hold(identity, target_name)
                 return print_mac_hold_result(result)
-        if action == "hold":
+        if action == "drain":
+            request = release_request(cast(str | None, options.release_eta), cast(str | None, options.zone))
+            identity = holder_of(cast(str | None, options.holder))
+            proc_root = cast(Path, options.proc_root)
+            kept: list[ProcessIdentity] = []
+            for pid in cast(list[int], options.keep):
+                start = process_start_time(pid, proc_root)
+                if not start:
+                    raise ValueError(f"--keep {pid}: no live process with a start time")
+                kept.append(ProcessIdentity(pid, start))
+            kept.extend(hold_enforcer().drain_identities(proc_root, identity))
+            purpose = cast(str, options.purpose)
+            now = datetime.now(timezone.utc)
+            publication_bound = 0
+
+            def record_publication_bound() -> None:
+                nonlocal publication_bound
+                publication_bound = time.clock_gettime_ns(time.CLOCK_BOOTTIME) * os.sysconf("SC_CLK_TCK") // 1_000_000_000
+
+            _ = start_hold(holder_directory(), identity, purpose, request, now, kept,
+                           before_publish=record_publication_bound)
+            kept = [run for run in hold_enforcer().drain_identities(proc_root, identity)
+                    if int(run.start_time) < publication_bound]
+            with release_lock():
+                if not holder_path(holder_directory(), identity.key).is_file():
+                    print("the hold was released; drain ends", flush=True)
+                    return 0
+                _ = write_hold(holder_directory(), identity, purpose, request, now, kept)
+            print(f"natedev is draining for {purpose}. Existing runs finish; new natedev work waits until release.",
+                  flush=True)
+            hold_enforcer().start()
+            return hold_enforcer().wait_for_kept_runs(
+                read_holder(holder_path(holder_directory(), identity.key)), proc_root)
+        elif action == "clear":
             request = release_request(cast(str | None, options.release_eta), cast(str | None, options.zone))
             identity = holder_of(cast(str | None, options.holder))
             keep: list[ProcessIdentity] = []
@@ -1780,15 +1870,16 @@ def main(arguments: list[str]) -> int:
                 if not start:
                     raise ValueError(f"--keep {pid}: no live process with a start time")
                 keep.append(ProcessIdentity(pid, start))
-            if cast(bool, options.drain):
-                keep.extend(hold_enforcer().working_drain_identities(proc_root))
+            now = datetime.now(timezone.utc)
+
+            def record_clear_cutoff() -> None:
+                hold_enforcer().record_clear_cutoff(identity, now)
+
             print(start_hold(holder_directory(), identity, cast(str, options.purpose), request,
-                             datetime.now(timezone.utc), keep, drain=cast(bool, options.drain)))
+                             now, keep, before_publish=record_clear_cutoff))
             hold_enforcer().start()
-            print_hold_audit(holder_directory(), cast(Path, options.proc_root), beginning=True,
-                             drain=cast(bool, options.drain))
-            if cast(bool, options.drain):
-                return hold_enforcer().drain(read_holder(holder_path(holder_directory(), identity.key)), proc_root)
+            print_hold_audit(holder_directory(), proc_root, beginning=True)
+            hold_enforcer().clear_queued_runs(proc_root)
         elif action == "quiet":
             verdict = wait_for_quiet(cast(float, options.max_wait))
             if isinstance(verdict, Busy):
@@ -1843,9 +1934,11 @@ def main(arguments: list[str]) -> int:
                 print("no build hold")
             else:
                 for holder in state.holders:
-                    print(f"{holder.name} since {holder.since.astimezone(user_zone()):%H:%M %Z}, for {holder.purpose} - release eta: {release_eta_text(holder.release)}")
+                    print(f"{holder.name} since {holder.since.astimezone(user_zone()):%H:%M %Z}, for {holder.purpose} - release eta: {release_eta_text(holder.release)} - {holder_state(holder, cast(Path, options.proc_root))}")
                     for run in holder.keep:
                         print(f"  kept by {holder.name}: pid {run.pid}, start {run.start_time}")
+                for line in ci_placement_lines(cast(Path, options.proc_root)):
+                    print(line)
                 try:
                     cycle = read_cycle()
                 except ReleaseRecordReadError as error:

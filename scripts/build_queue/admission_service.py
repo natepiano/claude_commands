@@ -1273,6 +1273,29 @@ class AdmissionServer:
                     or isinstance(watch, ScopeWatch) and watch.episode not in self.reservations):
                 self._unwatch(descriptor)
 
+    def _ci_hold_reasons(self) -> dict[str, str]:
+        """Apply the existing hold policy to legacy CI admission requests."""
+        waiting = {episode: item for episode, item in self.waiters.items()
+                   if isinstance(item.request, ServiceEstimatedAdmission)}
+        if not waiting:
+            return {}
+        from scripts.build_hold import build_hold
+        from scripts.build_targets import build_targets
+
+        try:
+            directory = build_hold.holder_directory()
+            holds = build_hold.natedev_holds(directory)
+        except OSError as error:
+            return {episode: f"natedev hold state is unreadable: {error}" for episode in waiting}
+        reasons: dict[str, str] = {}
+        for episode, item in waiting.items():
+            owner = item.request.owner
+            lineage = build_targets.read_caller_lineage(self.proc.path, owner.pid, owner.start_time)
+            blocking = build_targets.hold_waited_on(holds, NoOwningSession(), directory, lineage)
+            if isinstance(blocking, build_hold.Holder):
+                reasons[episode] = f"natedev is held by {blocking.name} for {blocking.purpose}; waiting for release"
+        return reasons
+
     def _ordered_waiters(self) -> list[tuple[Path, records.RankedWaiter]]:
         rows: list[tuple[Path, records.RankedWaiter]] = []
         for waiting in self.waiters.values():
@@ -1755,6 +1778,11 @@ class AdmissionServer:
         self._settle_attempt_reports()
         self._prepare_placements()
         inputs = self._inputs(config, self.configuration.progress_profile_rank, self.configuration.peak_history_share_percent)
+        ci_holds = self._ci_hold_reasons()
+        if ci_holds:
+            held_owners = {records.waiter_owner(self.waiters[episode].row) for episode in ci_holds}
+            inputs = replace(inputs, ordered=[(path, row) for path, row in inputs.ordered
+                                             if records.waiter_owner(row) not in held_owners])
         preserve_override = self._override_pending_reconnect()
         if preserve_override:
             inputs = replace(inputs, override=records.NoHeadAdmissionOverride())
@@ -1796,6 +1824,15 @@ class AdmissionServer:
                 if waiting.last_reply != reply or inputs.now - waiting.last_sent >= config.wait_reply_seconds:
                     self._deliver(waiting, reply)
                     waiting.last_reply, waiting.last_sent = reply, inputs.now
+        for position, (episode, text) in enumerate(ci_holds.items(), len(result.rows) + 1):
+            waiting = self.waiters[episode]
+            reason = records.ReadingUnavailable(text)
+            decision = records.AdmissionDecision("hold", waiting.row["need"], 0, 0, 0, free_passes=False)
+            reply = wire.Wait(reason, position, "", text,
+                self._wait_snapshot(waiting, decision, inputs, config, reason, records.NoHolder()))
+            if waiting.last_reply != reply or inputs.now - waiting.last_sent >= config.wait_reply_seconds:
+                self._deliver(waiting, reply)
+                waiting.last_reply, waiting.last_sent = reply, inputs.now
         interval = (config.waiting_pass_seconds if self.waiters or any(self._placement_waiting(request)
                     for request in self.placement_requests.values()) else config.running_pass_seconds)
         self.next_pass = self.clock.monotonic() + interval
@@ -1922,6 +1959,14 @@ class AdmissionServer:
             return
         reading = replace(gate.queue_read_from_pass(self.last_inputs, self.last_policy, self.last_result),
                           diagnostics=self.last_diagnostics)
+        ci_holds = self._ci_hold_reasons()
+        if ci_holds:
+            held_steps = tuple(records.WaitingStep(row["pid"], row.get("session_id", ""), row.get("session_name", ""),
+                row.get("step", ""), row.get("folder", ""), row["since"], row["need"], records.ReadingUnavailable(text),
+                row.get("unit", "")) for episode, text in ci_holds.items() for row in (self.waiters[episode].row,))
+            reading = replace(reading, view=replace(reading.view, waiting=(*reading.view.waiting, *held_steps)),
+                ordered=[*reading.ordered, *((self.state_dir / records.waiter_owner(self.waiters[episode].row),
+                    gate.rank_waiter(self.waiters[episode].row, records.NormalOrder())) for episode in ci_holds)])
         reading = self._placement_reading(reading)
         reading = self._cloud_reading(reading, self.configuration)
         view = wire.ViewReply(reading)

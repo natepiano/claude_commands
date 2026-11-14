@@ -168,3 +168,15 @@ def configured_ssh_target(target: str) -> SshTarget:
             require_target_name(target)
             return configured
     raise ConfigError(f"unknown SSH target: {target}")
+
+
+def command_target_name(given: str | None) -> str:
+    """Resolve a positional target for clear, drain, or release."""
+    configuration = conf.read_or_repository("build_targets")
+    configured = read_targets(configuration.source)
+    selected = given if given is not None else configuration.text("default_target")
+    names = {target.name for target in configured}
+    names.update(key.removeprefix("sync.hosts.") for key in configuration.values() if key.startswith("sync.hosts."))
+    if selected != "all" and selected not in names:
+        raise ConfigError(f"unknown target {selected}; configured targets: {', '.join(target.name for target in configured)}")
+    return selected

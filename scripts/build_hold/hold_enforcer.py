@@ -20,6 +20,7 @@ import sys
 import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Literal, cast
 
@@ -32,7 +33,53 @@ from scripts.direct import step_record
 from scripts.buildlog import store
 from scripts.lib.boot_identity import boot_identity
 from scripts.lib.atomic_file import write_text_atomic
+from scripts.lib.user_zone import user_zone
 from scripts.lib.process_group import send_process_group
+
+
+def ci_placement_lines(proc_root: Path) -> list[str]:
+    """Name live local CI placements from the existing admission records."""
+    from scripts.build_queue import admission_service, admission_protocol as wire, placement
+    from scripts.buildlog import store
+
+    try:
+        state = admission_service.read_state(store.root() / "admission")
+    except FileNotFoundError:
+        return []
+    except (OSError, ValueError) as error:
+        return [f"CI placements unreadable: {error}"]
+    rows: dict[str, tuple[str, str, datetime, int]] = {}
+    for episode, record in state.reservations.items():
+        if not isinstance(record.place, wire.LocalPlace):
+            continue
+        if (build_hold.process_start_time(record.owner.pid, proc_root) == record.owner.start_time
+                and build_hold.ci_process(record.owner.pid, record.owner.start_time, proc_root)):
+            rows[episode] = ("running", record.queue_waiter.get("session_name") or record.step,
+                             build_hold.aware_instant(record.admitted_at), record.owner.pid)
+    for episode, request in state.placement_requests.items():
+        if episode in rows or not build_hold.ci_process(request.owner.pid, request.owner.start_time, proc_root):
+            continue
+        saved = state.assignments.get(state.current_assignments.get(episode, ""))
+        if saved is not None:
+            if not isinstance(saved.state, placement.CurrentAssignment) or saved.assignment.destination.provider != "local":
+                continue
+            status, since = "running", saved.assignment.since
+        else:
+            if (not any(candidate.destination.provider == "local" for candidate in request.constraints.candidates)
+                    or any(item.assignment.episode == episode and isinstance(item.state, placement.ClosedAssignment)
+                           and item.state.reason in {"completed", "cancelled"} for item in state.assignments.values())):
+                continue
+            status, since = "queued", request.since
+        rows[episode] = (status, request.identity.name or request.identity.step or request.profile.step,
+                         datetime.fromtimestamp(since, timezone.utc), request.owner.pid)
+    for place in state.places.values():
+        if place.episode in rows or place.episode in state.placement_requests:
+            continue
+        if build_hold.ci_process(place.owner.pid, place.owner.start_time, proc_root):
+            rows[place.episode] = ("queued", place.queue_identity["session_name"] or place.queue_identity["step"],
+                datetime.fromtimestamp(place.since, timezone.utc), place.owner.pid)
+    return [f"  CI {status}: {name} since {since.astimezone(user_zone()):%Y-%m-%d %H:%M:%S %Z} (pid {pid})"
+            for status, name, since, pid in sorted(rows.values(), key=lambda row: (row[2], row[3]))]
 
 
 def admitted_processes() -> frozenset[build_hold.ProcessIdentity]:
@@ -166,6 +213,47 @@ def classify_drain_runs(
     return tuple(runs)
 
 
+def drain_identities(
+    proc_root: Path, identity: build_hold.HolderIdentity,
+) -> tuple[build_hold.ProcessIdentity, ...]:
+    """Keep existing gates, CI workers, and builds that the hold could stop."""
+    processes = build_hold.read_audit_processes(proc_root)
+    holder = build_hold.Holder(identity.name, datetime.now(timezone.utc), "drain",
+                               build_hold.UnknownReleaseEta(), identity.key)
+    claims = claimed_processes(proc_root)
+    claimed: frozenset[build_hold.ProcessIdentity] = (
+        claims.identities if isinstance(claims, build_hold.LiveClaims) else frozenset())
+    candidates = {decision.process.identity for decision in
+                  decide_builds(processes, (holder,), os.getuid(), os.getpid(), claimed)
+                  if isinstance(decision, WouldStopBuild)}
+    candidates.update(process.identity for process in processes.values()
+                      if is_waiting_gate(process) or process.command == "Runner.Worker"
+                      or process.executable == "Runner.Worker"
+                      or process.argv and Path(process.argv[0]).name == "Runner.Worker")
+    return tuple(process.identity for process in processes.values()
+                 if process.identity in candidates and not any(
+                     parent.identity in candidates for parent in build_hold.audit_ancestors(process, processes)))
+
+
+def wait_for_kept_runs(
+    holder: build_hold.Holder, proc_root: Path = build_hold.PROC_ROOT, *,
+    sleep: Callable[[float], None] = time.sleep, clock: Callable[[], float] = time.monotonic,
+) -> int:
+    """Wait for the kept identities without stopping any process."""
+    heartbeat = clock()
+    try:
+        while remaining := build_hold.live_kept_runs(holder, proc_root):
+            if clock() >= heartbeat:
+                print(f"draining: {len(remaining)} runs remain", flush=True)
+                heartbeat = clock() + 60
+            sleep(1)
+    except KeyboardInterrupt:
+        print("drain interrupted; the hold remains active", flush=True)
+        return 130
+    print("drained; natedev stays held until release", flush=True)
+    return 0
+
+
 def working_drain_identities(proc_root: Path) -> tuple[build_hold.ProcessIdentity, ...]:
     """Keep existing work through the enforcer when the drain hold starts."""
     processes = build_hold.read_audit_processes(proc_root)
@@ -236,6 +324,9 @@ def stop_waiting_run(
 
     process = run.process
     identity = process.identity
+    holders = (holder, *build_hold.natedev_holds(build_hold.holder_directory()).in_force)
+    if isinstance(keeping_holder(process, build_hold.audit_ancestors(process, processes), processes, holders), build_hold.Holder):
+        return RunIdentityChanged(run)
     if build_hold.process_start_time(identity.pid, proc_root) != identity.start_time:
         return RunIdentityChanged(run)
     detached = detached_run(process, processes)
@@ -243,6 +334,9 @@ def stop_waiting_run(
         return RunIdentityChanged(run)
     if isinstance(detached, DetachedRun):
         supervisor = detached.supervisor.identity
+        if isinstance(keeping_holder(detached.supervisor, build_hold.audit_ancestors(detached.supervisor, processes),
+                                     processes, holders), build_hold.Holder):
+            return RunIdentityChanged(run)
         if (build_hold.process_start_time(supervisor.pid, proc_root) != supervisor.start_time
                 or not supervisor_matches(supervisor_args(supervisor.pid, proc_root), detached.path, detached.supervisor.cwd)):
             return RunIdentityChanged(run)
@@ -286,12 +380,57 @@ def stop_waiting_run(
     if isinstance(detached, NoDetachedRun):
         for item in processes.values():
             if (process in build_hold.audit_ancestors(item, processes)
+                    and not isinstance(keeping_holder(item, build_hold.audit_ancestors(item, processes),
+                                                      processes, holders), build_hold.Holder)
                     and build_hold.process_start_time(item.identity.pid, proc_root) == item.identity.start_time):
                 try:
                     signal_process(item.identity.pid, signal.SIGTERM)
                 except ProcessLookupError:
                     pass
     return StoppedRun(run)
+
+
+def clear_queued_runs(proc_root: Path) -> None:
+    """Stop existing gates outside the hold's allow rules."""
+    try:
+        processes = read_processes(proc_root, os.getuid())
+        claims = claimed_processes(proc_root)
+    except (OSError, ValueError) as error:
+        print(f"Clear unavailable: {error}", file=sys.stderr)
+        return
+    if isinstance(claims, build_hold.ClaimsUnreadable):
+        print(f"claims unreadable; clear waits: {claims.reason}", file=sys.stderr)
+        return
+    holders = build_hold.natedev_holds(build_hold.holder_directory()).in_force
+    stop_queued_runs(processes, holders, os.getuid(), os.getpid(), claims.identities, proc_root)
+
+
+def stop_queued_runs(
+    processes: Mapping[int, build_hold.AuditProcess], holders: Sequence[build_hold.Holder],
+    uid: int, enforcer_pid: int, claimed: frozenset[build_hold.ProcessIdentity], proc_root: Path, *,
+    before: Mapping[str, int] | None = None,
+    stopped: set[build_hold.ProcessIdentity] | None = None,
+    signal_process: Callable[[int, int], None] = os.kill,
+) -> None:
+    """Apply the clear rule after checking claims and the current holder set."""
+    for decision in decide_builds(processes, holders, uid, enforcer_pid, claimed, drain=True):
+        if (not isinstance(decision, WouldStopBuild)
+                or not is_outermost_gate(decision.process, build_hold.audit_ancestors(decision.process, processes))):
+            continue
+        identity = decision.process.identity
+        if stopped is not None and identity in stopped:
+            continue
+        if before is not None and int(identity.start_time) >= before[decision.holder.key]:
+            continue
+        current = build_hold.natedev_holds(build_hold.holder_directory()).in_force
+        if current != tuple(holders):
+            return
+        result = stop_waiting_run(WaitingRun(decision.process, decision.owner), decision.holder, processes, proc_root,
+                                  signal_process=signal_process)
+        if isinstance(result, StoppedRun) and stopped is not None:
+            stopped.add(identity)
+        label = "stopped" if isinstance(result, StoppedRun) else "skipped"
+        print(f"{label}: pid {identity.pid}", flush=True)
 
 
 def drain(
@@ -383,14 +522,14 @@ BuildDecision = AllowedBuild | KeptBuild | WouldStopBuild
 
 @dataclass(frozen=True)
 class NotKept:
-    """No holder keeps this process or its step controller."""
+    """No holder keeps this process, its family, or its step controller."""
 
 
 def keeping_holder(
     process: build_hold.AuditProcess, ancestors: Sequence[build_hold.AuditProcess],
     processes: Mapping[int, build_hold.AuditProcess], holders: Sequence[build_hold.Holder],
 ) -> build_hold.Holder | NotKept:
-    """Check step controllers for the process and each ancestor."""
+    """Protect kept processes, their ancestors, their descendants, and their step controllers."""
     lineage = (process, *ancestors)
     for item in (process, *ancestors):
         call_id = item.environment.get("BUILDLOG_CALL_ID", "")
@@ -405,11 +544,43 @@ def keeping_holder(
     for holder in holders:
         if any(item.identity in holder.keep for item in lineage):
             return holder
+        for kept in holder.keep:
+            child = processes.get(kept.pid)
+            if (child is not None and child.identity == kept
+                    and process in build_hold.audit_ancestors(child, processes)):
+                return holder
     return NotKept()
 
 
 def state_directory() -> Path:
     return Path(os.environ.get("BUILD_HOLD_ENFORCER_DIR", str(Path.home() / ".local/state/build-hold-enforcer")))
+
+
+def clear_cutoff_path(key: str, since: datetime) -> Path:
+    hold_id = hashlib.sha256(json.dumps([key, since.isoformat()]).encode()).hexdigest()
+    return state_directory() / "clear-cutoffs" / f"{hold_id}.json"
+
+
+def record_clear_cutoff(identity: build_hold.HolderIdentity, since: datetime) -> None:
+    """Save the boot-relative cutoff before publishing the clear hold."""
+    before = time.clock_gettime_ns(time.CLOCK_BOOTTIME) * os.sysconf("SC_CLK_TCK") // 1_000_000_000
+    path = clear_cutoff_path(identity.key, since)
+    write_text_atomic(path, json.dumps({"boot_id": boot_identity(), "before": before}) + "\n")
+
+
+def read_clear_cutoff(holder: build_hold.Holder) -> int:
+    """Leave gates waiting if the cutoff is missing, invalid, or from another boot."""
+    try:
+        raw = cast(object, json.loads(clear_cutoff_path(holder.key, holder.since).read_text()))
+        if isinstance(raw, dict):
+            record = cast(dict[str, object], raw)
+            before = record.get("before")
+            if (record.get("boot_id") == boot_identity()
+                    and type(before) is int and before >= 0):
+                return before
+    except (OSError, ValueError):
+        pass
+    return 0
 
 
 def read_processes(
@@ -545,7 +716,7 @@ def protected_reason(
         # Missing, stale and unreadable records grant no permission.
         return ""
     if is_waiting_gate(process):
-        return "the drain stops waiting runs" if drain else "verify.sh or a suite runner waits at its own hold gate"
+        return "" if drain else "verify.sh or a suite runner waits at its own hold gate"
     if any(is_sccache_server(item) for item in (process, *ancestors)):
         return "sccache server compiles for the holder too"
     lineage = (process, *ancestors)
@@ -735,7 +906,8 @@ class StopBuildsAndTests:
              holders: Sequence[build_hold.Holder], enforcer_pid: int,
              claimed: frozenset[build_hold.ProcessIdentity]) -> None:
         root = build.stop_root
-        if root.identity in self.terminating or holds_claim(root, processes, claimed):
+        if (root.identity in self.terminating or holds_claim(root, processes, claimed)
+                or isinstance(keeping_holder(root, build_hold.audit_ancestors(root, processes), processes, holders), build_hold.Holder)):
             return
         ancestors = build_hold.audit_ancestors(build.process, processes)
         if isinstance(keeping_holder(build.process, ancestors, processes, holders), build_hold.Holder):
@@ -817,6 +989,7 @@ def run(
         except BlockingIOError:
             return 0
         claims_unreadable = False
+        cleared: set[build_hold.ProcessIdentity] = set()
         while True:
             holders = build_hold.natedev_holds(holder_directory).in_force
             if not holders:
@@ -833,6 +1006,9 @@ def run(
                 print("claims readable; enforcement resumes", file=sys.stderr)
             claims_unreadable = False
             claimed = claims.identities
+            before = {holder.key: read_clear_cutoff(holder) for holder in holders}
+            stop_queued_runs(processes, holders, uid, enforcer_pid, claimed, proc_root,
+                             before=before, stopped=cleared, signal_process=stopper.signal_process)
             stopper.kill_survivors(processes, holders, enforcer_pid, claimed)
             for decision in decide_builds(processes, holders, uid, enforcer_pid, claimed):
                 if isinstance(decision, WouldStopBuild):

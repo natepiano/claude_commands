@@ -487,6 +487,132 @@ class LocalHoldPlacementTests(unittest.TestCase):
                                     self.assertEqual(repeated.wait.holder, placement.ResourceHolderUnknown())
 
 
+    def test_ci_admission_waits_for_release_and_status_names_each_job(self) -> None:
+        from scripts.build_hold import build_hold
+        from contextlib import redirect_stdout
+
+        for draining in (False, True):
+            with self.subTest(draining=draining), AdmissionFixture() as fixture:
+                directory = fixture.root / "holders"
+                directory.mkdir()
+                ci_uid = os.getuid() + 10000
+                requests: list[wire.ServiceEstimateRequest] = []
+                for worker, job in ((110, "compile"), (120, "test")):
+                    write_process(fixture.proc.path, worker, start=str(worker * 10))
+                    _ = (fixture.proc.path / str(worker) / "comm").write_text("Runner.Worker\n")
+                    owner = fixture.account_owner(ci_uid)
+                    write_process(fixture.proc.path, owner.pid, parent=worker, start=owner.start_time)
+                    status = fixture.proc.path / str(owner.pid) / "status"
+                    _ = status.write_text(status.read_text() + f"Uid:\t{ci_uid}\t{ci_uid}\t{ci_uid}\t{ci_uid}\n")
+                    requests.append(replace(fixture.service_request(owner=owner, job=job),
+                        episode=f"uid:{ci_uid}:ci-{owner.pid}"))
+                with mock.patch.dict(os.environ, {"BUILD_HOLD_DIR": str(directory)}), \
+                     fixture.peer_account(ci_uid):
+                    fixture.allow_next_start()
+                    initial, = fixture.connect(requests[0]).replies()
+                    self.assertIsInstance(initial, wire.RunnerAdmitted)
+                    _ = (directory / "holder").write_text(json.dumps({
+                        "holder": "fixture", "since": "2026-11-13T12:00:00+00:00", "for": "private drain",
+                        "release_eta": "unknown",
+                        "keep": [{"pid": 110, "start_time": "1100"}] if draining else [],
+                    }))
+                    fixture.allow_next_start()
+                    waiting, = fixture.connect(requests[1]).replies()
+                    self.assertIsInstance(waiting, wire.Wait)
+                    assert isinstance(waiting, wire.Wait)
+                    self.assertIn("waiting for release", waiting.text)
+                    self.assertNotIn(requests[1].episode, fixture.server.reservations)
+                    _ = fixture.run_pass()
+                    view, = fixture.server.handle_request(wire.ViewRequest())
+                    assert isinstance(view, wire.ViewReply)
+                    self.assertIn(requests[1].owner.pid, [row.pid for row in view.reading.view.waiting])
+                    with mock.patch.object(build_hold, "print_hold_audit"), redirect_stdout(io.StringIO()) as output:
+                        self.assertEqual(build_hold.main(["status", "--proc-root", str(fixture.proc.path)]), 0)
+                    self.assertIn("CI running: hana CI · runner-a · compile since ", output.getvalue())
+                    self.assertIn("CI queued: hana CI · runner-a · test since ", output.getvalue())
+                    since = datetime.fromtimestamp(requests[1].since, ZoneInfo("UTC")).strftime("%Y-%m-%d %H:%M:%S UTC")
+                    self.assertIn(since, output.getvalue())
+                    self.assertIn("draining (1 runs left)" if draining else " - held", output.getvalue())
+                    if draining:
+                        owner = fixture.account_owner(ci_uid)
+                        write_process(fixture.proc.path, owner.pid, parent=110, start=owner.start_time)
+                        status = fixture.proc.path / str(owner.pid) / "status"
+                        _ = status.write_text(status.read_text() + f"Uid:\t{ci_uid}\t{ci_uid}\t{ci_uid}\t{ci_uid}\n")
+                        continued = replace(fixture.service_request(owner=owner, job="compile-next"),
+                                            episode=f"uid:{ci_uid}:ci-{owner.pid}")
+                        fixture.allow_next_start()
+                        reply, = fixture.connect(continued).replies()
+                        self.assertIsInstance(reply, wire.RunnerAdmitted)
+                    (directory / "holder").unlink()
+                    fixture.allow_next_start()
+                    _ = fixture.run_pass()
+                    self.assertIn(requests[1].episode, fixture.server.reservations)
+
+    def test_drain_keeps_another_users_ci_lineage_and_blocks_a_new_job(self) -> None:
+        from scripts.build_hold import build_hold
+        from scripts.build_hold.owning_session import NoOwningSession
+        from scripts.build_queue import placement
+        from scripts.mac_test.claim_state import WholeMacScope
+
+        with AdmissionFixture() as fixture:
+            directory = fixture.root / "holders"
+            directory.mkdir()
+            _ = (directory / "holder").write_text(json.dumps({
+                "holder": "fixture", "since": "2026-11-13T12:00:00+00:00", "for": "private drain",
+                "release_eta": "unknown", "keep": [{"pid": 110, "start_time": "1100"}],
+            }))
+            _ = (fixture.root / "build_targets.conf").write_text(
+                "targets=natedev\nkind.natedev=local\nplatform.natedev=linux\n")
+            for pid, parent in ((110, 1), (111, 110), (120, 1), (121, 120)):
+                write_process(fixture.proc.path, pid, parent=parent, start=str(pid * 10))
+                _ = (fixture.proc.path / str(pid) / "comm").write_text(
+                    "Runner.Worker" if pid in (110, 120) else "cargo")
+            original_stat, original_bytes = Path.stat, Path.read_bytes
+            ci_uid = os.getuid() + 1
+
+            def ci_stat(path: Path, *, follow_symlinks: bool = True) -> os.stat_result:
+                result = original_stat(path, follow_symlinks=follow_symlinks)
+                if path.parent == fixture.proc.path and path.name in {"110", "111", "120", "121"}:
+                    fields = list(result)
+                    fields[4] = ci_uid
+                    return os.stat_result(fields)
+                return result
+
+            def private_bytes(path: Path) -> bytes:
+                if path.parent.parent == fixture.proc.path and path.name in {"environ", "cmdline"}:
+                    raise PermissionError("hana-linux process details are private")
+                return original_bytes(path)
+
+            destination = placement.PlacementDestination("local", "natedev", fixture.server.host, WholeMacScope())
+            fixture.server.host_probe = fixture.server.read_provider_evidence
+            with mock.patch.dict(os.environ, {"BUILD_HOLD_DIR": str(directory)}), \
+                 mock.patch.object(build_hold, "PROC_ROOT", fixture.proc.path), \
+                 mock.patch.object(Path, "stat", ci_stat), mock.patch.object(Path, "read_bytes", private_bytes):
+                self.assertEqual((fixture.proc.path / "110").stat().st_uid, ci_uid)
+                self.assertNotEqual(ci_uid, os.getuid())
+                with self.assertRaises(PermissionError):
+                    _ = (fixture.proc.path / "111/environ").read_bytes()
+                for pid, expected in ((111, wire.LocalPlacementGranted), (121, wire.PlacementWait)):
+                    with self.subTest(pid=pid):
+                        local = fixture.request(owner=fixture.fixture_owner(pid, str(pid * 10)), episode=f"ci-{pid}")
+                        local = replace(local, identity=replace(local.identity, name=f"CI runner job-{pid}"))
+                        constraints = placement.PlacementConstraints(placement.SourceKeyKnown("private-ci-source"),
+                            local.argv, "fixture", "fixture", NoOwningSession(),
+                            (placement.PlacementCandidate(destination),))
+                        request = wire.PlacementRequest(local.episode,
+                            placement.SubmittingOwner(fixture.server.host, pid, str(pid * 10)), local.since,
+                            local.profile, constraints, identity=local.identity,
+                            local=wire.LocalAdmissionContext(local.argv, local.cwd, local.sidecar,
+                                local.call, local.test_width, local.fresh_test), code_version=local.code_version)
+                        fixture.allow_next_start()
+                        reply, = fixture.server.handle_request(request)
+                        self.assertIsInstance(reply, expected)
+                        if isinstance(reply, wire.PlacementWait):
+                            self.assertIsInstance(reply.wait, wire.PlacementResourceWait)
+                        lines = "\n".join(build_hold.ci_placement_lines(fixture.proc.path))
+                        self.assertIn(f"CI {'running' if pid == 111 else 'queued'}: CI runner job-{pid} since ", lines)
+
+
 class FixedSystemReader:
     """Publish private evidence without an operating-system reader."""
     def __init__(self, latest: service.SystemEvidence) -> None:

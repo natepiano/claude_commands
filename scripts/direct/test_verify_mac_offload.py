@@ -51,10 +51,9 @@ class VerifyMacOptionValidationTests(VerifyMacOffloadFixture):
                 self.assertEqual(result.stdout, "")
                 self.assertEqual(
                     result.stderr,
-                    "verify.sh: --local is only for a test that cannot pass on macOS, not to keep "
-                    + f'tests off the Mac ("{reason}"). To reserve the Mac, its holder runs '
-                    + "/build:hold hold <why> target mac: tests then skip the Mac by themselves, "
-                    + "/build:status shows the hold, and it ends at its expiry. Leave --local off.\n",
+                    f'verify.sh: --local requires a test that cannot pass on macOS ("{reason}"). '
+                    + "To reserve the Mac, use /build:mac block <why>. Tests skip a held Mac. "
+                    + "/build:status shows the hold. The hold ends at its expiry. Omit --local.\n",
                 )
                 self.assertEqual(self.cargo_events(), [])
                 self.assertEqual(self.runner_events(), [])

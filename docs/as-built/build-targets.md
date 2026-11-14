@@ -79,12 +79,28 @@ Without a matching row, `target_platform` returns no answer and status 1.
 
 ### Holds: `scripts/build_hold/build_hold.py`
 
-- `build_hold.py hold|release [--target <name>]`, default `natedev`. `--target` is parsed by `parse_hold_target` into `HoldTarget = NatedevHoldTarget | MacHoldTarget | UnknownHoldTarget(name, configured) | UncheckedHoldTarget(name, reason)`. Only a name other than `natedev` or `mac` reads the config: a readable one answers `unknown target <name>; configured targets: <list>`, an unreadable one (`ConfigError` or `UnicodeError`) answers `unknown target <name>; the target config cannot be read: <reason>`; both exit 2 before any lookup or record.
-- `--target mac` forwards the fixed holder key to `mac_test.py block` or `unblock`. It preserves the child output and status. It writes no natedev record or event. The Mac target refuses `--release-eta`, `--zone`, and `--resume` with exit 2. Release matches only the fixed key and makes no former-name retry.
-- A natedev hold file uses its holder’s fixed staff ID. `HolderIdentity.name` shows the current staff name. An explicit holder outside staff keeps its given key. Without `--holder`, the caller’s native session must resolve to a staff member. The hold notice explains that local work waits and eligible Mac tests continue.
-- `hold` starts the enforcer and appends an audit of builds already running. The enforcer stops tests and builds outside its allow rules, including existing runs; `--keep PID` adds checked PID/start-time pairs. `status` shows the audit and enforcer decisions while a hold exists; `audit` can run by itself. The audit groups cargo and nextest compiler children into one build and classifies each as `holder`, `admitted`, `other_session` or `no_session`, with process start checks. Other-session and no-session builds get an `audit` row through `hold_enforcer.record_build` and `store.append_line` in the current process. Enforcer stops use the same writer with action `stopped`. Schema 21 adds `hold_builds.action`; old rows read as `audit`. The audit itself stops no processes. See [build-memory-admission.md](build-memory-admission.md).
-- `natedev_holds(directory) -> NatedevHolds(in_force)` reads holder files once and never reads the cycle. A present file is always in force. `released_at` and `release_started_at` cannot admit a waiter or create a releasing state. Release removes the file first, records the release fields next, then sends notices after the last file is gone.
-- Holder files, the hold cycle, release delivery, the CLI table and recorded hold intervals are covered in [build-memory-admission.md](build-memory-admission.md) under "Build hold". The Mac block, its CI switch and its free message are in [mac-test-offload.md](mac-test-offload.md).
+`build_hold.py clear|drain|release [target]` reads its default from `default_target` in `config/build_targets.conf`.
+The shared target reader resolves configured target names.
+Only natedev supports these commands in this delivery.
+Mac, AWS, and `all` return exit 2 with `<command> <target> is not supported yet`.
+No unsupported selection changes any target.
+The commands have no `--target` option or trailing `target <name>` form.
+Use `/build:mac block <why>` and `/build:mac unblock` for the Mac.
+The retained remote helpers remain unreachable from these three commands.
+
+`clear` stops existing queued gates and running builds outside the hold's allow rules.
+`drain` keeps existing runs until they finish.
+Both accept `--keep PID`, `--release-eta HH:MM`, and `--zone IANA`.
+Both keep the target held until explicit release.
+A holder file uses its holder's fixed staff ID.
+`HolderIdentity.name` supplies the current display name.
+An explicit holder outside staff keeps its given key.
+Without `--holder`, the caller's native session must resolve to a staff member.
+
+`natedev_holds(directory)` reads holder files once and never reads the cycle.
+Every present file remains in force.
+Release removes the holder file before recording delivery state.
+See [build-memory-admission.md](build-memory-admission.md) for the keep list, enforcer, audit, and release records.
 
 ### Hold checks and release
 
@@ -217,7 +233,7 @@ The runner, the claim and the block are covered in [mac-test-offload.md](mac-tes
 
 | Command | Script | Role |
 | --- | --- | --- |
-| `/build:hold` | `build_hold.py` | Hold or release natedev (default) or the Mac (`target mac`), check quiet, show holds. The protocol every holder follows. |
+| `/build:hold` | `build_hold.py` | Clear, drain, or release natedev; check quiet and show holds. Use `/build:mac block` for the Mac. |
 | `/build:mac` | `mac_test.py` | Block, unblock, settle and show the Mac; audit which packages belong on it; claim it for a job of one's own (released after 15 idle minutes). |
 | `/build:status` | `build_targets.py status [--probe]` | Each target's state, read only, with the holder's showrunner and unit when its session is known. |
 | `/build:queue bump <selector>`, `clear`, `admit-head <why>` | `build_queue.py` | Changes unit priority or permits the head to exceed the budget when free memory permits. Use `/build:page` for the queue view. The unit-board pane retains its `--json` view and selected cards. Plain view requests exit 3 and name `/build:page`. |
@@ -442,7 +458,7 @@ the log does not record that connection. Journal retention also limits the evide
 - Hold checks store no build call records. A Mac attempt needs no local registration.
 - A hold nobody releases still escalates after 2 h: the waiter prints the holder and asks the agent to ask them.
 - Defaults are "go": no load threshold and no check for others' processes on any target. The claim watcher's activity check counts processes only to release an idle claim, never to turn a test away.
-- The scripts keep their arguments and exit codes: `build_hold.py hold|wait|release|quiet|status|audit`, `mac_test.py claim|release|block|unblock|status`, and `build_targets.py`'s 0/10/12/2. `claim` takes no required argument beyond `--pid` and `--what`; `watch-claim` is the claim watcher's own entry point.
+- The scripts keep their arguments and exit codes: `build_hold.py clear|drain|wait|release|quiet|status|audit`, `mac_test.py claim|release|block|unblock|status`, and `build_targets.py`'s 0/10/12/2. `claim` takes no required argument beyond `--pid` and `--what`; `watch-claim` is the claim watcher's own entry point.
 - Guard lines precede every read of `HOME` or a listed variable in `verify.sh` and `memory_gate.sh`.
   The guard runs at an entry point, never inside a directory reader.
 - The installed callers require `override_guard.sh`. Both machines need compatible installed helpers.

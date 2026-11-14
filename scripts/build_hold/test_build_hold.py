@@ -28,7 +28,6 @@ from scripts.build_hold import build_hold
 from scripts.build_hold import hold_enforcer
 from scripts.production import staff
 from scripts.production.staff_test_support import fixture_member, fixture_runtime_id, isolated_staff_file
-from scripts.message.sessions import SessionRecord
 
 from scripts.build_hold.build_hold_test_support import (
     IsolatedBuildHoldTest as IsolatedBuildHoldTest,
@@ -440,202 +439,49 @@ class TargetCommandTests(PrivateReleaseBroadcastTest):
     def setUp(self) -> None:
         super().setUp()
         self.enterContext(mock.patch.dict(os.environ, {
-            "CONF_DIR": str(Path(SCRIPT.parent.parent.parent / "config/build_targets.conf").parent),
+            "CONF_DIR": str(SCRIPT.parent.parent.parent / "config"),
         }))
 
-    def run_with_mac_stand_in(
-        self, arguments: list[str], exit_code: int = 0, *, check_block_holder: bool = False,
-    ) -> tuple[int, str, str, list[list[str]]]:
-        calls: list[list[str]] = []
-        expected_script = SCRIPT.resolve().parent.parent / "mac_test/mac_test.py"
-        run = subprocess.run
+    def test_remote_commands_refuse_without_state_changes(self) -> None:
+        for action in ("clear", "drain", "release"):
+            for target in ("mac", "aws", "all"):
+                with self.subTest(action=action, target=target), redirect_stdout(io.StringIO()) as output:
+                    arguments = [action, target]
+                    if action != "release":
+                        arguments.extend(["--for", "private test"])
+                    self.assertEqual(build_hold.main(arguments), 2)
+                    self.assertEqual(output.getvalue(), f"{action} {target} is not supported yet\n")
+                    self.assertFalse((self.scratch / "holders").exists())
+                    self.assertFalse((self.scratch / "release").exists())
 
-        def command(argv: list[str], **options: object) -> subprocess.CompletedProcess[str]:
-            if argv[:1] == ["git"]:
-                return run(argv, capture_output=True, text=True, check=False, timeout=test_hang_guard.TEST_HANG_GUARD_SECS)
-            self.assertEqual(argv[:2], [str(SCRIPT.resolve().parents[1] / "lib/py"), str(expected_script)])
-            self.assertTrue(options.get("capture_output"))
-            self.assertTrue(options.get("text"))
-            calls.append(argv[2:])
-            if check_block_holder:
-                block = self.scratch / "stand-in-block-holder"
-                holder = argv[argv.index("--holder") + 1]
-                if argv[2] == "block":
-                    _ = block.write_text(holder)
-                elif block.exists():
-                    stored = block.read_text()
-                    if stored != holder:
-                        return subprocess.CompletedProcess(argv, 1, f"blocked by {stored}\n", "")
-                    block.unlink()
-            return subprocess.CompletedProcess(argv, exit_code, "Mac stand-in result\n", "Mac stand-in detail\n")
 
-        output, errors = io.StringIO(), io.StringIO()
-        with mock.patch.object(build_hold.hold_enforcer(), "start"), \
-             mock.patch.object(subprocess, "run", side_effect=command), redirect_stdout(output), redirect_stderr(errors):
-            try:
-                status = build_hold.main(arguments)
-            except SystemExit as error:
-                status = error.code if isinstance(error.code, int) else 1
-        self.reap_recorders()
-        return status, output.getvalue(), errors.getvalue(), calls
+    def test_default_target_comes_from_configuration(self) -> None:
+        from scripts.build_targets import target_config
 
-    def assert_no_natedev_record(self) -> None:
-        self.assertFalse((self.scratch / "holders").exists())
-        self.assertFalse((self.scratch / "release" / "current").exists())
-        self.assertEqual(recorded_hold_events(self.scratch / "buildlog", 0), [])
+        config = self.scratch / "configuration"
+        config.mkdir()
+        path = config / "build_targets.conf"
+        _ = path.write_text("targets=natedev\nkind.natedev=local\nplatform.natedev=linux\ndefault_target=natedev\n")
+        with mock.patch.dict(os.environ, {"CONF_DIR": str(config)}):
+            self.assertEqual(target_config.command_target_name(None), "natedev")
+            _ = path.write_text(path.read_text().replace("default_target=natedev", "default_target=all"))
+            for action in ("clear", "drain", "release"):
+                arguments = [action] if action == "release" else [action, "--for", "private test"]
+                with self.subTest(action=action), redirect_stdout(io.StringIO()) as output:
+                    self.assertEqual(build_hold.main(arguments), 2)
+                    self.assertEqual(output.getvalue(), f"{action} all is not supported yet\n")
+            self.assertEqual(target_config.command_target_name("natedev"), "natedev")
 
-    def test_mac_hold_forwards_block_holder_and_reason_without_a_natedev_record(self) -> None:
-        status, output, errors, calls = self.run_with_mac_stand_in(
-            ["hold", "--target", "mac", "--holder", "alice", "--for", "renderer checks"])
-        self.assertEqual(status, 0, errors)
-        self.assertEqual(calls, [["block", "--holder", "alice", "--for", "renderer checks", "--target", "mac"]])
-        self.assertEqual(output, "Mac stand-in result\n")
-        self.assertEqual(errors, "Mac stand-in detail\n")
-        self.assert_no_natedev_record()
-
-    def test_mac_release_forwards_unblock_holder_and_child_exit_codes(self) -> None:
-        for exit_code in (0, 7):
-            with self.subTest(exit_code=exit_code):
-                status, output, errors, calls = self.run_with_mac_stand_in(
-                    ["release", "--target", "mac", "--holder", "alice"], exit_code=exit_code)
-                self.assertEqual(status, exit_code, errors)
-                self.assertEqual(calls, [["unblock", "--holder", "alice", "--target", "mac"]])
-                self.assertEqual(output, "Mac stand-in result\n")
-                self.assertEqual(errors, "Mac stand-in detail\n")
-                self.assert_no_natedev_record()
-
-    def test_mac_hold_returns_the_block_child_failure(self) -> None:
-        status, output, errors, calls = self.run_with_mac_stand_in(
-            ["hold", "--target", "mac", "--holder", "alice", "--for", "renderer checks"], exit_code=9)
-        self.assertEqual(status, 9, errors)
-        self.assertEqual(calls, [["block", "--holder", "alice", "--for", "renderer checks", "--target", "mac"]])
-        self.assertEqual(output, "Mac stand-in result\n")
-        self.assertEqual(errors, "Mac stand-in detail\n")
-        self.assert_no_natedev_record()
-
-    def session(self, name: str, *former: str) -> None:
-        path = self.socket_dir / "renamed-session.sock"
-        if not path.exists():
-            connection = socket.socket(socket.AF_UNIX)
-            connection.bind(str(path))
-            self.addCleanup(connection.close)
-        directory = self.scratch / "sessions"
-        directory.mkdir(exist_ok=True)
-        record: SessionRecord = {
-            "pid": os.getpid(), "sessionId": "renamed-session", "name": name,
-            "formerNames": list(former), "messagingSocketPath": str(path), "updatedAt": 1,
-            "tmux": "",
-        }
-        _ = (directory / "renamed-session.json").write_text(json.dumps(record))
-        member = staff.StaffRow(staff.StaffId("fixed"), "unit", name, staff.StaffRoot(),
-                                current_session=staff.StaffId("renamed-session"))
-        _ = self.enterContext(mock.patch.object(staff, "snapshot", return_value=staff.StaffSnapshot((member,))))
-
-    def test_mac_release_after_session_rename_releases_own_block_and_keeps_others(self) -> None:
-        with mock.patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": "renamed-session"}):
-            for given in ([], ["--holder", "session:renamed-session"], ["--holder", "current-name"]):
-                with self.subTest(given=given):
-                    self.session("first-name")
-                    status, _, errors, calls = self.run_with_mac_stand_in(
-                        ["hold", "--target", "mac", "--for", "renderer checks"], check_block_holder=True)
-                    self.assertEqual(status, 0, errors)
-                    self.assertEqual(calls, [["block", "--holder", "fixed", "--for", "renderer checks", "--target", "mac"]])
-                    self.session("current-name", "first-name", "middle-name")
-                    status, output, errors, calls = self.run_with_mac_stand_in(
-                        ["release", "--target", "mac", *given], check_block_holder=True)
-                    self.assertEqual(status, 0, errors)
-                    self.assertEqual(calls, [["unblock", "--holder", "fixed", "--target", "mac"]])
-                    self.assertEqual(output, "Mac stand-in result\n")
-                    self.assertEqual(errors, "Mac stand-in detail\n")
-                    self.assertFalse((self.scratch / "stand-in-block-holder").exists())
-                    self.assert_no_natedev_record()
-                    status, _, errors, _ = self.run_with_mac_stand_in(
-                        ["hold", "--target", "mac", "--holder", "someone-else", "--for", "renderer checks"],
-                        check_block_holder=True)
-                    self.assertEqual(status, 0, errors)
-                    status, output, errors, calls = self.run_with_mac_stand_in(
-                        ["release", "--target", "mac", *given], check_block_holder=True)
-                    self.assertEqual(status, 1)
-                    self.assertEqual(calls, [["unblock", "--holder", "fixed", "--target", "mac"]])
-                    self.assertEqual(output, "blocked by someone-else\n")
-                    self.assertEqual(errors, "")
-                    self.assertEqual((self.scratch / "stand-in-block-holder").read_text(), "someone-else")
-                    self.assert_no_natedev_record()
-
-    def test_default_hold_and_release_record_only_natedev_and_never_call_mac(self) -> None:
-        status, output, errors, calls = self.run_with_mac_stand_in(
-            ["hold", "--holder", "alice", "--for", "renderer checks"])
-        self.assertEqual(status, 0, errors)
-        self.assertEqual(calls, [])
-        self.assertTrue(output.startswith("natedev is held for renderer checks."), output)
-        holder = build_hold.read_holder(self.scratch / "holders" / "alice")
-        self.assertEqual((holder.name, holder.purpose), ("alice", "renderer checks"))
-        (self.scratch / "release" / "current").unlink()
-        status, _, errors, calls = self.run_with_mac_stand_in(["release", "--holder", "alice"])
-        self.assertEqual(status, 0, errors)
-        self.assertEqual(calls, [])
-        self.assertFalse((self.scratch / "holders" / "alice").exists())
-        rows = recorded_hold_events(self.scratch / "buildlog", 2)
-        self.assertEqual([(row["target"], row["event"], row["holder"]) for row in rows],
-                         [("natedev", "began", "alice"), ("natedev", "ended", "alice")])
-
-    def test_unknown_hold_and_release_targets_list_the_configured_names(self) -> None:
-        for arguments in (["hold", "--for", "renderer checks"], ["release"]):
-            with self.subTest(action=arguments[0]):
-                status, output, errors, calls = self.run_with_mac_stand_in(
-                    [*arguments, "--target", "missing", "--holder", "alice"])
-                self.assertEqual(status, 2)
-                self.assertEqual((output + errors).splitlines(),
-                                 ["unknown target missing; configured targets: mac, natedev"])
-                self.assertEqual(calls, [])
-                self.assert_no_natedev_record()
-
-    def test_unknown_target_with_an_unreadable_config_names_the_reason(self) -> None:
-        missing = self.scratch / "missing" / "build_targets.conf"
-        missing.parent.mkdir()
-        incomplete = self.scratch / "incomplete" / "build_targets.conf"
-        incomplete.parent.mkdir()
-        _ = incomplete.write_text("targets=mac\n", encoding="utf-8")
-        invalid_utf8 = self.scratch / "invalid-utf8" / "build_targets.conf"
-        invalid_utf8.parent.mkdir()
-        _ = invalid_utf8.write_bytes(b"\xff")
-        for config, reason in (
-            (missing, f"{missing}: keys: [Errno 2] No such file or directory: {str(missing)!r}"),
-            (incomplete, "kind.mac: expected local or ssh, got ''"),
-            (invalid_utf8, f"{invalid_utf8}: keys: 'utf-8' codec can't decode byte 0xff in position 0: invalid start byte"),
-        ):
-            for arguments in (["hold", "--for", "renderer checks"], ["release"]):
-                with self.subTest(config=config.name, action=arguments[0]), mock.patch.dict(
-                    os.environ, {"CONF_DIR": str(Path(config).parent)},
-                ), mock.patch.object(build_hold, "holder_of") as holder_lookup:
-                    status, output, errors, calls = self.run_with_mac_stand_in(
-                        [*arguments, "--target", "missing", "--holder", "alice"])
-                    self.assertEqual(status, 2)
-                    history_fault = config in (missing, invalid_utf8)
-                    suffix = "; no usable committed file" if history_fault else ""
-                    self.assertEqual(output, f"unknown target missing; the target config cannot be read: {reason}{suffix}\n")
-                    self.assertEqual(errors, f"warning: {reason}\n" if history_fault else "")
-                    holder_lookup.assert_not_called()
-                    self.assertEqual(calls, [])
-                    self.assert_no_natedev_record()
-
-    def test_mac_hold_refuses_release_eta_and_zone_before_calling_block(self) -> None:
-        for option, value in (("--release-eta", "23:59"), ("--zone", "UTC")):
-            with self.subTest(option=option):
-                status, output, errors, calls = self.run_with_mac_stand_in(
-                    ["hold", "--target", "mac", "--holder", "alice", "--for", "renderer checks", option, value])
-                self.assertEqual(status, 2)
-                self.assertEqual((output + errors).splitlines(), [f"{option} is not supported with --target mac"])
-                self.assertEqual(calls, [])
-                self.assert_no_natedev_record()
-
-    def test_mac_release_refuses_resume_before_calling_unblock(self) -> None:
-        status, output, errors, calls = self.run_with_mac_stand_in(
-            ["release", "--target", "mac", "--holder", "alice", "--resume"])
-        self.assertEqual(status, 2)
-        self.assertEqual((output + errors).splitlines(), ["--resume is not supported with --target mac"])
-        self.assertEqual(calls, [])
-        self.assert_no_natedev_record()
+    def test_parser_rejects_removed_target_forms(self) -> None:
+        for action in ("clear", "drain", "release"):
+            for selection in (["--target", "natedev"], ["target", "natedev"]):
+                arguments = [action, *selection]
+                if action != "release":
+                    arguments.extend(["--for", "private test"])
+                with self.subTest(arguments=arguments), redirect_stderr(io.StringIO()):
+                    with self.assertRaises(SystemExit) as result:
+                        _ = build_hold.main(arguments)
+                    self.assertEqual(result.exception.code, 2)
 
 
 class CommandTests(PrivateReleaseBroadcastTest):
@@ -657,13 +503,13 @@ class CommandTests(PrivateReleaseBroadcastTest):
             (folder / ("fixed-" + session_id)).unlink(missing_ok=True)
 
     def run_cli(self, folder: Path, *args: str) -> subprocess.CompletedProcess[str]:
-        audit_args = ["--proc-root", str(self.scratch / "proc")] if args[0] in {"hold", "status", "audit"} else []
+        audit_args = ["--proc-root", str(self.scratch / "proc")] if args[0] in {"clear", "drain", "status", "audit"} else []
         return invoke_hold([*args, *audit_args], {**os.environ, "BUILD_HOLD_DIR": str(folder)})
 
     def damage_record(self, kind: str, scratch: Path, *, two_holders: bool = False) -> tuple[Path, bytes]:
         folder = scratch / "holders"
         for name in (("first", "second") if two_holders else ("first",)):
-            held = self.run_cli(folder, "hold", "--holder", name, "--for", f"{name} test")
+            held = self.run_cli(folder, "clear", "--holder", name, "--for", f"{name} test")
             self.assertEqual(held.returncode, 0, held.stderr)
         release = scratch / "release"
         cycle_id = (release / "current").read_text().strip()
@@ -748,7 +594,7 @@ class CommandTests(PrivateReleaseBroadcastTest):
             _ = build_hold.held_key(folder, "new-name")
         self.assertEqual(build_hold.held_key(folder, "old-name"), "old-name")
         # With no name and no session, there is no holder to look up.
-        refused = self.run_cli(folder, "hold", "--for", "one test")
+        refused = self.run_cli(folder, "clear", "--for", "one test")
         self.assertEqual(refused.returncode, 1)
         self.assertIn("give --holder: this caller has no staff row", refused.stderr)
 
@@ -781,7 +627,7 @@ class CommandTests(PrivateReleaseBroadcastTest):
                 "BUILD_HOLD_DIR": str(scratch / "holders"),
                 "BUILD_HOLD_RELEASE_DIR": str(scratch / "release"),
             }):
-                held = self.run_cli(scratch / "holders", "hold", "--holder", "first", "--for", "first test")
+                held = self.run_cli(scratch / "holders", "clear", "--holder", "first", "--for", "first test")
                 self.assertEqual(held.returncode, 0, held.stderr)
                 release = scratch / "release"
                 path = release / (release / "current").read_text().strip() / "cycle.json"
@@ -814,7 +660,7 @@ class CommandTests(PrivateReleaseBroadcastTest):
                 self.assertFalse((scratch / "holders" / "first").exists())
 
     def test_dangling_cycle_link_is_set_aside_instead_of_current(self) -> None:
-        held = self.run_cli(self.scratch / "holders", "hold", "--holder", "first", "--for", "first test")
+        held = self.run_cli(self.scratch / "holders", "clear", "--holder", "first", "--for", "first test")
         self.assertEqual(held.returncode, 0, held.stderr)
         release = self.scratch / "release"
         path = release / (release / "current").read_text().strip() / "cycle.json"
@@ -867,7 +713,7 @@ class CommandTests(PrivateReleaseBroadcastTest):
         self.assertTrue((self.scratch / "holders" / "first").exists())
 
     def test_intact_cycle_final_line_does_not_request_broadcast(self) -> None:
-        held = self.run_cli(self.scratch / "holders", "hold", "--holder", "first", "--for", "first test")
+        held = self.run_cli(self.scratch / "holders", "clear", "--holder", "first", "--for", "first test")
         self.assertEqual(held.returncode, 0, held.stderr)
         release = self.scratch / "release"
         path = release / (release / "current").read_text().strip() / "cycle.json"
@@ -889,7 +735,7 @@ class CommandTests(PrivateReleaseBroadcastTest):
             }):
                 path, content = self.damage_record(kind, scratch)
                 old_cycles = list((scratch / "release").glob("*/cycle.json"))
-                held = self.run_cli(scratch / "holders", "hold", "--holder", "second", "--for", "second test")
+                held = self.run_cli(scratch / "holders", "clear", "--holder", "second", "--for", "second test")
                 self.assertEqual(held.returncode, 0, held.stderr)
                 self.assert_record_set_aside(path, content, held.stdout, scratch)
                 self.assertTrue((scratch / "holders" / "second").exists())
@@ -973,11 +819,11 @@ class CommandTests(PrivateReleaseBroadcastTest):
 
 
     def test_hold_writes_unknown_and_status_names_it(self) -> None:
-        for options in ((), ("--drain",)):
-            with self.subTest(options=options), tempfile.TemporaryDirectory() as scratch, \
+        for action in ("clear", "drain"):
+            with self.subTest(action=action), tempfile.TemporaryDirectory() as scratch, \
                  mock.patch.object(hold_enforcer, "claimed_processes", return_value=build_hold.LiveClaims(frozenset())):
                 folder = Path(scratch)
-                result = self.run_cli(folder, "hold", "--holder", "slot one", "--for", "the focused test", *options)
+                result = self.run_cli(folder, action, "--holder", "slot one", "--for", "the focused test")
                 self.assertEqual(result.returncode, 0, result.stderr)
                 path = folder / "slot-one"
                 fields = cast(dict[str, object], json.loads(path.read_text()))
@@ -985,8 +831,8 @@ class CommandTests(PrivateReleaseBroadcastTest):
                 self.assertEqual(fields["for"], "the focused test")
                 self.assertEqual(fields["release_eta"], "unknown")
                 self.assertIsNotNone(datetime.fromisoformat(cast(str, fields["since"])).tzinfo)
-                if options:
-                    self.assertEqual(result.stdout.splitlines()[-1], "drained")
+                if action == "drain":
+                    self.assertEqual(result.stdout.splitlines()[-1], "drained; natedev stays held until release")
                 status = self.run_cli(folder, "status")
                 self.assertEqual(status.returncode, 0, status.stderr)
                 self.assertIn("slot one", status.stdout)
@@ -995,16 +841,16 @@ class CommandTests(PrivateReleaseBroadcastTest):
 
     def test_hold_message_tells_recipient_verify_waits_without_registering(self) -> None:
         with tempfile.TemporaryDirectory() as scratch:
-            result = self.run_cli(Path(scratch), "hold", "--holder", "slot", "--for", "the focused test")
+            result = self.run_cli(Path(scratch), "clear", "--holder", "slot", "--for", "the focused test")
             self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertIn("verify.sh waits by itself", result.stdout)
+            self.assertIn("Existing queued runs and running work outside the allow rules stop.", result.stdout)
             self.assertNotIn("build_hold.py wait", result.stdout)
             self.assertIn("tests and builds outside the hold are stopped", result.stdout)
             self.assertEqual(len(recorded_hold_events(self.scratch / "buildlog", 1)), 1)
 
     def test_recipient_wait_command_registers_its_session_id(self) -> None:
         folder = self.scratch / "holders"
-        held = self.run_cli(folder, "hold", "--holder", "holder", "--for", "the focused test")
+        held = self.run_cli(folder, "clear", "--holder", "holder", "--for", "the focused test")
         self.assertEqual(held.returncode, 0, held.stderr)
         received = subprocess.run(
             ["python3", str(SCRIPT), "wait"], capture_output=True, text=True, check=False, timeout=test_hang_guard.TEST_HANG_GUARD_SECS,
@@ -1030,14 +876,14 @@ class CommandTests(PrivateReleaseBroadcastTest):
 
             free = attempt("no hold")
             self.assertEqual(free.returncode, 0, free.stderr)
-            held = self.run_cli(folder, "hold", "--holder", "owner", "--for", "owner test")
+            held = self.run_cli(folder, "clear", "--holder", "owner", "--for", "owner test")
             self.assertEqual(held.returncode, 0, held.stderr)
             own = attempt("sole holder")
             self.assertEqual(own.returncode, 0, own.stderr)
             cycle = build_hold.read_cycle()
             assert cycle is not None
             self.assertEqual(cycle["recipients"], {})
-            other = self.run_cli(folder, "hold", "--holder", "other", "--for", "other test")
+            other = self.run_cli(folder, "clear", "--holder", "other", "--for", "other test")
             self.assertEqual(other.returncode, 0, other.stderr)
             shared = attempt("must not build with two holders")
             self.assertEqual(shared.returncode, 10, shared.stderr)
@@ -1057,7 +903,7 @@ class CommandTests(PrivateReleaseBroadcastTest):
 
     def test_wait_without_session_id_refuses_other_holder_until_release(self) -> None:
         folder = self.scratch / "holders"
-        held = self.run_cli(folder, "hold", "--holder", "other", "--for", "other test")
+        held = self.run_cli(folder, "clear", "--holder", "other", "--for", "other test")
         self.assertEqual(held.returncode, 0, held.stderr)
         blocked = self.run_cli(folder, "wait")
         self.assertEqual(blocked.returncode, 10, blocked.stderr)
@@ -1069,12 +915,12 @@ class CommandTests(PrivateReleaseBroadcastTest):
     def test_overlapping_holders_share_one_cycle_and_next_hold_starts_another(self) -> None:
         folder = self.scratch / "holders"
         release = self.scratch / "release"
-        first = self.run_cli(folder, "hold", "--holder", "first", "--for", "first test")
+        first = self.run_cli(folder, "clear", "--holder", "first", "--for", "first test")
         self.assertEqual(first.returncode, 0, first.stderr)
         current = release / "current"
         first_cycle = current.read_text().strip()
         self.assertTrue((release / first_cycle).is_dir())
-        second = self.run_cli(folder, "hold", "--holder", "second", "--for", "second test")
+        second = self.run_cli(folder, "clear", "--holder", "second", "--for", "second test")
         self.assertEqual(second.returncode, 0, second.stderr)
         self.assertEqual(current.read_text().strip(), first_cycle)
         partial = self.run_cli(folder, "release", "--holder", "first")
@@ -1088,7 +934,7 @@ class CommandTests(PrivateReleaseBroadcastTest):
         final = self.run_cli(folder, "release", "--holder", "second")
         self.assertEqual(final.returncode, 0, final.stderr)
         self.assertFalse((folder / "second").exists())
-        next_hold = self.run_cli(folder, "hold", "--holder", "third", "--for", "third test")
+        next_hold = self.run_cli(folder, "clear", "--holder", "third", "--for", "third test")
         self.assertEqual(next_hold.returncode, 0, next_hold.stderr)
         self.assertNotEqual(current.read_text().strip(), first_cycle)
 
@@ -1125,7 +971,7 @@ class CommandTests(PrivateReleaseBroadcastTest):
             if now.hour == 0 and now.minute == 0:
                 self.skipTest("the local day has no earlier HH:MM yet")
             past = "00:00"
-            result = self.run_cli(folder, "hold", "--holder", "slot", "--for", "the test", "--release-eta", past, "--zone", "America/New_York")
+            result = self.run_cli(folder, "clear", "--holder", "slot", "--for", "the test", "--release-eta", past, "--zone", "America/New_York")
             self.assertEqual(result.returncode, 1)
             self.assertFalse((folder / "slot").exists())
 
@@ -1153,7 +999,7 @@ class CommandTests(PrivateReleaseBroadcastTest):
                 with mock.patch.dict(os.environ, {"TZ": "America/New_York", "USER_ZONE": "America/New_York", "BUILD_HOLD_DIR": str(folder)}):
                     time.tzset()
                     with mock.patch.object(build_hold, "datetime", FixedDatetime), redirect_stdout(output), redirect_stderr(errors):
-                        result = build_hold.main(["hold", "--holder", "slot", "--for", "the test", "--release-eta", "22:00", "--zone", "America/Los_Angeles"])
+                        result = build_hold.main(["clear", "--holder", "slot", "--for", "the test", "--release-eta", "22:00", "--zone", "America/Los_Angeles"])
             finally:
                 time.tzset()
             self.assertEqual(result, 0, errors.getvalue())
@@ -1163,7 +1009,7 @@ class CommandTests(PrivateReleaseBroadcastTest):
     def test_release_eta_requires_zone(self) -> None:
         with tempfile.TemporaryDirectory() as scratch:
             folder = Path(scratch)
-            result = self.run_cli(folder, "hold", "--holder", "slot", "--for", "the test", "--release-eta", "22:00")
+            result = self.run_cli(folder, "clear", "--holder", "slot", "--for", "the test", "--release-eta", "22:00")
             self.assertEqual(result.returncode, 1)
             self.assertIn("--zone", result.stderr)
             self.assertIn("--release-eta", result.stderr)
@@ -1172,7 +1018,7 @@ class CommandTests(PrivateReleaseBroadcastTest):
     def test_release_eta_rejects_unknown_zone(self) -> None:
         with tempfile.TemporaryDirectory() as scratch:
             folder = Path(scratch)
-            result = self.run_cli(folder, "hold", "--holder", "slot", "--for", "the test", "--release-eta", "22:00", "--zone", "Pacific/Nowhere")
+            result = self.run_cli(folder, "clear", "--holder", "slot", "--for", "the test", "--release-eta", "22:00", "--zone", "Pacific/Nowhere")
             self.assertEqual(result.returncode, 1)
             self.assertIn("Pacific/Nowhere", result.stderr)
             self.assertFalse((folder / "slot").exists())
@@ -1398,7 +1244,7 @@ class HoldRecordingTests(PrivateReleaseBroadcastTest):
             fcntl.flock(held_log, fcntl.LOCK_EX)
             try:
                 result = subprocess.run(
-                    ["python3", str(SCRIPT), "hold", "--holder", "alice", "--for", "render checks",
+                    ["python3", str(SCRIPT), "clear", "--holder", "alice", "--for", "render checks",
                      "--proc-root", str(self.scratch / "proc")],
                     env=dict(os.environ), capture_output=True, text=True, timeout=test_hang_guard.TEST_HANG_GUARD_SECS, check=False)
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
@@ -2618,9 +2464,9 @@ class BuildAuditTests(IsolatedBuildHoldTest):
         output = io.StringIO()
         with redirect_stdout(output):
             for pid in (10, 20):
-                self.assertEqual(build_hold.main(["hold", "--holder", "holder", "--for", "app test",
+                self.assertEqual(build_hold.main(["clear", "--holder", "holder", "--for", "app test",
                                                  "--proc-root", str(self.proc), "--keep", str(pid)]), 0)
-            self.assertEqual(build_hold.main(["hold", "--holder", "holder", "--for", "app test",
+            self.assertEqual(build_hold.main(["clear", "--holder", "holder", "--for", "app test",
                                              "--proc-root", str(self.proc), "--keep", "999"]), 1)
         holder, = build_hold.natedev_holds(self.holders).in_force
         self.assertEqual(holder.keep, (build_hold.ProcessIdentity(10, "100"), build_hold.ProcessIdentity(20, "200")))
@@ -2631,10 +2477,10 @@ class BuildAuditTests(IsolatedBuildHoldTest):
         _ = self.process(10, "cargo", environment={"CLAUDE_CODE_SESSION_ID": "other"})
         _ = self.process(20, "cargo", argv=("cargo", "check", "--package", "unowned"))
         (self.holders / "holder").unlink()
-        for action, entry in (("hold", "import"), ("status", "import"),
+        for action, entry in (("clear", "import"), ("status", "import"),
                               ("audit", "import"), ("audit", "__main__")):
             args = [action, "--proc-root", str(self.proc)]
-            if action == "hold":
+            if action == "clear":
                 args.extend(["--holder", "holder", "--for", "app test"])
             output = io.StringIO()
             if entry == "__main__":
@@ -2662,13 +2508,13 @@ with mock.patch("sys.exit", side_effect=exit_code):
                 self.assertNotIn("unowned", output.getvalue())
             else:
                 self.assertIn("--keep 20", output.getvalue())
-            if action == "hold":
+            if action == "clear":
                 self.assertIn("tests and builds outside the hold are stopped", output.getvalue())
         self.assertEqual(len(self.rows()), 2)
 
     def test_audit_read_failure_does_not_fail_hold_or_status(self) -> None:
         missing_proc = self.scratch / "missing-proc"
-        for args in (["hold", "--holder", "holder", "--for", "app test"], ["status"]):
+        for args in (["clear", "--holder", "holder", "--for", "app test"], ["status"]):
             output = io.StringIO()
             with redirect_stdout(output):
                 self.assertEqual(build_hold.main([*args, "--proc-root", str(missing_proc)]), 0)

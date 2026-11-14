@@ -35,7 +35,7 @@ With `--name` and no package, the example's member supplies its required feature
 prevents a saved pass. `--tree` requires `--saved`.
 
 Use `--local` only for a test that cannot pass on macOS. A reservation reason
-is refused. Use `/build:hold hold <why> target mac` for a Mac hold.
+is refused. Use `/build:mac block <why>` for a Mac hold.
 Before CI, either machine can answer a test, including merge gates.
 
 Rules:

@@ -4,7 +4,16 @@ description: Hold the Mac or audit Rust packages.
 
 `$ARGUMENTS` is `block <why> [hours N]`, `unblock`, `status`, or `audit <repo dir>`.
 
-1. `block <why> [hours N]` runs `~/.claude/scripts/lib/py ~/.claude/scripts/mac_test/mac_test.py block --holder '<your session name>' --for '<why>' [--hours N]`. A unit director also passes `--showrunner '<showrunner name>'`, which `~/.claude/scripts/lib/py ~/.claude/scripts/production/showrunners.py name <showrunner name>` prints. The block is the Mac's hold; `/build:hold hold <why> target mac` places the same block with its default length. It admits the holder session's own claims, refuses other sessions' new Mac tests and builds, and turns off CI's Mac switch. This applies while pending and active. Existing local work or a CI Mac job finishes first; its free message arrives when that work ends. New CI runs skip macOS and stay green; re-run the listed commits after release. Repeat `block` to renew it.
+1. Run `~/.claude/scripts/lib/py ~/.claude/scripts/mac_test/mac_test.py block --holder '<your session name>' --for '<why>' [--hours N]`.
+   A unit director also passes `--showrunner '<showrunner name>'`.
+   Resolve the name with `~/.claude/scripts/lib/py ~/.claude/scripts/production/showrunners.py name <showrunner name>`.
+   The block admits the holder's claims and refuses other sessions' new Mac work.
+   It disables CI's Mac switch while pending or active.
+   Existing local work and CI Mac jobs finish first.
+   The free message arrives when that work ends.
+   New CI runs skip macOS and remain green.
+   Repeat the listed CI commits after release.
+   Repeat `block` to renew it.
 2. `unblock` runs `~/.claude/scripts/lib/py ~/.claude/scripts/mac_test/mac_test.py unblock --holder '<your session name>'`. It restores CI's Mac switch only if this block turned it off, then lists skipped runs by branch and their re-run commands. A block remains in force after expiry until its record is removed. If expiry cannot restore CI, run `github-warmup`, then `/build:mac unblock`; the failed restore keeps the block.
 3. `status` runs `~/.claude/scripts/lib/py ~/.claude/scripts/mac_test/mac_test.py status`. It settles block state and may lift an expired block, restore CI, or send pending messages. For a read-only view, use `/build:status`.
 4. `audit <repo dir>` runs `~/.claude/scripts/lib/py ~/.claude/scripts/mac_test/audit.py <repo dir>`. Its table shows compile-time gating: a gated test is not built on the Mac. `Not built on the Mac` names omitted lines.

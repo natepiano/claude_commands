@@ -1051,6 +1051,40 @@ Every present holder file remains in force, including when the cycle has `releas
 There is no releasing state.
 Only removal ends the holder's hold.
 
+**Drain.** `build_hold.py drain --for '<why>'` keeps existing queued and running natedev runs until they finish.
+It captures outermost gates, CI `Runner.Worker` processes, and builds that the enforcer could stop.
+It publishes the hold with the first keep list and records a boot-relative start-tick bound immediately before publication.
+A second scan adds only identities whose start ticks do not exceed that bound.
+The command merges those identities under the release lock before starting the enforcer.
+If release removes the holder file during discovery, the command ends without restoring the file.
+Each keep entry has a PID and a start time.
+The enforcer and the admission service use this same keep list for descendants.
+The lineage reader uses process identity files without reading private environments or command lines.
+New natedev runs wait for explicit release.
+The command stops no process and adds no stored state field.
+It accepts `--keep`, `--release-eta`, and `--zone`, and refuses Mac and SSH targets.
+Each 60 seconds, it prints `draining: N runs remain`.
+Completion prints `drained; natedev stays held until release` and returns 0.
+Ctrl-C returns 130 and retains the hold.
+Status derives `draining (N runs left)` or `held` from matching live keep entries.
+A reused PID does not count when its start time differs.
+Status names each queued or running local CI placement and its state start time from existing admission records.
+Legacy CI cargo requests use the same hold and lineage check before memory admission.
+CI requests outside the keep list remain queued until release.
+An existing CI reservation continues when the enforcer cannot stop its account.
+No process permission changes support these checks.
+**Clear.** `build_hold.py clear --for '<why>'` stops existing queued gates and running work outside the hold's allow rules.
+It retains explicit keep entries and their children.
+The command leaves the target held until release.
+`clear` and `drain` accept an optional positional target before their options.
+`release [target]` uses the same target form.
+The shared `default_target=natedev` key selects the target when the word is absent.
+Only natedev supports these commands.
+Mac, AWS, and `all` return exit 2 with `<command> <target> is not supported yet`.
+No unsupported command changes any target.
+Use `/build:mac block <why>` for a Mac hold.
+Use `/build:mac unblock` for its release.
+
 ### Step state publication
 
 `step_record.py write --report` writes the JSON record once for each verify call.
@@ -1130,7 +1164,7 @@ They write stopped rows with the PID and start time.
 The merge gate reads those rows and reruns the stopped modules after release.
 No run pauses: cargo must release `/dev/steve` slots and locks, and wall-clock limits continue.
 
-`hold` starts the user unit `build-hold-enforcer` with absolute paths, or keeps an active unit.
+`clear` starts the user unit `build-hold-enforcer` with absolute paths, or keeps an active unit.
 Without systemd-run or a user bus, it starts a detached process.
 `BUILD_HOLD_ENFORCER_DIR` holds the singleton lock.
 No paused record or thaw exists.
@@ -1160,11 +1194,11 @@ Those workers may build.
 
 | Command | Behavior |
 | --- | --- |
-| `hold [--holder N] --for TEXT [--keep PID]... [--release-eta HH:MM --zone IANA] [--target natedev\|mac]` | Default natedev; ETA must be later today. Starts the enforcer, prints its notice, keep list and audit. Every test and build outside the allow rules stops, including runs already started; its session gets one release notice. Repeated holds add kept PID/start pairs and reset release fields. Mac runs `mac_test.py block`; keep, ETA and zone are refused. |
+| `clear [target] [--holder N] --for TEXT [--keep PID]... [--release-eta HH:MM --zone IANA]` | Default natedev; ETA must be later today. Starts the enforcer, prints its notice, keep list and audit. Every test and build outside the allow rules stops, including runs already started; its session gets one release notice. Repeated holds add kept PID/start pairs and reset release fields. Other targets return exit 2 without changes. |
 | `quiet [--max-wait 600]` | Waits for remaining builds; busy while any user's `cargo`, `rustc` or `cargo-nextest` run; counts each command by user (`your builds still running: 7 cargo, 5 rustc; ci-runner: 2 rustc`). Exit 1 when busy. Load does not delay it. Exit 0 prints `builds are quiet: no build runs. 1-minute load <load> is other work: <five heaviest processes>`, with user, command and current CPU percent over about one second, or `none visible`. Only success takes the CPU window: two reads of `/proc/<pid>/stat` user and system ticks divided by elapsed clock ticks; processes that end or use no CPU in the window are skipped. |
 | `wait` | Returns at once through the shared local hold check. Exit 0 permits a build only when no other session’s holder file exists. The sole holder may build. Exit 10 refuses and registers the session for release notice; exit 12 means unreadable state. Cycle release fields never grant permission. Start only on 0; after 10, wait for release and check again. |
 | `record-recipient --session-id --name` | Written by `top_level.py`. |
-| `release [--holder N] [--target natedev\|mac]` / `release --resume` | Removes its holder file first, then records released_at and release_started_at; notices follow after the last file is gone. Other holder files keep the hold in force. One notice per recipient; the memory gate orders builds. `--resume` refuses while any holder file exists. Mac runs `mac_test.py unblock` and refuses resume. |
+| `release [target] [--holder N]` / `release --resume` | Removes its holder file first, then records released_at and release_started_at; notices follow after the last file is gone. Other holder files keep the hold in force. One notice per recipient; the memory gate orders builds. `--resume` refuses while any holder file exists. Other targets return exit 2 without changes. |
 | `status` | One line per holder with since, reason and ETA, its keep list, cycle delivery rows, and the audit with `--keep <pid>` for each run that would stop; or `no build hold`. Then `release pending:` lines name unfinished releases and their unsent recipients, using the release drain's reader, and `/build:hold release` to finish them, even with no holder file. A damaged record or cycle is named with its path, error and the command that sets it aside. Status changes no file. Present files stay held despite cycle release fields. |
 | `audit` | Reads running build processes from `/proc`. Prints session-owned builds by class. Records other_session and no_session builds when a hold is in force. |
 
@@ -1183,7 +1217,7 @@ The other classes are `other_session` and `no_session`.
 These classes describe ownership and admission; the enforcer applies its allow rules separately.
 The printed audit omits `no_session` builds.
 The audit sends no messages and stops no processes.
-The `hold`, `status`, and `audit` commands accept `--proc-root` for a fake process tree in tests.
+The `clear`, `drain`, `status`, and `audit` commands accept `--proc-root` for a fake process tree in tests.
 
 The audit calls `hold_enforcer.record_build(..., action="audit")` for each `other_session` or `no_session` build. The enforcer uses the same writer with `action="stopped"` for each stopped root. Both call `store.append_line` in the current process, after the audit read; no detached audit recorder runs. The kernel boot id, PID and process start time identify the build. The permanent file is `buildlog/<host>/hold-builds-<hold hash>.jsonl`. A separate `.lock` file covers the duplicate check and append, once per build, holder key, `since` and action. A new hold or a reused PID gets a new row. Index schema 21 adds `action` to `hold_builds`; old rows read as `audit`. Rows record hold identity, build identity, class, owner, command as shell text, working directory and observation time. Holder and admitted builds get no audit row.
 
@@ -1225,7 +1259,13 @@ It changes nothing.
 
 **Recorded hold intervals.** A new holder file queues a `began` event after writing the file; every removal in `release_hold` queues `ended`, using that file's key, name and reason. Repeating a hold writes no event. The event's UTC `at` is taken under the coordination lock and queued there; a detached `record.py hold-event` starts after the lock closes. A stalled event log cannot delay hold or release. Both reports read current coordination state independently. A lost event reads `end not recorded` or `began not recorded`, never a changed hold. The index keeps one row per event with its source file; the `holds` view pairs by host, target and key, ordering equal instants began first. Overlapping holders count once in held duration. A present holder file keeps an interval with no recorded end open, regardless of cycle release fields. Times shown use the user's zone, stored instants UTC.
 
-**Target option.** `--target` on hold and release defaults to natedev and is decoded into `NatedevHoldTarget | MacHoldTarget | UnknownHoldTarget | UncheckedHoldTarget`. Only a name other than natedev or mac reads the config, through `read_targets` imported at module level from `scripts/build_targets/target_config.py`; a readable config answers with the configured targets, an unreadable one with `unknown target <name>; the target config cannot be read: <reason>`, and both exit 2. The Mac subprocess is found beside build_hold via `Path(__file__)`, runs with `sys.executable`, and returns `MacHoldResult(status, stdout, stderr)`. It creates no natedev holder, cycle or event. `--release-eta`, `--zone` and `--resume` with Mac print the unsupported option and exit 2. `/build:hold`, `/build:mac` and `/build:status` are grouped beside the two reports; `/verify_saved`, `/lint_config` and `/validate_and_push` stay separate.
+**Target selection.** `clear`, `drain`, and `release` accept one optional positional target.
+The shared target reader supplies configured names and `default_target`.
+Only natedev acts in this delivery.
+Mac, AWS, and `all` print one unsupported-command line and return 2 without changing state.
+The parser rejects `--target` and the trailing `target <name>` form.
+The retained remote helpers remain unreachable from these commands.
+`/build:mac block` and `/build:mac unblock` retain the Mac workflow.
 
 **No-cycle release.** With no cycle, `release` calls `release_hold` under the lock; the last holder's line becomes `released, builds may resume. No hold cycle: broadcast this release to every session.`, and the command doc has the holder broadcast it with `/notify_top_level --here`. A cycle release's final line never carries that clause.
 

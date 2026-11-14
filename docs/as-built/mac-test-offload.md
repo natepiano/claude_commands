@@ -63,7 +63,9 @@ A PID alone cannot release another attempt.
 - **Pending until idle.** A block is pending while any claim is live (it waits on the oldest one's `what`), or while `ci_activity` reads busy: a queued or in-progress run of `ci_workflow` is busy until it lists a job named `ci_job` with status `completed`. A pending block says `a CI run may still use the Mac`; the stored `waiting_on` kind is `ci_job`.
 - **The message.** The block sends one free message with key `mac-free-<since>`. A staff holder receives it through the fixed staff ID. A holder outside staff uses the recorded session socket or given key. The message states which work ended and that the block remains active. A send.py exit status of 0 or 1 counts as delivery.
 - Every `gh` call is bounded by `gh_timeout_s`; the send and the session lookup by 30 s (`MAC_TEST_MESSAGE_TIMEOUT_S`). An empty `ci_repo` turns every `gh` call off.
-- `commands/build/mac.md` is `/build:mac block <why>`, `unblock`, `status`, and `audit`; `/build:hold hold <why> target mac` runs the same block command with its default duration. `/build:status [--probe]` only reads coordination state, with a reach check when requested. `mac_test.py status` calls `full_settle`, which can lift expiry, restore CI and send pending messages.
+- `/build:mac` accepts `block <why>`, `unblock`, `status`, and `audit`.
+  `/build:status [--probe]` reads coordination state and checks reach only when requested.
+  `mac_test.py status` calls `full_settle`, which can lift expiry, restore CI, and send pending messages.
 
 ### The idle claim — `mac_test.py watch-claim`
 
@@ -373,7 +375,7 @@ An interrupted run stops and reaps both log readers after recording its result. 
   The reason must be present, nonblank, and must not start with `--`.
   Reservation words also refuse with exit 2 before work starts.
   The words are reserve, reserved, reservation, hold, holds, held, blocked, claim, claims, busy, showrunner, and ruling.
-  The refusal points to `/build:hold hold <why> target mac` for a reservation.
+  The refusal points to `/build:mac block <why>` for a reservation.
   The reason does not enter the tree key or Cargo arguments.
   `compose_nextest_args` constructs nextest arguments for `try_mac_test`.
   `VERIFY_MAC_RUNNER` supplies a runner stand-in in tests.
