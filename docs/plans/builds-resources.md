@@ -15,7 +15,7 @@ Own what a build may use and when it starts: memory admission and the memory que
 - **Project started:** 2026-10-29T14:07:00+00:00
 - **Stack:** Python 3.13, standard library only; basedpyright strict (`pyrightconfig.json`); unittest. Bash for the memory gate and hooks.
 - **Layout:**
-  - `scripts/lint/memory_admit.py` — the admission checker. `check_memory_reading(path)` is the tripwire check: with `BUILDLOG_LIVE_MEMORY_TRIPWIRE` set, a path that resolves to `/proc/meminfo` or `/proc/pressure/memory` appends a record and raises `LiveMemoryReading`. `read_meminfo(path)` returns `HostMemory` (`MemAvailable`, `MemTotal`, `SwapTotal`, `SwapFree`); its path comes from the shell (`check <meminfo> …`) or from `BUILDLOG_MEMINFO` (`read_queue`). `read_pressure(host)` reads `BUILDLOG_MEMORY_PRESSURE`, default `/proc/pressure/memory`, and holds every step when `full avg10` > 5, or when swap use is over 85% and `some avg10` is over 25% (Phase 12). The tripwire also protects live cgroup reads; fixtures use `fake_memory_readings`, which includes a private `BUILDLOG_BUILDS_CGROUP`. It swallows `OSError`/`ValueError`. Both call `check_memory_reading` before they open the file. Callers: `check` (in two places) and `read_queue` (the `/build:queue` view). `run_action` (actions include `tripwire <path>`), `main` (a `LiveMemoryReading` exits 2 with its text as the last stderr line).
+  - `scripts/lint/memory_admit.py` — the admission checker. `check_memory_reading(path)` is the tripwire check: with `BUILDLOG_LIVE_MEMORY_TRIPWIRE` set, a path that resolves to `/proc/meminfo` or `/proc/pressure/memory` appends a record and raises `LiveMemoryReading`. `read_meminfo(path)` returns `HostMemory` (`MemAvailable`, `MemTotal`, `SwapTotal`, `SwapFree`); its path comes from the shell (`check <meminfo> …`) or from `BUILDLOG_MEMINFO` (`read_queue`). `read_pressure(host)` reads `BUILDLOG_MEMORY_PRESSURE`, default `/proc/pressure/memory`, and holds every step when `full avg10` is over `full_pressure_limit`, or else when `some avg10` is over `some_pressure_limit` (config/build_admission.conf); swap use has no part (Phase 117). The admission wire must stay readable by the client at `7fdfd9a6a`: add only optional fields, and add no enum value; `legacy_pressure_shape()` in `scripts/build_queue/snapshot_codec.py` writes the old pressure shape. A change to an admission record runs `scripts.build_queue.test_snapshot_codec`. The tripwire also protects live cgroup reads; fixtures use `fake_memory_readings`, which includes a private `BUILDLOG_BUILDS_CGROUP`. It swallows `OSError`/`ValueError`. Both call `check_memory_reading` before they open the file. Callers: `check` (in two places) and `read_queue` (the `/build:queue` view). `run_action` (actions include `tripwire <path>`), `main` (a `LiveMemoryReading` exits 2 with its text as the last stderr line).
   - `scripts/lint/memory_gate.sh` — `buildlog_wait_for_memory`. With the tripwire set it resolves `$meminfo` and refuses a live path through `memory_admit.py tripwire <path>`. Then it reads `MemAvailable` itself from `${BUILDLOG_MEMINFO:-/proc/meminfo}` and starts `memory_admit.py check`. A checker that exits non-zero is refused with its last output line (`buildlog_memory_refuse`). On darwin with `BUILDLOG_MEMINFO` unset it grants at once and reads nothing.
   - `scripts/hooks/pre-tool-use-brp-launch-gate.sh` — sources `memory_gate.sh` and calls `buildlog_wait_for_memory` with no arguments (a launch: no reservation).
   - `scripts/hooks/test_brp_launch_gate.py` — `setUp` :53 takes `BUILDLOG_MEMINFO`, `BUILDLOG_MEMORY_PRESSURE` and `BUILDLOG_LIVE_MEMORY_TRIPWIRE` from `fake_memory_readings(self.root)` (:74). `test_low_memory_wait_leaves_old_release_record_unchanged` :159 writes its low value to the returned `meminfo` file.
@@ -2397,13 +2397,15 @@ Each Mac run without `--target-dir` trims the mirror target to `mac_budget_gib.<
 - `scripts/build_queue/admission_client.py`
 - `scripts/build_queue/test_admission_service.py`
 - `scripts/build_queue/test_admission_client.py`
+- `scripts/lint/test_memory_admit.py`
+- `scripts/production/test_merge_gate_suites_admission.py`
 
 **Workers:** one implement worker.
 
 **State:** none.
 
 **Verification:**
-1. Test: `scripts.build_queue.test_admission_service` and `scripts.build_queue.test_admission_client`.
+1. Test: `scripts.build_queue.test_admission_service`, `scripts.build_queue.test_admission_client`, `scripts.lint.test_memory_admit` and `scripts.production.test_merge_gate_suites_admission`.
 2. Lint: `basedpyright` on the changed files, once after the edits.
 
 **Speed:** one name lookup for each wait reply; no new read of a file or of `/proc`.
@@ -2423,3 +2425,22 @@ Each Mac run without `--target-dir` trims the mirror target to `mac_budget_gib.<
 - `scripts/buildlog/mac_idle.py` — `mac_work` reads a running CI Mac job as Mac work
 - `scripts/mac_test/test_mac_test.py` — `test_busy_ci_keeps_block_pending_until_watch_sends_once` is a queued/running table
 - `scripts/buildlog/test_mac_idle.py` — rows for a running CI Mac job with a block and with no block
+
+### Phase 117 — The memory pressure hold fires on some pressure alone  · status: done
+
+#### As-built
+
+- `pressure_from_readings()` (`scripts/lint/memory_admit.py`) holds with condition `"full"` when full avg10 is above `full_pressure_limit`, else with `"some"` when some avg10 is above `some_pressure_limit`. Swap use has no part. At the 2026-11-13 12:26 natedev freeze, some avg10 was 91% with swap at 50%, and the old swap-and-some rule did not hold.
+- `MemoryPressure.condition` is `Literal["full", "some"]`. The texts: `memory pressure: some avg10 <v>` (`admission_records.pressure_text`), `; starts below some avg10 <limit>%` (`queue_evidence.pressure_text`), `some memory pressure` (`admission_client.wait_reasons`).
+- The user deleted the `swap_used_limit` setting: the config line and comment in `config/build_admission.conf` and the fixture copy, `PressurePolicy.swap_used_limit`, its reader in `read_memory_config()` and its test rows. A config file that still has the key reads without an error.
+- `legacy_pressure_shape()` (`scripts/build_queue/snapshot_codec.py`) keeps the wire readable by the client at `7fdfd9a6a`: it writes `swap_used_limit: 0.0` in each `PressurePolicy` record and `"swap"` for a `"some"` condition. The parser reads `"swap"` as `"some"`. `test_pinned_client_reads_current_pressure_policy_and_some_pressure` (`test_snapshot_codec.py`) proves it.
+- The memory page: the swap gauge has no limit line, and its hover says that swap use alone does not hold the queue. The "near a limit" level uses some and full only. `memory_feed.py` sends no `limits.swap`.
+
+**Files:**
+- `scripts/lint/memory_admit.py` — the hold predicate
+- `scripts/build_queue/admission_records.py` — the condition type, the policy and its reader, the pressure text
+- `scripts/build_queue/snapshot_codec.py` — the old wire shape for older clients
+- `scripts/build_queue/admission_client.py`, `queue_evidence.py` — the wait and evidence texts
+- `scripts/build_queue/memory_feed.py`, `memory_live.html` — the page limits and the swap gauge
+- `config/build_admission.conf`, `scripts/lint/fixtures/build_admission.conf` — `swap_used_limit` deleted
+- tests: `test_memory_admit.py`, `test_snapshot_codec.py`, `test_admission_protocol.py`, `test_queue_evidence.py`, `test_queue_view.py`, `test_memory_feed.py`, `test_memory_hover.py`, `test_merge_gate_suites_admission.py`

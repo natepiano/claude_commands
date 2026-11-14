@@ -347,7 +347,7 @@ body.queue-unavailable .status, body.queue-unavailable .card { display: none; }
     <div class="gauges">
       <div class="gauge" data-tip="g-some"><span>Some tasks stall</span><div class="gt"><div class="gf" id="gf-some"></div><div class="gl" id="gl-some"></div><div class="amounts"><span class="bar-amount" id="gv-some" data-start="0"></span><span class="bar-amount limit-label" id="limit-some"></span></div></div></div>
       <div class="gauge" data-tip="g-full"><span>All tasks stall</span><div class="gt"><div class="gf" id="gf-full"></div><div class="gl" id="gl-full"></div><div class="amounts"><span class="bar-amount" id="gv-full" data-start="0"></span><span class="bar-amount limit-label" id="limit-full"></span></div></div></div>
-      <div class="gauge" data-tip="g-swap"><span>Swap used <span class="num" id="swap-sum"></span></span><div class="gt"><div class="gf" id="gf-swap"></div><div class="gl" id="gl-swap"></div><div class="amounts"><span class="bar-amount" id="gv-swap" data-start="0"></span><span class="bar-amount limit-label" id="limit-swap"></span></div></div></div>
+      <div class="gauge" data-tip="g-swap"><span>Swap used <span class="num" id="swap-sum"></span></span><div class="gt"><div class="gf" id="gf-swap"></div><div class="amounts"><span class="bar-amount" id="gv-swap" data-start="0"></span></div></div></div>
     </div>
     <h3>Swap by group</h3>
     <div class="swaprows" id="swaprows"></div>
@@ -389,8 +389,8 @@ function formatPercent(value, complete = true) {
 function level(d) {
   if (!recorded(d.psi.some) || !recorded(d.psi.full)) return "neutral";
   if (d.pressure !== "none") return "hold";
-  const L = d.limits, sp = pctOf(d.swap_used, d.swap_total);
-  return (d.psi.some >= L.some * 0.6 || d.psi.full >= L.full * 0.6 || sp >= L.swap * 0.8) ? "warn" : "ok";
+  const L = d.limits;
+  return (d.psi.some >= L.some * 0.6 || d.psi.full >= L.full * 0.6) ? "warn" : "ok";
 }
 Object.assign(TIPS, {
   pill: (d) => [`Memory pressure · ${({ ok: "none", warn: "near a limit", hold: "queue holds", neutral: "stall not recorded" })[level(d)]}`, `Pressure means the system waits for memory. Above a limit, the queue starts no new step. Click to see swap and the pressure checks.`],
@@ -401,7 +401,7 @@ Object.assign(TIPS, {
   swaphead: () => ["Swap and memory pressure", "Swap is disk space the system uses when RAM is short. Swap itself is not a problem. Stalls are the problem: they show the system waits for memory."],
   "g-some": (d) => [`Some tasks stall · ${(!recorded(d.psi.some) ? "not recorded" : formatPercent(d.psi.some))}`, `Part of the last 10 s that at least one task waited for memory. The queue holds above ${formatPercent(d.limits.some)} (the red line).`],
   "g-full": (d) => [`All tasks stall · ${(!recorded(d.psi.full) ? "not recorded" : formatPercent(d.psi.full))}`, `Part of the last 10 s that all tasks waited for memory. This is the serious signal. The queue holds above ${formatPercent(d.limits.full)}.`],
-  "g-swap": (d) => [`Swap used · ${formatPercent(pctOf(d.swap_used, d.swap_total))}`, `The queue holds above ${formatPercent(d.limits.swap)} swap used.`],
+  "g-swap": (d) => [`Swap used · ${formatPercent(pctOf(d.swap_used, d.swap_total))}`, "Swap use alone does not hold the queue."],
 });
 function macRow(row) {
   return row.kind === "mac-build" || row.kind === "mac-unavailable";
@@ -652,7 +652,7 @@ function renderSwap(d) {
   const missing = Object.values(d.psi).filter(value => value && !recorded(value)).map(value => value.reason);
   if (d.pressure !== "none") missing.unshift(d.pressure);
   $("pressure-reason").textContent = [...new Set(missing)].join(" · ");
-  const g = { some: [d.psi.some, d.limits.some], full: [d.psi.full, d.limits.full], swap: [pctOf(d.swap_used, d.swap_total), d.limits.swap] };
+  const g = { some: [d.psi.some, d.limits.some], full: [d.psi.full, d.limits.full] };
   for (const [k, [v, lim]] of Object.entries(g)) {
     $(`gf-${k}`).style.width = `${!recorded(v) ? 0 : Math.min(100, v).toFixed(2)}%`;
     $(`gf-${k}`).className = `gf ${v >= lim ? "hold" : v >= lim * 0.6 ? "warn" : ""}`;
@@ -660,6 +660,9 @@ function renderSwap(d) {
     $(`gv-${k}`).textContent = !recorded(v) ? "not recorded" : formatPercent(v);
     $(`limit-${k}`).textContent = `Queue holds at ${formatPercent(lim)}`;
   }
+  const swap = pctOf(d.swap_used, d.swap_total);
+  $("gf-swap").style.width = `${Math.min(100, swap).toFixed(2)}%`;
+  $("gv-swap").textContent = formatPercent(swap);
   placeLimitLabels();
   $("swaprows").innerHTML = d.swap_by.map((row, index) =>
     `<div class="row ${row.kind}" data-tip="swap:${index}" data-bytes="${row.bytes}"><span class="name">${row.kind === "smaller" ? `<details data-owner-key="${esc(row.kind)}"><summary><span class="chev">▶</span>${esc(row.name)}</summary><div class="swap-members">${row.detail.split("; ").map(part => `<div>${esc(part)}</div>`).join("")}</div></details>` : esc(row.name)}</span><span class="v">${swapAmount(row.bytes)}</span><small>${row.kind === "smaller" ? "" : esc(visibleDetail(row))}</small></div>`).join("");
@@ -788,7 +791,7 @@ function placeBarLabels(container, limit) {
 }
 
 function placeLimitLabels() {
-  for (const key of ["some", "full", "swap"]) {
+  for (const key of ["some", "full"]) {
     const label = $(`limit-${key}`);
     const track = label.closest(".gt");
     const line = $(`gl-${key}`);

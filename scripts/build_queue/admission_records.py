@@ -52,7 +52,6 @@ class AdmissionTiming:
 @dataclass(frozen=True)
 class PressurePolicy:
     full_avg10_limit: float
-    swap_used_limit: float
     some_avg10_limit: float
 
 
@@ -476,7 +475,7 @@ class MemoryPressure:
     some_avg10: float = 0.0
     swap_used_percent: float = 0.0
     next_start_at: float = 0.0
-    condition: Literal["full", "swap"] | PressureConditionNotRecorded = PressureConditionNotRecorded()
+    condition: Literal["full", "some"] | PressureConditionNotRecorded = PressureConditionNotRecorded()
 
 
 @dataclass(frozen=True)
@@ -1216,7 +1215,7 @@ def read_memory_config(*, report: bool = True) -> MemoryConfig:
             timing = AdmissionTiming(*(whole(key) for key in (
                 "recovery_start_seconds", "estimate_refresh_seconds", "slot_gap_seconds")), fresh_test_seconds=running_interval)
             pressure = PressurePolicy(*(number(key) for key in (
-                "full_pressure_limit", "swap_used_limit", "some_pressure_limit")))
+                "full_pressure_limit", "some_pressure_limit")))
             kinds = {key.removeprefix("peak_hold_seconds."): whole(key)
                      for key in values if key.startswith("peak_hold_seconds.")}
             first_peaks = {key.removeprefix("program_first_peak_gib."): gib(key)
@@ -1273,8 +1272,8 @@ def pressure_text(pressure: MemoryPressure) -> str:
     if isinstance(pressure.condition, PressureConditionNotRecorded):
         return (f"memory pressure: condition not recorded by service; full avg10 {pressure.full_avg10:.1f}; "
                 f"some avg10 {pressure.some_avg10:.1f}; swap {format_percent(pressure.swap_used_percent)} used")
-    if pressure.condition == "swap":
-        return f"memory pressure: swap {format_percent(pressure.swap_used_percent)} used; some avg10 {pressure.some_avg10:.1f}"
+    if pressure.condition == "some":
+        return f"memory pressure: some avg10 {pressure.some_avg10:.1f}"
     return f"memory pressure: full avg10 {pressure.full_avg10:.1f}"
 
 
