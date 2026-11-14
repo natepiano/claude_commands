@@ -148,11 +148,6 @@ def _run_worker(record: RunRecord, membership: staff.StaffSnapshot) -> staff.Sta
     return member
 
 
-def _is_worker(staff_id: str) -> bool:
-    member = staff.local_snapshot().by_id(staff.StaffId(staff_id)) if staff_id else None
-    return member is not None and member.kind == "worker"
-
-
 def _runs_dir(session_dir: str) -> Path:
     return Path(session_dir) / DETACHED_RUNS_DIR
 
@@ -370,26 +365,48 @@ def _complete_worker_dispatch(record: RunRecord) -> None:
 _RUN_FILES = ("{}.log", "{}.scope", "{}.reap", "{}.record.lock", ".{}.delivery.lock", "{}.json")
 
 
-def remove_finished(runs: Path, worker: str) -> list[str]:
-    """Delete the worker's finished runs when its pass ends; the user keeps no old run files.
-
-    Until the pass ends, the pass reads these records to prove that each result reached the transcript.
-    """
+def prune_finished(runs: Path) -> list[str]:
+    """Delete the folder's finished runs that no reader needs; the user keeps no old run files."""
     if not runs.is_dir():
         return []
     with (runs / ".start.lock").open("a") as admission:
         fcntl.flock(admission, fcntl.LOCK_EX)
-        return _remove_finished_locked(runs, worker)
+        return _prune_finished_locked(runs)
 
 
-def _remove_finished_locked(runs: Path, worker: str) -> list[str]:
-    """Delete the finished runs of one owner while the caller holds the admission lock."""
+def _prune_finished_locked(runs: Path) -> list[str]:
+    """Delete settled finished runs while the caller holds the admission lock.
+
+    A worker's run stays while its pass is open: the pass reads it to prove that the result reached
+    the transcript. Another owner's run stays until that owner starts again, so the owner can read
+    its log first. A run whose owner has no staff row goes.
+    """
+    from scripts.herdr import worker_panes
+
+    membership = staff.local_snapshot()
+    records = [(path, raw) for path in sorted(runs.glob("*.json"))
+               if (raw := worker_lifecycle.read_json_object(path)).get("run_id")]
+    newest: dict[str, float] = {}
+    for _, raw in records:
+        owner = str(raw.get("worker", ""))
+        newest[owner] = max(newest.get(owner, 0.0), _number(raw.get("started_at"), 0.0))
+    passes: dict[staff.StaffId, dict[str, object]] = {}
     removed: list[str] = []
-    for path in sorted(runs.glob("*.json")):
-        raw = worker_lifecycle.read_json_object(path)
+    for path, raw in records:
         run_id = raw.get("run_id")
-        if (raw.get("worker") != worker or raw.get("status") != "finished" or raw.get("completion_pending")
+        if (raw.get("status") != "finished" or raw.get("completion_pending")
                 or not isinstance(run_id, str) or path.name != f"{run_id}.json"):
+            continue
+        started = _number(raw.get("started_at"), 0.0)
+        staff_id = str(raw.get("staff_id", ""))
+        member = membership.by_id(staff.StaffId(staff_id)) if staff_id else None
+        if member is not None and member.kind == "worker":
+            if member.id not in passes:
+                passes[member.id] = worker_panes.worker_pass(member, runs.parent, record=membership)
+            passed = passes[member.id]
+            if passed and passed.get("status") != "completed" and started >= _number(passed.get("started_at"), 0.0):
+                continue
+        elif (member is not None or not staff_id) and started >= newest[str(raw.get("worker", ""))]:
             continue
         for name in _RUN_FILES:
             (runs / name.format(run_id)).unlink(missing_ok=True)
@@ -520,11 +537,6 @@ def command_start(args: argparse.Namespace) -> int:
     with (runs / ".start.lock").open("a") as admission:
         fcntl.flock(admission, fcntl.LOCK_EX)
         _ = _reap_orphans_locked(runs)
-        owner = reference or _worker_reference(session_dir, name)
-        if not _is_worker(owner):
-            # An owner without a pass read its earlier results before this start.
-            # A worker's pass end deletes the worker's finished runs.
-            _ = _remove_finished_locked(runs, name)
         if twin := live_twin(runs, name, command, tree_key):
             started = time.strftime("%H:%M:%S", time.localtime(twin["started_at"]))
             print(f"run {twin['run_id']} is already running for {name} on these files (started {started}, "
@@ -548,7 +560,7 @@ def command_start(args: argparse.Namespace) -> int:
         log_path = runs / f"{run_id}.log"
         record: RunRecord = {
             "run_id": run_id, "status": "running", "session_dir": session_dir, "worker": name,
-            "staff_id": owner, "label": label, "command": command,
+            "staff_id": reference or _worker_reference(session_dir, name), "label": label, "command": command,
             "log": str(log_path), "started_at": time.time(), "pid": 0,
             "director_dir": director_dir, "done_message_file": done_file, "tree_key": tree_key,
         }
@@ -561,6 +573,7 @@ def command_start(args: argparse.Namespace) -> int:
             )
         record["pid"] = supervisor.pid
         _ = _write_record(record_path, record)
+        _ = _prune_finished_locked(runs)
     print(f"run {run_id} started detached for {name} (pid {supervisor.pid}, log {log_path}); "
           + "its result arrives as your next message")
     return 0

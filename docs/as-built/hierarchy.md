@@ -118,6 +118,11 @@ The command shares that group through the systemd scope prefix.
 The supervisor installs no signal handler.
 The orphan reaper finishes a dead supervisor's record and delivers its result during start, restore, or explicit recovery.
 Results return to the worker or its current holder. Callers do not poll.
+Finished runs are deleted with their logs and lock files when no reader needs them.
+A worker's pass end deletes the folder's finished runs, and so does each start.
+A run stays while its worker's pass is open and the run started in that pass.
+A run of another owner stays until that owner starts a newer run.
+A run whose owner has no staff row goes at once.
 
 ### Channels and user decisions
 
