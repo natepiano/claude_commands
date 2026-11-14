@@ -431,6 +431,8 @@ Exit and pause records take priority over all activity states.
 Without a live detached run, a missing live session gives `exited`.
 Other live activity gives `idle`.
 Role counts are `busy`, `idle`, `paused`, `exited` and `total`.
+The accounts board has no activity column, the same as the cargo-handler accounts table.
+The activity of each session shows only in the cargo-handler tiles, from `cargo-handler census --json`.
 An older peer's document holds waiting within busy and starting within idle, with separate `starting` and `waiting` fields.
 The decoder moves that peer's `starting` count from idle to busy.
 Claude producers count under `showrunners` with the same hold and activity rules.
