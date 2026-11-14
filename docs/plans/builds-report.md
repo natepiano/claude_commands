@@ -1412,3 +1412,11 @@ From the user (via builds), 2026-11-13, with user shot /tmp/claude/scratch/until
 - `identityHtml` on the Builds page is the one place for the block. Every walk and waiter hover, Mac rows included, starts with it: showrunner, unit, then worker, with the user's label texts. The labels are lowercase and the colons align.
 - Row headings and the local row body no longer repeat the owner that the block names. A hover with the block is up to 24rem wide, so the values do not wrap.
 - `memory_page_proof.mjs --identity` saves before and after shots of the Mac row hover, plus one showrunner-run row and one unit-director-run row.
+
+### Phase 75 — The hover colons line up exactly · status: todo
+
+From builds (not the user), 2026-11-13 23:46: "the colon after 'showrunner' sits about 3 px left of the colons after 'unit' and 'worker'. The page font is proportional, so space padding cannot align them. Put the label, the colon and the value in three grid columns, so all three colons line up exactly. Send it as a small phase with before and after shots."
+
+1. `identityHtml` gives each line three cells: the label (`dt`), the colon (`dd.colon`, hidden from screen readers) and the value (`dd`). The `.identity` grid has three columns, so every colon starts at the same x.
+2. Proof: before and after shots of a Mac row hover and a queued row hover; the proof measures the colon cells and requires one left edge.
+3. Run every build_queue module before the checkpoint.

@@ -20,6 +20,11 @@ from scripts.lib import test_hang_guard
 GIB = admission_records.GIB
 
 
+def field_values(fields: ElementTree.Element) -> list[str | None]:
+    """Read the value cells of a field list, without the colon cells."""
+    return [cell.text for cell in fields.findall("dd") if cell.get("class") != "colon"]
+
+
 class MemoryHoverTests(unittest.TestCase):
     def test_builds_page_has_no_navigation_or_framing_restriction(self) -> None:
         page = Path(memory_feed.__file__).with_name("memory_live.html").read_text()
@@ -187,9 +192,10 @@ class MemoryHoverTests(unittest.TestCase):
                     self.assertEqual(root[0].tag, "b")
                     self.assertEqual(root[1].get("class"), "identity")
                     names = [cell.text for cell in root[1].findall("dt")]
-                    values = [cell.text for cell in root[1].findall("dd")]
+                    values = field_values(root[1])
+                    self.assertEqual([cell.text for cell in root[1].findall("dd[@class='colon']")], [":"] * len(names))
                     self.assertEqual(list(zip(names, values, strict=True)), expected)
-                    self.assertNotIn("showrunner:", "".join(root.itertext()))
+                    self.assertEqual({cell.get("aria-hidden") for cell in root[1].findall("dd[@class='colon']")}, {"true"})
 
     def test_a_ci_hover_keeps_its_ci_line(self) -> None:
         data = {"read_at": 200, "waiters": [], "walk": [{"name": "hana CI", "ci": True, "ci_label": "hana CI · runner-1",
@@ -197,7 +203,7 @@ class MemoryHoverTests(unittest.TestCase):
         rendered = cast(str, self.page_expression("tooltipHtml('row:0', data)", data, walk=True))
         root = ElementTree.fromstring(f"<root>{rendered}</root>")
         self.assertEqual([(cell.text) for cell in root[1].findall("dt")], ["CI"])
-        self.assertEqual([(cell.text) for cell in root[1].findall("dd")], ["hana CI · runner-1"])
+        self.assertEqual(field_values(root[1]), ["hana CI · runner-1"])
 
     def test_cloud_hover_shows_the_progress_and_reservation(self) -> None:
         for status, counter, expected in (
@@ -214,7 +220,9 @@ class MemoryHoverTests(unittest.TestCase):
                 owner = {"walk": [{"unit": "cloud-unit", "showrunner": "fixture"}]}
                 identity = ElementTree.fromstring(
                     f"<root>{self.page_expression('identityHtml(data.walk[0])', owner, walk=True)}</root>")
-                self.assertEqual([cell.text for cell in identity.findall("dl/dd")], ["fixture", "cloud-unit"])
+                fields = identity.find("dl")
+                assert fields is not None
+                self.assertEqual(field_values(fields), ["fixture", "cloud-unit"])
                 self.assertFalse(hover[1].startswith("."), hover[1])
 
     def test_progress_percent_rounds_down_until_the_counter_is_complete(self) -> None:
@@ -360,7 +368,7 @@ class MemoryHoverTests(unittest.TestCase):
                 self.assertEqual(title.text, "hana nextest · 3.5 GiB")
                 self.assertEqual(sentence.text, "Mac memory does not count against natedev.")
                 labels = [cell.text for cell in tooltip.findall("dl/dt")]
-                values = [cell.text for cell in tooltip.findall("dl/dd")]
+                values = [value for fields in tooltip.findall("dl") for value in field_values(fields)]
                 self.assertEqual(labels, ["showrunner", "unit", "Target", "Started", "Used", "Reading age"])
                 fields = dict(zip(labels, values, strict=True))
                 self.assertEqual(fields["showrunner"], "hana")

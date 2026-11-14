@@ -94,11 +94,10 @@ h1 { font-size: 1.4rem; margin: 0; letter-spacing: -0.01em; }
 #tip .mac-tip-fields { display: grid; grid-template-columns: max-content minmax(0, 1fr); gap: 2px 16px; margin: 6px 0 0; white-space: normal; }
 #tip .mac-tip-fields dt { text-align: left; }
 #tip .mac-tip-fields dd { margin: 0; text-align: right; font-variant-numeric: tabular-nums; }
-#tip .identity { display: grid; grid-template-columns: max-content minmax(0, 1fr); gap: 2px 8px; margin: 6px 0; white-space: normal; }
-#tip .identity dt { display: flex; justify-content: space-between; }
+#tip .identity { display: grid; grid-template-columns: max-content max-content minmax(0, 1fr); gap: 2px 0; margin: 6px 0; white-space: normal; }
 #tip:has(.identity) { max-width: min(calc(100vw - 20px), 24rem); }
-#tip .identity dt::after { content: ":"; }
 #tip .identity dd { margin: 0; overflow-wrap: anywhere; }
+#tip .identity dd.colon { padding: 0 8px 0 2px; }
 #tip .mac-note { display: block; margin-top: 6px; white-space: nowrap; }
 #tip:has(.mac-note) { width: max-content; max-width: min(calc(100vw - 20px), 34rem); }
 .seg-remote { background: var(--remote-memory); }
@@ -466,7 +465,7 @@ function identityFields(row) {
   return [showrunner, ["unit", unit || "not recorded"]];
 }
 function identityHtml(row) {
-  return `<dl class="identity">` + identityFields(row).map(([name, value]) => `<dt>${esc(name)}</dt><dd>${esc(value)}</dd>`).join("") + `</dl>`;
+  return `<dl class="identity">` + identityFields(row).map(([name, value]) => `<dt>${esc(name)}</dt><dd class="colon" aria-hidden="true">:</dd><dd>${esc(value)}</dd>`).join("") + `</dl>`;
 }
 function pageOwnerTipFields(data) {
   const rows = [...data.walk, ...data.waiters, ...data.swap_by];

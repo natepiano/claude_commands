@@ -926,7 +926,7 @@ try {
             if(version==='after') {
               const tips=await evaluate(`[...latest.walk.map((row,index)=>'row:'+index),...latest.waiters.map((row,index)=>'wait:'+index)].map(key=>tooltipHtml(key,latest))`);
               for(const tip of tips) {
-                assert.match(tip,/<dl class="identity"><dt>showrunner<\/dt><dd>hana<\/dd><dt>unit<\/dt><dd>research<\/dd>/);
+                assert.match(tip,/<dl class="identity"><dt>showrunner<\/dt><dd class="colon" aria-hidden="true">:<\/dd><dd>hana<\/dd><dt>unit<\/dt><dd class="colon" aria-hidden="true">:<\/dd><dd>research<\/dd>/);
               }
               const allTips=await evaluate(`(() => {
                 const keys=[...new Set([...document.querySelectorAll('[data-tip]')].map(node=>node.dataset.tip))];
@@ -1241,39 +1241,49 @@ try {
             progress:{kind:'RowProgress',phase:'testing',done:891,total:894,percent:100*891/894,unit:'units'}});
           Object.assign(reading.walk[local],{name:'builds merge gate',showrunner:'builds',unit:'—',runner:'showrunner',worker:''});
           Object.assign(reading.waiters[0],{name:'report nextest',showrunner:'builds',unit:'report',runner:'unit director',worker:''});
-          const lines=text=>text.split('\n').map(line=>line.trim()).filter(Boolean);
+          // A colon is its own cell on the after page; the before page draws it after the label.
           const identity=key=>evaluate(`(() => {
             showTip(${JSON.stringify(key)},700,420);
             const tip=document.querySelector('#tip');
             const block=tip.querySelector('.identity');
+            const colonLeft=cell=>{
+              const colon=cell.nextElementSibling;
+              if(colon?.classList.contains('colon')) return colon.getBoundingClientRect().left;
+              const style=getComputedStyle(cell,'::after');
+              const probe=document.createElement('span');
+              probe.textContent=':';
+              probe.style.font=style.font;
+              document.body.append(probe);
+              const width=probe.getBoundingClientRect().width;
+              probe.remove();
+              return cell.getBoundingClientRect().right-width;
+            };
             return {text:tip.innerText,fields:block?[...block.querySelectorAll('dt')].map(cell=>[cell.textContent,
-              cell.nextElementSibling.textContent,getComputedStyle(cell,'::after').content,
-              cell.getBoundingClientRect().right]):[],
+              (cell.nextElementSibling?.classList.contains('colon')?cell.nextElementSibling.nextElementSibling:cell.nextElementSibling).textContent,
+              colonLeft(cell)]):[],
               first:tip.children[1]?.className||''};
           })()`);
-          for (const version of ['before','after']) {
-            await navigate(version==='before'?'before.html':'memory_live.html');
-            await show(reading);
-            const state=await identity('row:'+mac);
-            if(version==='after') {
-              assert.equal(state.first,'identity');
-              assert.deepEqual(state.fields.map(([name,value])=>[name,value]),
-                [['showrunner','hana'],['unit','research'],['worker','impl2']]);
-              assert.ok(state.fields.every(([, , colon])=>colon==='":"'));
-              assert.ok(new Set(state.fields.map(([, , , right])=>Math.round(right))).size===1,'The colons do not align.');
-            } else assert.ok(!lines(state.text).includes('worker'),state.text);
-            await capture(`${version}-identity-mac-row`,'#tip');
-            comparisons.push({version,row:'mac worker',...state});
-          }
+          const lefts=state=>[...new Set(state.fields.map(([, , left])=>left.toFixed(2)))];
           for (const [key,name,expected] of [
-            ['row:'+local,'showrunner-row',[['showrunner','builds'],['unit','this run is from the showrunner']]],
-            ['wait:0','unit-director-row',[['showrunner','builds'],['unit','report'],['worker','this run is from the unit director']]]]) {
-            const state=await identity(key);
-            assert.equal(state.first,'identity');
-            assert.deepEqual(state.fields.map(([field,value])=>[field,value]),expected);
-            await capture(`after-identity-${name}`,'#tip');
-            comparisons.push({version:'after',row:name,...state});
+            ['row:'+mac,'mac-row',[['showrunner','hana'],['unit','research'],['worker','impl2']]],
+            ['wait:0','queued-row',[['showrunner','builds'],['unit','report'],['worker','this run is from the unit director']]]]) {
+            for (const version of ['before','after']) {
+              await navigate(version==='before'?'before.html':'memory_live.html');
+              await show(reading);
+              const state=await identity(key);
+              assert.equal(state.first,'identity');
+              assert.deepEqual(state.fields.map(([field,value])=>[field,value]),expected);
+              if(version==='after') assert.equal(lefts(state).length,1,`The colons do not align: ${lefts(state)}`);
+              await capture(`${version}-colons-${name}`,'#tip');
+              comparisons.push({version,row:name,colonLefts:lefts(state),...state});
+            }
           }
+          await navigate('memory_live.html');
+          await show(reading);
+          const showrunnerState=await identity('row:'+local);
+          assert.deepEqual(showrunnerState.fields.map(([field,value])=>[field,value]),
+            [['showrunner','builds'],['unit','this run is from the showrunner']]);
+          assert.equal(lefts(showrunnerState).length,1);
         }
         if (beforePage && !queuedComparison && !consoleComparison && !ownersComparison && !blocksComparison && !identityComparison) {
           const review = structuredClone(readings.spacing);
