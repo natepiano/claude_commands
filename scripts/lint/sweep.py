@@ -199,7 +199,6 @@ from scripts.lib.process_failure import failure_detail
 from scripts.lib.user_zone import user_zone  # noqa: E402
 if TYPE_CHECKING:
     from scripts.lint import tmp_sweep
-    from scripts.copies import copies
     from scripts.lib import scratch
     from scripts.lib.atomic_file import write_text_atomic
     from scripts.buildlog import record, store
@@ -209,7 +208,6 @@ if TYPE_CHECKING:
     from scripts.notify.push_texts import RenderedPush
     from scripts.notify import review
 else:
-    from scripts.copies import copies
     from scripts.lib import scratch
     from scripts.lib.atomic_file import write_text_atomic
     from scripts.buildlog import store
@@ -3886,6 +3884,7 @@ def floor_roots(*, lint_settings: conf.ConfigRead | UseConfiguredValue = UseConf
     """Include the standing pool wherever copies configuration places it."""
     if isinstance(lint_settings, UseConfiguredValue):
         lint_settings = conf.read("lint")
+    from scripts.copies import copies
     return (*lint_settings.words("sweep_floor_roots"), str(copies.gates_root()))
 
 
@@ -4527,6 +4526,7 @@ def _hold_floor_pass(floor: int, dry_run: bool, *,
                         if isinstance(policy, NatedevFloor) else {})
         uses: dict[str, TargetUse | LockHeld] = dict(policy.uses(targets) if isinstance(policy, MacFloor) else process_uses(owners))
         if isinstance(policy, NatedevFloor):
+            from scripts.copies import copies
             busy_mirrors = mirror_leases.enter_context(copies.target_mirror_leases(targets))
             for root in targets:
                 if any(Path(root).resolve().is_relative_to(mirror) for mirror in busy_mirrors):
@@ -5140,6 +5140,7 @@ def main(argv: list[str]) -> int:
                 mac_floor, mac_roots = mac_floor_settings(mac_settings, mirror_root=mirror_root)
                 lint_settings = conf.read("lint")
                 timeout = mac_settings.number("probe_timeout_s")
+            from scripts.copies import copies
             with copies.mirror_sweep_leases(mirror_root.local_path()) as leases:
                 claims = floor_claims.read_claims(timeout)
                 return hold_floor(mac_floor, dry_run, lint_settings=lint_settings,
