@@ -923,7 +923,7 @@ class TurnEndTests(unittest.TestCase):
     def test_the_astra_launcher_returns_with_an_active_pass_and_a_worker_process_hold(self) -> None:
         router = test_worker.PaneCommandRouter()
         router.setup(self, self.case.fixture.root)
-        args = assign.Arguments(new_worker="astra-reviewer", summary=str(self.case.reply), policy="astra-reviewer")
+        args = assign.Arguments(new_worker="astra-reviewer", reply_file=str(self.case.reply), policy="astra-reviewer")
         hold_role = astra_roles.hold
         bootstrap_hooks: list[Future[turn_end.TurnOutcome]] = []
 

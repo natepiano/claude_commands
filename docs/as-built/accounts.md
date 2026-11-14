@@ -293,6 +293,7 @@ Worker assignment fallback to Claude remains separate from the selected Codex ac
 Routing returns only when the selected Codex account can work and its refusal has resolved.
 An owned workers refusal with no account capacity enables `no_worker_mode` on the workers-role host, `role_map.ROLE_MAP_HOST`.
 The refusal handler sets this flag independently of the first `NoRoomMove` entry and the Claude assignment switch.
+A zero account with credits off enables the same flag when its workers stay on it: no other account has room, or the workers move failed.
 The saved flag triggers one broadcast to showrunners and unit directors on both machines.
 `config/accounts.conf` supplies `no_worker_mode_on` and `no_worker_mode_off`; `quota-alert` identifies the sender.
 The ON notice directs directors to write code, run tests, and do reviews without assigning workers.
@@ -300,6 +301,18 @@ Successful Codex recovery clears the flag and broadcasts OFF after the workers a
 Recovery also clears the flag when no Claude assignment fallback was saved.
 An unfinished Claude switch or failed restoration retains the flag until recovery can finish.
 The state context saves each flag change and releases the lock before it starts a separate broadcast unit.
+When the flag goes on, the same step starts `scripts/production/worker_capacity.py stop` as a second transient unit.
+That command stops each Codex worker of every local parent, busy or idle, under the worker's lock, and proves the stop from a new pane observation.
+It ends each open pass of a stopped worker as `canceled`, also for a Codex worker whose pane is already closed.
+It closes the pane of a stopped worker when the close checks permit. Claude workers are not touched.
+Each affected director gets one stop report. A worker that is not proved stopped, or a pass that is not canceled, also goes to `faults_to`.
+A live detached run of a stopped worker continues; the report names its result file and its log.
+Its result goes to the director: `send.deliver_worker_text` sends the text for a stopped or closed worker to the holder and starts no worker.
+No command starts workers when the flag goes off; the next assign of a director starts its worker.
+
+The credits setting of the hold owner releases a credits-off hold: when `codex_credit_accounts` names the owner again, routing can return before the hold time.
+An unresolved refusal does not block the return when credits are on for the selected account and a reading taken after the refusal shows a credit balance.
+This rule is local to the return; `accounts.pick` and the next-move target check still treat that account as refused.
 The start uses `systemd-run --user --collect --quiet --no-block` with the user manager's environment.
 The unit uses the repository working directory and `scripts/lib/py` to run `scripts/production/broadcast.py`.
 The quota pass waits only for the unit start, so slow peer delivery cannot consume its 30-second budget.
@@ -313,6 +326,10 @@ The flag survives state reloads and suppresses repeated ON notices during the sa
 Normal recovery takes about two to three minutes plus reading, restoration, and broadcast time.
 This interval is not a fixed reset-to-notice deadline; stale readings, failed moves, or interrupted jobs can delay OFF.
 Pane workers move under their dispatch lock with fresh pane evidence.
+A worker whose source account is the target returns `already on <target>` with exit 0; the move closes and starts nothing.
+`pane_moves._own_policy` keeps the worker's family from its staff backend and reads that family's role row with `worker_panes.launch_policy(role, family)`.
+`worker_panes.kept_settings` then keeps the model, effort and service tier of the saved launch. The resume and the rollback both use this policy.
+So a change of the role's assigned family never moves a worker to another family.
 An idle worker closes its pane through the shared `worker_panes.can_close` check.
 `worker_panes.close` repeats that check under its worker lock before it closes the pane.
 Held dispatch locks, live launchers, and unfinished submitted passes keep the pane open.
@@ -399,7 +416,7 @@ An accepted reading without a date removes the stored date.
 Both renderers use the same problem lines from `StatusReading.notes`, including shared-home repairs.
 JSON `problems` matches the text board's problem lines, with only the `* ` footnote prefix removed.
 Each account row exports `sessions` beside `role_counts`.
-Each entry has a native `session` ID and a classified `state`: `busy`, `starting`, `waiting`, `idle`, `paused`, or `exited`.
+Each entry has a native `session` ID and a classified `state`: `busy`, `idle`, `paused`, or `exited`.
 The list reuses local count observations and reads no pane again.
 Peer caches provide aggregate counts only; the session list contains local members.
 Named problem causes and repair steps preserve the subject, fault, evidence, and action.
@@ -409,17 +426,13 @@ This preserves visible off-target members during a move.
 Local role counts read the registry, staff, pane launches, and worker records without writing state.
 `session_state.classify` supplies the shared unit status for the accounts board and the units table.
 An exit record takes precedence over a pause record.
-A busy pane gives `busy`. A starting pane gives `starting`, including with a live detached run.
-The starting state shows that the pane has not reached an idle prompt.
-Other live detached work gives `waiting`.
+A busy or starting pane gives `busy`. Live detached work also gives `busy`.
 Exit and pause records take priority over all activity states.
 Without a live detached run, a missing live session gives `exited`.
 Other live activity gives `idle`.
-Role counts include `starting` and `waiting` separately from `busy` and `idle`.
-Peer counts use zero for each missing `starting` or `waiting` field.
-Published counts include waiting within busy and starting within idle, so older peers retain valid totals.
-The new fields identify those subsets. The decoder separates them for display.
-The cache retains the published document to prevent repeated subtraction.
+Role counts are `busy`, `idle`, `paused`, `exited` and `total`.
+An older peer's document holds waiting within busy and starting within idle, with separate `starting` and `waiting` fields.
+The decoder moves that peer's `starting` count from idle to busy.
 Claude producers count under `showrunners` with the same hold and activity rules.
 Without a live session, they count on the selected showrunners account.
 `session-counts-read` prints the same live count document without publishing a file.

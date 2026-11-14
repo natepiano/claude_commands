@@ -529,7 +529,8 @@ def table(units: list[live_units.LiveUnit], records: dict[str, object], *,
           now: float | None = None, zone: ZoneInfo | None = None,
           snapshot: staff.StaffSnapshot | None = None,
           pane_rows: dict[staff.StaffId, list[dict[str, object]]] | None = None,
-          runs_reader: worker_runs.WorkerRuns | None = None) -> str:
+          runs_reader: worker_runs.WorkerRuns | None = None, columns: int | None = None) -> str:
+    """Render both phase tables with continuation rows for the terminal width, or the configured floor without one."""
     snapshot = plan_history.staff_record() if snapshot is None else snapshot
     if now is None:
         now = runs_reader.now if runs_reader is not None else plan_history.now_epoch()
@@ -662,7 +663,7 @@ def table(units: list[live_units.LiveUnit], records: dict[str, object], *,
             if show_progress:
                 lines.extend(("", progress_legend()))
             lines.append("")
-        headers, table_rows = display_cells.wrapped(headers, table_rows)
+        headers, table_rows = display_cells.wrapped(headers, table_rows, columns)
         lines.extend(("| " + " | ".join(display_cells.escaped(header) for header in headers) + " |",
                       "| " + " | ".join(("---",) * len(headers)) + " |"))
         lines.extend("| " + " | ".join(display_cells.escaped(cell) for cell in cells) + " |" for cells in table_rows)
@@ -742,7 +743,7 @@ def send_anomalies(lines: tuple[str, ...]) -> None:
         print(f"anomaly: could not send unit anomalies: {' '.join(str(error).splitlines())}")
 
 
-def main(arguments: list[str]) -> int:
+def main(arguments: list[str], columns: int | None = None) -> int:
     match arguments:
         case ["--help"] | ["-h"]:
             print("usage: unit_phases.py [--production <staff name>]")
@@ -783,7 +784,7 @@ def main(arguments: list[str]) -> int:
                 else:
                     sections: list[str] = []
                     if product_units:
-                        sections.append(table(product_units, records, zone=production.zone))
+                        sections.append(table(product_units, records, zone=production.zone, columns=columns))
                     if ticket_units:
                         from scripts.production import style_units
                         sections.append(style_units.table(ticket_units, records, doc=doc, ledger_paths=paths))
@@ -800,4 +801,4 @@ def main(arguments: list[str]) -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main(sys.argv[1:]))
+    raise SystemExit(main(sys.argv[1:], display_cells.pane_columns()))

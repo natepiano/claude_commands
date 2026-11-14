@@ -769,12 +769,14 @@ always=director
     def test_stopped_worker_relay_names_each_outcome(self) -> None:
         cases = ((quota_alert.WorkersMoved("codex2"), "Workers moved to codex2, and the move resumes the pass. "),
                  (quota_alert.WorkersWaitForReset("14:05"), "Workers wait for the reset at 14:05. "),
-                 (quota_alert.NO_WORKER_MODE_STARTED, "No-worker mode started. "),
                  (quota_alert.REFUSAL_OUTCOME_UNKNOWN, ""))
         for outcome, sentence in cases:
             with self.subTest(outcome=outcome):
                 self.assertEqual(quota_alert.stopped_worker_relay("impl", outcome),
                     f"Codex refused worker impl for quota. Its pass stays open. {sentence}Do not rerun its assign command.")
+        self.assertEqual(quota_alert.stopped_worker_relay("impl", quota_alert.NO_WORKER_MODE_STARTED),
+            "Codex refused worker impl for quota. No-worker mode started. "
+            + "The stop of the Codex workers ends its pass as canceled. Do not rerun its assign command.")
 
     def account(self, number: int, *, default: bool = False) -> agent_accounts.KnownCodexAccount:
         home = self.root / (".codex" if default else f".codex{number}")

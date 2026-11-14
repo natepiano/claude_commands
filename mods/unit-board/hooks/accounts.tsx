@@ -32,7 +32,8 @@ export function accountDisplay(account: StoredAccount): AccountDisplay {
       account.selected_roles?.includes(role) ? `${role} ✓` : role),
     roleCounts: account.roles.map((_, index) => {
       const count = account.role_counts?.[index];
-      return reading(count == null ? count : { ...count, starting: count.starting ?? 0, waiting: count.waiting ?? 0 });
+      return reading(count == null ? count : { busy: count.busy + (count.starting ?? 0) + (count.waiting ?? 0),
+        idle: count.idle, paused: count.paused, exited: count.exited, total: count.total });
     }),
     weekly: reading(account.weekly_left_percent), resets: reading(account.resets_at),
     credits: account.credits === null ? { kind: 'unavailable' }
@@ -76,7 +77,7 @@ interface TableColumn {
   width: number;
 }
 
-const COUNT_COLUMNS = ['busy', 'starting', 'waiting', 'idle', 'paused', 'exited', 'total'] as const;
+const COUNT_COLUMNS = ['busy', 'idle', 'paused', 'exited', 'total'] as const;
 type CountColumn = typeof COUNT_COLUMNS[number];
 
 function countCells(count: AccountReading<RoleSessionCounts>): Record<CountColumn, string> {
@@ -87,7 +88,7 @@ function countCells(count: AccountReading<RoleSessionCounts>): Record<CountColum
 }
 
 function countSpans(counts: Record<CountColumn, string>): Record<CountColumn, BoardLine> {
-  return { busy: [span(counts.busy)], starting: [span(counts.starting)], waiting: [span(counts.waiting)],
+  return { busy: [span(counts.busy)],
     idle: [span(counts.idle)], paused: [span(counts.paused)],
     exited: [span(counts.exited)], total: [span(counts.total)] };
 }
@@ -98,7 +99,6 @@ function totalRow(accounts: AccountDisplay[]): AccountRow {
   const sum = (values: number[]) => values.reduce((total, value) => total + value, 0);
   const cells = countCells(reading<RoleSessionCounts>({
     busy: sum(counts.map(count => count.busy)),
-    starting: sum(counts.map(count => count.starting)), waiting: sum(counts.map(count => count.waiting)),
     idle: sum(counts.map(count => count.idle)), paused: sum(counts.map(count => count.paused)),
     exited: sum(counts.map(count => count.exited)), total: sum(counts.map(count => count.total)),
   }));

@@ -323,9 +323,12 @@ A live session stays unchanged.
 A failed start retains the row on the restart list.
 Restart sends no work prompt.
 
-Restart waits within `START_SECONDS` for an exiting agent in its retained pane.
+Restart starts a session in its own pane, as `docs/as-built/shutdown-and-restart.md` describes.
+It waits within `OWN_PANE_SHELL_SECONDS` for that pane to reach the shell.
+When the wait ends first, the start is refused with one line, and the row stays on the restart list.
+A new tab opens only for a session with no own pane; a restart never splits a pane beside a worker.
+For the pane in the saved launch record, restart also waits within `START_SECONDS` for an exiting agent.
 It reuses that pane when fresh reads prove a shell with no native agent.
-After that budget, restart opens the replacement tab.
 The existing resume-check loop closes the old shell through the restore path when its agent exits.
 The loop uses `RESUME_CHECK_SECONDS` and `RESUME_CHECK_INTERVAL_SECONDS`.
 A caller without shared resume checks runs the same cleanup loop before `start_row` returns.

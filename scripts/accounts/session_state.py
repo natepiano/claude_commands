@@ -10,7 +10,7 @@ from typing import Literal, cast
 from scripts.lib.unit_runs import LauncherRunDirectories
 from scripts.production import staff
 
-SessionState = Literal["busy", "starting", "waiting", "idle", "paused", "exited"]
+SessionState = Literal["busy", "idle", "paused", "exited"]
 StaffState = Literal["active", "paused", "exited"]
 
 
@@ -59,17 +59,26 @@ def running_detached_work(record: staff.StaffSnapshot, *, additional_runs: Seque
     worker_directories = cast(Callable[[staff.StaffSnapshot], LauncherRunDirectories],
                               import_module("scripts.herdr.worker_panes").worker_run_directories)
 
+    # Workers of one parent share folders; resolve each folder once.
+    resolved: dict[Path, Path] = {}
+
+    def owned(folder: Path) -> set[staff.StaffId]:
+        real = resolved.get(folder)
+        if real is None:
+            real = resolved[folder] = folder.resolve()
+        return owners.setdefault(real, set())
+
     owners: dict[Path, set[staff.StaffId]] = {}
     for row in record.rows:
         if isinstance(row.run, staff.OpenRun):
-            owners.setdefault(row.run.path.resolve(), set()).add(row.id)
+            owned(row.run.path).add(row.id)
     directories = worker_directories(record)
     for identity, folders in directories.by_worker.items():
         for folder in folders:
-            owners.setdefault(folder.resolve(), set()).add(identity)
+            owned(folder).add(identity)
     identities = {row.id for row in record.find(kind="worker")}
     for folder in additional_runs:
-        owners.setdefault(folder.resolve(), set()).update(identities)
+        owned(folder).update(identities)
     busy: set[staff.StaffId] = set()
     labels: dict[staff.StaffId, list[str]] = {}
     inputs: set[Path] = set()
@@ -91,17 +100,14 @@ def running_detached_work(record: staff.StaffSnapshot, *, additional_runs: Seque
 def classify(member: staff.StaffRow | UnrecordedStaff,
              activity: LiveActivity | NoLiveSession, *,
              detached: RunningDetachedWork = NO_DETACHED_WORK) -> SessionState:
-    """Staff exit and pause records take precedence over observed activity."""
+    """Staff exit and pause records take precedence; a start or a detached run counts as busy."""
     hold = staff_state(member)
     if hold != "active":
         return hold
-    if isinstance(activity, LiveActivity):
-        if activity.status == "busy":
-            return "busy"
-        if activity.status == "starting":
-            return "starting"
+    if isinstance(activity, LiveActivity) and activity.status in ("busy", "starting"):
+        return "busy"
     if isinstance(member, staff.StaffRow) and member.id in detached.staff_ids:
-        return "waiting"
+        return "busy"
     if isinstance(activity, NoLiveSession):
         return "exited"
     return "idle"
