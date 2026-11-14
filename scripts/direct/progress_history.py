@@ -2262,6 +2262,17 @@ def mark_pass_refused(session_dir: Path, worker_name: str) -> None:
                 _append_event(state, _event(state, "pass_refused", plan_history.now_epoch(), passed))
 
 
+def cancel_worker_passes(session_dir: Path, worker_id: staff.StaffId) -> int:
+    """End each open pass of a stopped worker as canceled. Return the number of passes ended."""
+    if not _state_path(session_dir).is_file():
+        return 0
+    with (session_dir / ".progress_history.lock").open("a+", encoding="utf-8") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        state = _read_state(session_dir)
+        slots = [slot for slot, passed in _open_passes(state).items() if passed.get("worker_id") == worker_id]
+        return sum(_close_slot_pass(session_dir, state, slot, "canceled", plan_history.now_epoch()) for slot in slots)
+
+
 def _finish_pass(args: argparse.Namespace) -> None:
     session_dir = _session_dir(args)
     status = _arg_string(args, "status")

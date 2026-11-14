@@ -293,6 +293,7 @@ Worker assignment fallback to Claude remains separate from the selected Codex ac
 Routing returns only when the selected Codex account can work and its refusal has resolved.
 An owned workers refusal with no account capacity enables `no_worker_mode` on the workers-role host, `role_map.ROLE_MAP_HOST`.
 The refusal handler sets this flag independently of the first `NoRoomMove` entry and the Claude assignment switch.
+A zero account with credits off enables the same flag when its workers stay on it: no other account has room, or the workers move failed.
 The saved flag triggers one broadcast to showrunners and unit directors on both machines.
 `config/accounts.conf` supplies `no_worker_mode_on` and `no_worker_mode_off`; `quota-alert` identifies the sender.
 The ON notice directs directors to write code, run tests, and do reviews without assigning workers.
@@ -300,6 +301,18 @@ Successful Codex recovery clears the flag and broadcasts OFF after the workers a
 Recovery also clears the flag when no Claude assignment fallback was saved.
 An unfinished Claude switch or failed restoration retains the flag until recovery can finish.
 The state context saves each flag change and releases the lock before it starts a separate broadcast unit.
+When the flag goes on, the same step starts `scripts/production/worker_capacity.py stop` as a second transient unit.
+That command stops each Codex worker of every local parent, busy or idle, under the worker's lock, and proves the stop from a new pane observation.
+It ends each open pass of a stopped worker as `canceled`, also for a Codex worker whose pane is already closed.
+It closes the pane of a stopped worker when the close checks permit. Claude workers are not touched.
+Each affected director gets one stop report. A worker that is not proved stopped, or a pass that is not canceled, also goes to `faults_to`.
+A live detached run of a stopped worker continues; the report names its result file and its log.
+Its result goes to the director: `send.deliver_worker_text` sends the text for a stopped or closed worker to the holder and starts no worker.
+No command starts workers when the flag goes off; the next assign of a director starts its worker.
+
+The credits setting of the hold owner releases a credits-off hold: when `codex_credit_accounts` names the owner again, routing can return before the hold time.
+An unresolved refusal does not block the return when credits are on for the selected account and a reading taken after the refusal shows a credit balance.
+This rule is local to the return; `accounts.pick` and the next-move target check still treat that account as refused.
 The start uses `systemd-run --user --collect --quiet --no-block` with the user manager's environment.
 The unit uses the repository working directory and `scripts/lib/py` to run `scripts/production/broadcast.py`.
 The quota pass waits only for the unit start, so slow peer delivery cannot consume its 30-second budget.
