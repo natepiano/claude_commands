@@ -511,6 +511,8 @@ print('two homes isolated; recorder lock retained; caller restored')
         environment["USER_ZONE"] = "UTC"
         self.isolate_recorder_roots(environment)
         self.isolate_identity(environment)
+        # The refresh process starts only when a vault is present.
+        Path(environment["PHASE_TABLE_VAULT"]).parent.mkdir(parents=True, exist_ok=True)
         stdout = io.StringIO()
         stderr = io.StringIO()
         if isinstance(refresh_result, BaseException):

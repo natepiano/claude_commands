@@ -1745,6 +1745,11 @@ def _vault_root() -> Path:
     ).expanduser()
 
 
+def vault_present() -> bool:
+    """Report whether the folder that holds the vault exists; without it no phase note is written."""
+    return _vault_root().parent.exists()
+
+
 def _archive_note(candidate: Path, vault_root: Path, name: str) -> Path:
     """Move one generated phase note into the vault's archive and return its new path."""
     # Outside showrunners, the archive stays out of every scan and in the vault's Git history.
@@ -1793,9 +1798,9 @@ def archive(production_doc: Path) -> list[Path]:
     """Move a production's generated phase notes into the vault's archive."""
     resolver = session_staff.RowResolver(staff.snapshot())
     production = read_production(production_doc, resolver=resolver)
-    vault_root = _vault_root()
-    if not vault_root.parent.exists():
+    if not vault_present():
         return []
+    vault_root = _vault_root()
     archived: list[Path] = []
     for candidate in sorted(vault_root.glob("*/*.md")):
         ownership = _note_ownership(candidate, resolver.record)
@@ -1846,9 +1851,9 @@ def refresh(session_dir: Path) -> None:
     reference = _production_reference(record.plan, resolver=resolver)
     if isinstance(reference, PlanOutsideProduction):
         return
-    vault_root = _vault_root()
-    if not vault_root.parent.exists():
+    if not vault_present():
         return
+    vault_root = _vault_root()
     production = read_production(_production_document(record.plan, reference), resolver=resolver)
     owner = resolver.record.by_doc(remote.local_machine(), production.doc)
     from scripts.message import sessions
