@@ -3,9 +3,10 @@
 
 Start writes a run record and returns after it starts the supervisor.
 The supervisor runs the command and delivers its result to the current worker.
+A unit director that names its run folder owns its run; its result goes through send.py.
 Reap finishes records whose supervisor disappeared and delivers their results.
 Stop a run through its supervisor's process group, including scoped commands.
-Exit 3 means that no registered worker owns the caller.
+Exit 3 means that the caller is neither a registered worker nor a director with a run folder.
 """
 
 from __future__ import annotations
@@ -42,7 +43,7 @@ from scripts.lib.cancellation import CANCELLATION_SIGNALS
 from scripts.message import send_budget
 from scripts.production import staff, worker_admission
 
-# Exit status of `start` when the caller is not a registered worker: run the command attached.
+# Exit status of `start` when no worker or director owns the run: run the command attached.
 NOT_A_DETACHED_WORKER = 3
 # A worker at its live-run limit must keep its command pending, never run it attached.
 LIVE_RUN_LIMIT_REACHED = 4
@@ -111,22 +112,32 @@ class PaneCaller:
     staff_id: staff.StaffId
 
 
-Caller = PaneCaller | NotDetachedWorker
+@dataclass(frozen=True)
+class DirectorCaller:
+    """A unit director; it owns a run only when it names its run folder."""
+
+    name: str
+    staff_id: staff.StaffId
+
+
+Caller = PaneCaller | DirectorCaller | NotDetachedWorker
 
 
 def caller_from_environment(environment: dict[str, str]) -> Caller:
-    """Find the worker through its current native session and staff parent."""
+    """Find the worker or unit director through its current native session."""
     membership = staff.local_snapshot()
     member = membership.by_current_session(staff.runtime_id())
     if member is None or member.kind != "worker":
         identity = environment.get("CODEX_THREAD_ID") or environment.get("CLAUDE_CODE_SESSION_ID", "")
-        member = membership.by_current_session(identity)
+        member = membership.by_current_session(identity) or member
     if member is not None and member.kind == "worker":
         from scripts.herdr import worker_panes
 
         parent = membership.parent_of(member)
         if parent is not None:
             return PaneCaller(str(worker_panes.worker_run(member, record=membership)), member.name, member.id)
+    if member is not None and member.kind == "unit":
+        return DirectorCaller(member.name, member.id)
     return NotDetachedWorker()
 
 
@@ -136,15 +147,16 @@ def _worker_reference(session_dir: str, name: str) -> str:
 
 
 @dataclass(frozen=True)
-class RunWorkerUnavailable:
+class RunOwnerUnavailable:
     reason: str
 
 
-def _run_worker(record: RunRecord, membership: staff.StaffSnapshot) -> staff.StaffRow | RunWorkerUnavailable:
+def _run_owner(record: RunRecord, membership: staff.StaffSnapshot) -> staff.StaffRow | RunOwnerUnavailable:
+    """The worker or unit director that owns the run."""
     member = membership.by_id(staff.StaffId(record.get("staff_id", "")))
-    if member is None or member.kind != "worker":
-        reason = f"{record['worker']}: detached run has no worker staff row"
-        return RunWorkerUnavailable(reason)
+    if member is None or member.kind not in ("worker", "unit"):
+        reason = f"{record['worker']}: detached run has no worker or director staff row"
+        return RunOwnerUnavailable(reason)
     return member
 
 
@@ -355,8 +367,8 @@ def _finish_record(path: Path, record: RunRecord) -> None:
 
 def _complete_worker_dispatch(record: RunRecord) -> None:
     """Recheck the pass after the finished record becomes visible."""
-    member = _run_worker(record, staff.local_snapshot())
-    if isinstance(member, staff.StaffRow):
+    member = _run_owner(record, staff.local_snapshot())
+    if isinstance(member, staff.StaffRow) and member.kind == "worker":
         complete = cast(Callable[[str], None], import_module("scripts.herdr.turn_end").run_finished)
         complete(str(member.current_session))
 
@@ -442,6 +454,8 @@ def command_start(args: argparse.Namespace) -> int:
             print(f"detached_runs: --to {name} ignored; run belongs to worker {caller.name}", file=sys.stderr)
         session_dir, name = caller.session_dir, caller.name
         reference = caller.staff_id
+    elif isinstance(caller, DirectorCaller) and session_dir and not name:
+        name, reference = caller.name, caller.staff_id
     else:
         if bool(session_dir) != bool(name):
             print("detached_runs: --session-dir and --to go together", file=sys.stderr)
@@ -606,7 +620,7 @@ def _result_received(member: staff.StaffRow, membership: staff.StaffSnapshot, ma
 
 
 def deliver(record: RunRecord, result: CommandResult) -> str:
-    """Deliver the command result to its current worker."""
+    """Deliver the command result to its current worker or director."""
     exit_code = result.code if isinstance(result, CompletedCommand) else result
     done_file = record["done_message_file"]
     if done_file and exit_code not in (0, SUPERSEDED_STATUS, TREE_CHANGED_STATUS) and not record.get("stop_reason"):
@@ -620,13 +634,20 @@ def deliver(record: RunRecord, result: CommandResult) -> str:
         text = result_text(record, result)
     session_dir = record["session_dir"]
     membership = staff.local_snapshot()
-    member = _run_worker(record, membership)
-    if isinstance(member, RunWorkerUnavailable):
+    member = _run_owner(record, membership)
+    if isinstance(member, RunOwnerUnavailable):
         print(f"anomaly: {member.reason}", file=sys.stderr)
         return "finished: worker retired"
     from scripts.message import send
 
     marker = f"Detached run: {record['run_id']}"
+    timeout = send_budget.seconds()
+    if member.kind == "unit":
+        sent = send.send(send.parse(["--to", str(member.id), "--from", "detached-runs",
+                                     "--timeout", str(timeout), "--text", marker + "\n" + text]))
+        if sent.outcome in ("failed", "refused"):
+            raise RunDeliveryFailed(f"{sent.outcome}: {sent.detail}")
+        return f"{sent.outcome}: {sent.detail}"
     runs = _runs_dir(session_dir)
     runs.mkdir(parents=True, exist_ok=True)
     with (runs / f".{record['run_id']}.delivery.lock").open("a") as lock:
@@ -637,7 +658,6 @@ def deliver(record: RunRecord, result: CommandResult) -> str:
                 return f"already delivered: {record['run_id']}"
         except (OSError, ValueError) as error:
             reason = f"worker transcript is unavailable: {error}"
-        timeout = send_budget.seconds()
         delivery = send.deliver_worker_text(member, membership, marker + "\n" + text,
                                           sender="detached-runs", timeout=timeout, reason=reason)
         if delivery.outcome in ("failed", "refused"):
