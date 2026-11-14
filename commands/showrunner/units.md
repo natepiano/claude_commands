@@ -16,11 +16,11 @@ When it cannot read the width within `units_table_width_read_milliseconds`, it u
 This fallback is normal and prints no anomaly.
 `units_table_cell_lines` sets the cell line cap for Claude Code 2.1.319.
 Each table shows only the production's staff units, sorted by unit name without case distinctions.
-For the phase status table, **Status** is `busy`, `starting`, `waiting`, `idle`, `paused` or `exited`.
+For the phase status table, **Status** is `busy`, `idle`, `paused` or `exited`.
 The accounts board uses the same status rule.
 An exit record gives `exited` before a pause record gives `paused`.
-A busy pane gives `busy`. A starting pane gives `starting` before a live detached run gives `waiting`.
-Without these activity states, a live session or pane process gives `idle`.
+A busy or starting pane, or a live detached run, gives `busy`.
+Otherwise a live session or pane process gives `idle`.
 No live session or process gives `exited`.
 The style table uses the same status words as the phase table.
 **Unit** is the unit's staff name, including stopped units and units without a session.

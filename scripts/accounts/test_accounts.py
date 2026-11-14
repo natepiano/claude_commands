@@ -37,7 +37,7 @@ from unittest.mock import AsyncMock, MagicMock, call, patch
 from zoneinfo import ZoneInfo
 
 from scripts.accounts.home_test_support import clear_notes_directory_cache, scratch_account_home, set_config_credits, write_account_settings
-from scripts.accounts import accounts, next_moves, refusal_watch, refusals, role_map
+from scripts.accounts import accounts, next_moves, refusal_watch, refusals, role_map, session_state
 from scripts.accounts.nix_env_fake import FakeShellRefusal, fake_nix_loader, imports_with_nix_loader, installed_program
 from scripts.lib import atomic_file, conf, file_lock, unit_runs
 from scripts.lib.test_models_registry import write_registry
@@ -610,9 +610,9 @@ class AccountsTests(unittest.TestCase):
             inventory.ShowrunnerRegistration("runner-a", "runner-a", ""),
             inventory.ShowrunnerRegistration("runner-b", "runner-b", ""),
         ))
-        units = accounts.RoleSessionCountsDocument(starting=0, waiting=0, busy=1, idle=1, paused=0, exited=1, total=3)
-        runners_count = accounts.RoleSessionCountsDocument(starting=0, waiting=0, busy=0, idle=1, paused=0, exited=0, total=1)
-        selected_runners = accounts.RoleSessionCountsDocument(starting=0, waiting=0, busy=0, idle=1, paused=0, exited=1, total=2)
+        units = accounts.RoleSessionCountsDocument(busy=1, idle=1, paused=0, exited=1, total=3)
+        runners_count = accounts.RoleSessionCountsDocument(busy=0, idle=1, paused=0, exited=0, total=1)
+        selected_runners = accounts.RoleSessionCountsDocument(busy=0, idle=1, paused=0, exited=1, total=2)
         cases: tuple[tuple[str, dict[str, tuple[list[str], list[accounts.RoleSessionCountsDocument]]]], ...] = (
             ("claude2", {"claude1": (["units", "showrunners"], [units, runners_count]), "claude2": (["showrunners"], [selected_runners])}),
             ("claude1", {"claude1": (["units", "showrunners"], [units, selected_runners]), "claude2": (["showrunners"], [runners_count])}),
@@ -644,7 +644,7 @@ class AccountsTests(unittest.TestCase):
             self.assertEqual((code, error), (0, ""))
             document = cast(accounts.StatusDocument, json.loads(text))
             values = {row["label"]: (row["roles"], row["role_counts"]) for row in document["accounts"]}
-            self.assertEqual(values, {**expected, "codex1": (["workers"], [{"starting": 0, "waiting": 0, "busy": 2, "paused": 0, "exited": 0, "idle": 2, "total": 4}]), "codex2": (["spare"], [None])})
+            self.assertEqual(values, {**expected, "codex1": (["workers"], [{"busy": 2, "paused": 0, "exited": 0, "idle": 2, "total": 4}]), "codex2": (["spare"], [None])})
             self.assertIn(str(records / "fixture.json"), document["session_inputs"])
             self.assertEqual((records / "fixture.json").read_bytes(), retained_bytes)
 
@@ -727,10 +727,10 @@ class AccountsTests(unittest.TestCase):
                 rows = {row["label"]: row for row in document["accounts"]}
                 self.assertEqual(rows["claude4"]["roles"], [group] if family == "claude" else [])
                 if state == "paused":
-                    self.assertEqual(rows["claude4"]["role_counts"], [{"starting": 0, "waiting": 0, "busy": 0, "paused": 1, "exited": 0, "idle": 0, "total": 1}])
+                    self.assertEqual(rows["claude4"]["role_counts"], [{"busy": 0, "paused": 1, "exited": 0, "idle": 0, "total": 1}])
                 else:
-                    self.assertEqual(rows["claude4"]["role_counts"], [{"starting": 0, "waiting": 0, "busy": 1, "paused": 0, "exited": 0, "idle": 0, "total": 1}] if family == "claude" else [])
-                self.assertEqual(rows["claude2"]["role_counts"], [{"starting": 0, "waiting": 0, "busy": 0, "paused": 0, "exited": 0, "idle": 0, "total": 0}])
+                    self.assertEqual(rows["claude4"]["role_counts"], [{"busy": 1, "paused": 0, "exited": 0, "idle": 0, "total": 1}] if family == "claude" else [])
+                self.assertEqual(rows["claude2"]["role_counts"], [{"busy": 0, "paused": 0, "exited": 0, "idle": 0, "total": 0}])
                 self.assertIsInstance(result, accounts.GroupMoveDryRun)
                 assert isinstance(result, accounts.GroupMoveDryRun)
                 if kind == "producer" and state == "paused":
@@ -785,19 +785,19 @@ class AccountsTests(unittest.TestCase):
         self.assertEqual(rows["claude2"]["roles"], ["units", "showrunners"])
         self.assertEqual(rows["claude2"]["selected_roles"], ["units", "showrunners"])
         self.assertEqual(rows["claude2"]["role_counts"], [
-            {"starting": 0, "waiting": 0, "busy": 1, "paused": 0, "exited": 1, "idle": 0, "total": 2},
-            {"starting": 0, "waiting": 0, "busy": 0, "paused": 0, "exited": 1, "idle": 0, "total": 1}])
+            {"busy": 1, "paused": 0, "exited": 1, "idle": 0, "total": 2},
+            {"busy": 0, "paused": 0, "exited": 1, "idle": 0, "total": 1}])
         self.assertEqual(rows["claude4"]["roles"], ["units"])
         self.assertEqual(rows["claude4"]["selected_roles"], [])
-        self.assertEqual(rows["claude4"]["role_counts"], [{"starting": 0, "waiting": 0, "busy": 1, "idle": 1, "paused": 0, "exited": 0, "total": 2}])
+        self.assertEqual(rows["claude4"]["role_counts"], [{"busy": 1, "idle": 1, "paused": 0, "exited": 0, "total": 2}])
         self.assertEqual(rows["claude4"]["sessions"], sorted([
             {"session": members[0].current_session, "state": "busy"},
             {"session": members[2].current_session, "state": "idle"},
         ], key=lambda entry: entry["session"]))
         self.assertIn({"session": members[3].current_session, "state": "exited"}, rows["claude2"]["sessions"])
         table = accounts.render_status_table(reading)
-        for text in ("units ✓ 2 (busy 1, starting 0, waiting 0, idle 0, paused 0, exited 1)", "units 2 (busy 1, starting 0, waiting 0, idle 1, paused 0, exited 0)",
-                     "showrunners ✓ 1 (busy 0, starting 0, waiting 0, idle 0, paused 0, exited 1)"):
+        for text in ("units ✓ 2 (busy 1, idle 0, paused 0, exited 1)", "units 2 (busy 1, idle 1, paused 0, exited 0)",
+                     "showrunners ✓ 1 (busy 0, idle 0, paused 0, exited 1)"):
             self.assertIn(text, table)
             self.assertIn(text, "\n".join(reading.detail_lines))
 
@@ -811,8 +811,8 @@ class AccountsTests(unittest.TestCase):
                   ("busy", "pause", "paused", "none"), ("", "pause", "paused", "none"),
                   ("busy", "exit", "exited", "none"), ("", "exit", "exited", "none"),
                   ("busy", "both", "exited", "none"), ("", "both", "exited", "none"), ("", "", "exited", "none"),
-                  ("idle", "", "waiting", "live"), ("busy", "", "busy", "live"),
-                  ("starting", "", "starting", "none"), ("starting", "", "starting", "live"),
+                  ("idle", "", "busy", "live"), ("busy", "", "busy", "live"),
+                  ("starting", "", "busy", "none"), ("starting", "", "busy", "live"),
                   ("starting", "pause", "paused", "live"), ("starting", "exit", "exited", "live"),
                   ("idle", "", "idle", "dead"),
                   ("idle", "pause", "paused", "live"), ("idle", "exit", "exited", "live")]
@@ -852,12 +852,10 @@ class AccountsTests(unittest.TestCase):
                     account_row = next(row for row in document["accounts"] if row["label"] == label)
                     self.assertEqual(account_row["role_counts"][account_row["roles"].index(role)],
                                      {"busy": int(expected == "busy"), "idle": int(expected == "idle"),
-                                      "waiting": int(expected == "waiting"), "starting": int(expected == "starting"),
                                       "paused": int(expected == "paused"), "exited": int(expected == "exited"), "total": 1})
-                    if expected in ("waiting", "starting"):
-                        self.assertIn(f"busy 0, starting {int(expected == 'starting')}, waiting {int(expected == 'waiting')}, idle 0",
-                                      accounts.render_status_table(status))
-                        self.assertIn({"session": member.current_session, "state": expected}, account_row["sessions"])
+                    if expected == "busy" and (activity == "starting" or supervisor == "live"):
+                        self.assertIn("busy 1, idle 0", accounts.render_status_table(status))
+                        self.assertIn({"session": member.current_session, "state": "busy"}, account_row["sessions"])
                     if kind == "unit":
                         assert parent is not None
                         listing = unit_lookup.LabeledProductions({}, {parent.name: (member.name,)})
@@ -871,36 +869,39 @@ class AccountsTests(unittest.TestCase):
                         rendered = unit_phases.table(selected, {}, snapshot=snapshot, pane_rows={})
                         self.assertIn(f"| {member.name} | {expected} |", rendered)
 
-    def test_detached_work_waits_until_the_pane_starts_another_turn(self) -> None:
-        from scripts.accounts import session_state
-
+    def test_detached_work_and_a_starting_pane_count_as_busy(self) -> None:
         identity = staff.StaffId("9c5e3298-b8da-5d9d-9a8f-1a023259fefd")
         member = staff.StaffRow(identity, "unit", "waiting", staff.StaffRoot(), current_session=identity)
         detached = session_state.RunningDetachedWork(frozenset({identity}))
-        for activity, expected in (("idle", "waiting"), ("shell", "waiting"), ("busy", "busy"), ("starting", "starting")):
+        for activity in ("idle", "shell", "busy", "starting"):
             with self.subTest(activity=activity):
-                self.assertEqual(session_state.classify(member, session_state.LiveActivity(activity), detached=detached), expected)
-        self.assertEqual(session_state.classify(member, session_state.NoLiveSession(), detached=detached), "waiting")
+                self.assertEqual(session_state.classify(member, session_state.LiveActivity(activity), detached=detached), "busy")
+        self.assertEqual(session_state.classify(member, session_state.NoLiveSession(), detached=detached), "busy")
+        idle = session_state.NO_DETACHED_WORK
+        self.assertEqual(session_state.classify(member, session_state.LiveActivity("starting"), detached=idle), "busy")
+        self.assertEqual(session_state.classify(member, session_state.LiveActivity("idle"), detached=idle), "idle")
 
-    def test_peer_counts_accept_old_documents_and_validate_waiting(self) -> None:
-        for field in ("waiting", "starting"):
-            for value in (None, 2, 1, -1, True, "2", 4):
-                with self.subTest(field=field, value=value):
-                    count: dict[str, object] = {"busy": 1, "idle": 0, "paused": 0, "exited": 0, "total": 1}
-                    if value is not None:
-                        count[field] = value
-                        count["total"] = 3
-                        if type(value) is int and value in (2, 4):
-                            count["busy" if field == "waiting" else "idle"] = 3 if field == "waiting" else 2
-                    text = json.dumps({"machine": "mac", "at": datetime.now(timezone.utc).isoformat(),
-                                       "accounts": {"codex1": {"workers": count}}})
-                    if value is None or type(value) is int and value == 2:
-                        decoded = decode_session_counts(text, "mac")["accounts"]["codex1"]["workers"]
-                        self.assertEqual(decoded[field], 0 if value is None else 2)
-                        self.assertEqual((decoded["busy"], decoded["idle"]), (1, 0))
-                    else:
-                        with self.assertRaises(ValueError):
-                            _ = decode_session_counts(text, "mac")
+    def test_peer_counts_read_an_older_peer_starting_count_as_busy(self) -> None:
+        """An older peer wrote waiting within busy and starting within idle."""
+        cases: tuple[tuple[str, object, int, tuple[int, int] | None], ...] = (
+            ("starting", None, 0, (1, 0)), ("starting", 2, 2, (3, 0)), ("starting", 3, 2, None),
+            ("starting", -1, 0, None), ("starting", True, 2, None), ("starting", "2", 2, None),
+            ("waiting", 2, 0, (3, 0)), ("waiting", "2", 0, (3, 0)))
+        for field, value, idle, expected in cases:
+            with self.subTest(field=field, value=value):
+                count: dict[str, object] = {"busy": 1 + (2 if field == "waiting" else 0), "idle": idle, "paused": 0, "exited": 0}
+                if value is not None:
+                    count[field] = value
+                count["total"] = cast(int, count["busy"]) + idle
+                text = json.dumps({"machine": "mac", "at": datetime.now(timezone.utc).isoformat(),
+                                   "accounts": {"codex1": {"workers": count}}})
+                if expected is None:
+                    with self.assertRaises(ValueError):
+                        _ = decode_session_counts(text, "mac")
+                else:
+                    decoded = decode_session_counts(text, "mac")["accounts"]["codex1"]["workers"]
+                    self.assertEqual((decoded["busy"], decoded["idle"]), expected)
+                    self.assertNotIn(field, decoded)
 
     def test_native_codex_counts_share_one_conversation_and_activity_read(self) -> None:
         from scripts.herdr import herdr
@@ -949,11 +950,11 @@ class AccountsTests(unittest.TestCase):
             reading = accounts.read_status(source=accounts.StoredUsageOnly(), detail=True)
         document = cast(accounts.StatusDocument, json.loads(accounts.render_status_json(reading)))
         rows = {row["label"]: row for row in document["accounts"]}
-        exited = {"starting": 0, "waiting": 0, "busy": 0, "idle": 0, "paused": 0, "exited": 1, "total": 1}
+        exited = {"busy": 0, "idle": 0, "paused": 0, "exited": 1, "total": 1}
         for label in ("claude2", "claude4"):
             self.assertEqual(rows[label]["role_counts"], [exited])
         self.assertEqual(rows["codex2"]["role_counts"], [
-            {"starting": 0, "waiting": 0, "busy": 0, "idle": 0, "paused": 0, "exited": 0, "total": 0}])
+            {"busy": 0, "idle": 0, "paused": 0, "exited": 0, "total": 0}])
         self.assertEqual(rows["codex1"]["roles"], ["spare"])
         self.assertNotIn("shell", accounts.render_status_table(reading))
         with (patch.object(sessions, "running_sessions", return_value=[]),
@@ -968,9 +969,9 @@ class AccountsTests(unittest.TestCase):
         document = cast(accounts.StatusDocument, json.loads(accounts.render_status_json(reading)))
         rows = {row["label"]: row for row in document["accounts"]}
         self.assertEqual(rows["codex1"]["role_counts"], [
-            {"starting": 0, "waiting": 0, "busy": 1, "idle": 0, "paused": 0, "exited": 0, "total": 1}])
+            {"busy": 1, "idle": 0, "paused": 0, "exited": 0, "total": 1}])
         self.assertEqual(rows["codex2"]["role_counts"], [
-            {"starting": 0, "waiting": 0, "busy": 0, "idle": 0, "paused": 0, "exited": 0, "total": 0}])
+            {"busy": 0, "idle": 0, "paused": 0, "exited": 0, "total": 0}])
 
         from scripts.agents import detached_run_process, detached_runs
 
@@ -982,15 +983,15 @@ class AccountsTests(unittest.TestCase):
         run_path = run_records / "fixture.json"
         cases: tuple[tuple[Literal["busy", "idle", "starting"], str, str, str, str], ...] = (
                  ("busy", "pause", "none", "paused", "recorded"), ("idle", "exit", "none", "exited", "recorded"),
-                 ("idle", "", "live", "waiting", "recorded"), ("busy", "", "live", "busy", "recorded"),
-                 ("starting", "", "none", "starting", "recorded"), ("starting", "", "live", "starting", "recorded"),
+                 ("idle", "", "live", "busy", "recorded"), ("busy", "", "live", "busy", "recorded"),
+                 ("starting", "", "none", "busy", "recorded"), ("starting", "", "live", "busy", "recorded"),
                  ("starting", "pause", "live", "paused", "recorded"), ("starting", "exit", "live", "exited", "recorded"),
-                 ("starting", "", "none", "starting", "pane"), ("starting", "", "live", "starting", "pane"),
+                 ("starting", "", "none", "busy", "pane"), ("starting", "", "live", "busy", "pane"),
                  ("starting", "pause", "live", "paused", "pane"), ("starting", "exit", "live", "exited", "pane"),
                  ("idle", "", "dead", "idle", "recorded"),
                  ("idle", "pause", "live", "paused", "recorded"), ("idle", "exit", "live", "exited", "recorded"),
-                 ("idle", "", "live", "waiting", "renamed"), ("idle", "", "live", "waiting", "fallback"),
-                 ("idle", "", "live", "waiting", "saved dispatch"))
+                 ("idle", "", "live", "busy", "renamed"), ("idle", "", "live", "busy", "fallback"),
+                 ("idle", "", "live", "busy", "saved dispatch"))
         for family, target, label in (("claude", claude_worker, "claude4"), ("codex", worker, "codex1")):
             for activity, hold, supervisor, expected, ownership in cases:
                 with self.subTest(family=family, worker_activity=activity, staff_hold=hold, supervisor=supervisor, ownership=ownership):
@@ -1053,7 +1054,6 @@ class AccountsTests(unittest.TestCase):
                     worker_account = next(row for row in document["accounts"] if row["label"] == label)
                     self.assertEqual(worker_account["role_counts"][worker_account["roles"].index("workers")],
                                      {"busy": int(expected == "busy"), "idle": int(expected == "idle"),
-                                      "waiting": int(expected == "waiting"), "starting": int(expected == "starting"),
                                       "paused": int(expected == "paused"), "exited": int(expected == "exited"), "total": 1})
 
 
@@ -1075,12 +1075,12 @@ class AccountsTests(unittest.TestCase):
         row = replace(SharedStatusDocumentTests().row(), label="claude4", tool="claude", roles=(), role_counts=())
         peer = remote.other_machine()
         _ = session_counts_cache().write_text(json.dumps({"machine": peer, "at": now.isoformat(), "accounts": {
-            "claude4": {"units": {"starting": 0, "waiting": 0, "busy": 9, "paused": 0, "exited": 1, "idle": 20, "total": 30}}}}))
+            "claude4": {"units": {"busy": 9, "paused": 0, "exited": 1, "idle": 20, "total": 30}}}}))
         rows, problems = machine_role_counts((row,), now)
         self.assertEqual(problems, ())
         self.assertEqual(rows[0].roles, ("units",))
         self.assertEqual(rows[0].selected_roles, ())
-        self.assertIn("units 30 (busy 9, starting 0, waiting 0, idle 20, paused 0, exited 1)", accounts.render_status_table(
+        self.assertIn("units 30 (busy 9, idle 20, paused 0, exited 1)", accounts.render_status_table(
             accounts.StatusReading(rows, (), (), timezone.utc, now)))
 
     def test_stored_status_starts_a_background_counts_fetch_without_waiting_for_ssh(self) -> None:
@@ -1100,7 +1100,7 @@ class AccountsTests(unittest.TestCase):
         row = replace(SharedStatusDocumentTests().row(), label="claude1", tool="claude",
             folder=str(self.home / ".claude1"), roles=("units",), role_counts=(local,))
         now = datetime.now(timezone.utc)
-        count = accounts.RoleSessionCountsDocument(starting=0, waiting=0, busy=3, paused=0, exited=2, idle=1, total=6)
+        count = accounts.RoleSessionCountsDocument(busy=3, paused=0, exited=2, idle=1, total=6)
         for here, peer in (("natedev", "mac"), ("mac", "natedev")):
             with (self.subTest(here=here), patch.object(remote, "local_machine", return_value=here),
                   patch.object(remote, "other_machine", return_value=peer),
@@ -1118,66 +1118,52 @@ class AccountsTests(unittest.TestCase):
                 self.assertEqual(document["problems"], [])
                 machines = document["accounts"][0]["role_counts_by_machine"]
                 self.assertEqual(machines[peer]["units"], count)
-                self.assertEqual(machines[here]["units"], {"starting": 0, "waiting": 0, "busy": 1, "paused": 0, "exited": 1, "idle": 2, "total": 4})
-                self.assertEqual(document["accounts"][0]["role_counts"], [{"starting": 0, "waiting": 0, "busy": 4, "paused": 0, "exited": 3, "idle": 3, "total": 10}])
+                self.assertEqual(machines[here]["units"], {"busy": 1, "paused": 0, "exited": 1, "idle": 2, "total": 4})
+                self.assertEqual(document["accounts"][0]["role_counts"], [{"busy": 4, "paused": 0, "exited": 3, "idle": 3, "total": 10}])
                 self.assertEqual(rows[0].role_counts, (accounts.RoleSessionCounts(4, 3, 0, 3),))
-                self.assertIn("units 10 (busy 4, starting 0, waiting 0, idle 3, paused 0, exited 3)", accounts.render_status_table(
+                self.assertIn("units 10 (busy 4, idle 3, paused 0, exited 3)", accounts.render_status_table(
                     accounts.StatusReading(rows, (), (), timezone.utc, now)))
 
-    def test_published_new_states_pass_the_legacy_count_check(self) -> None:
+    def test_published_counts_pass_the_older_peer_count_check(self) -> None:
         self.write_note("codex1", "counts@example.invalid")
         self.codex_login("counts@example.invalid", self.home / ".codex1")
-        for states in (("waiting", "starting"), ("busy", "waiting", "starting", "idle", "paused", "exited")):
-            with self.subTest(states=states):
-                published = session_counts_document({(self.home / ".codex1", "workers"):
-                    {f"worker-{index}": state for index, state in enumerate(states)}})
-                count = published["accounts"]["codex1"]["workers"]
-                # Freeze the count check from e6611628d, which ignores extra fields.
-                busy, idle, paused, exited, total = (count["busy"], count["idle"], count["paused"],
-                                                     count["exited"], count["total"])
-                if any(type(value) is not int for value in (busy, idle, paused, exited, total)):
-                    raise ValueError("invalid activity counts")
-                if min(busy, idle, paused, exited, total) < 0 or busy + idle + paused + exited != total:
-                    raise ValueError("invalid count total")
-                self.assertEqual((busy, idle, paused, exited, total),
-                                 (states.count("busy") + states.count("waiting"),
-                                  states.count("idle") + states.count("starting"),
-                                  states.count("paused"), states.count("exited"), len(states)))
-                self.assertEqual(decode_session_counts(json.dumps(published), published["machine"])["accounts"]["codex1"]["workers"],
-                                 {"busy": states.count("busy"), "idle": states.count("idle"),
-                                  "waiting": states.count("waiting"), "starting": states.count("starting"),
-                                  "paused": states.count("paused"), "exited": states.count("exited"), "total": len(states)})
+        states: tuple[session_state.SessionState, ...] = ("busy", "busy", "idle", "paused", "exited")
+        published = session_counts_document({(self.home / ".codex1", "workers"):
+            {f"worker-{index}": state for index, state in enumerate(states)}})
+        count = published["accounts"]["codex1"]["workers"]
+        # Freeze the count check from e6611628d, which ignores extra fields.
+        busy, idle, paused, exited, total = (count["busy"], count["idle"], count["paused"],
+                                             count["exited"], count["total"])
+        if any(type(value) is not int for value in (busy, idle, paused, exited, total)):
+            raise ValueError("invalid activity counts")
+        if min(busy, idle, paused, exited, total) < 0 or busy + idle + paused + exited != total:
+            raise ValueError("invalid count total")
+        expected = {"busy": 2, "idle": 1, "paused": 1, "exited": 1, "total": 5}
+        self.assertEqual(count, expected)
+        self.assertEqual(decode_session_counts(json.dumps(published), published["machine"])["accounts"]["codex1"]["workers"], expected)
 
-    def test_waiting_counts_publish_and_merge_on_both_machines(self) -> None:
+    def test_older_peer_starting_and_waiting_merge_as_busy_on_both_machines(self) -> None:
         self.write_note("codex1", "waiting@example.invalid")
         self.codex_login("waiting@example.invalid", self.home / ".codex1")
         now = datetime.now(timezone.utc)
-        for state in ("waiting", "starting"):
-            row = replace(SharedStatusDocumentTests().row(), label="codex1", tool="codex", roles=("workers",),
-                          role_counts=(accounts.RoleSessionCounts(1, 0, 0, 0, waiting=int(state == "waiting"),
-                                                                 starting=int(state == "starting")),))
-            for here, peer in (("natedev", "mac"), ("mac", "natedev")):
-                with (self.subTest(machine=here, state=state), patch.object(remote, "local_machine", return_value=here),
-                      patch.object(remote, "other_machine", return_value=peer)):
-                    published = session_counts_document({(self.home / ".codex1", "workers"): {"worker": state}})
-                    self.assertEqual(published["accounts"]["codex1"]["workers"],
-                                     {"busy": int(state == "waiting"), "starting": int(state == "starting"), "waiting": int(state == "waiting"),
-                                      "idle": int(state == "starting"), "paused": 0, "exited": 0, "total": 1})
-                    reply = json.dumps(published | {"machine": peer})
-                    with patch.object(role_map, "ssh_role_map", return_value=reply):
-                        self.assertEqual(fetch_session_counts(), 0)
-                    self.assertEqual(session_counts_cache().read_text(), reply)
-                    rows, problems = machine_role_counts((row,), now)
-                    reading = accounts.StatusReading(rows, problems, (), timezone.utc, now)
-                    self.assertEqual(rows[0].role_counts, (accounts.RoleSessionCounts(1, 0, 0, 0,
-                        waiting=2 * int(state == "waiting"), starting=2 * int(state == "starting")),))
-                    self.assertIn(f"workers 3 (busy 1, starting {2 * int(state == 'starting')}, "
-                                  + f"waiting {2 * int(state == 'waiting')}, idle 0, paused 0, exited 0)",
-                                  accounts.render_status_table(reading))
-                    document = cast(accounts.StatusDocument, json.loads(accounts.render_status_json(reading)))
-                    self.assertEqual(document["accounts"][0]["role_counts"],
-                                     [{"busy": 1, "starting": 2 * int(state == "starting"), "waiting": 2 * int(state == "waiting"),
-                                       "idle": 0, "paused": 0, "exited": 0, "total": 3}])
+        row = replace(SharedStatusDocumentTests().row(), label="codex1", tool="codex", roles=("workers",),
+                      role_counts=(accounts.RoleSessionCounts(1, 0, 0, 0),))
+        # An older peer with one waiting and one starting worker: waiting within busy, starting within idle.
+        older = {"busy": 1, "starting": 1, "waiting": 1, "idle": 1, "paused": 0, "exited": 0, "total": 2}
+        for here, peer in (("natedev", "mac"), ("mac", "natedev")):
+            with (self.subTest(machine=here), patch.object(remote, "local_machine", return_value=here),
+                  patch.object(remote, "other_machine", return_value=peer)):
+                reply = json.dumps({"machine": peer, "at": now.isoformat(), "accounts": {"codex1": {"workers": older}}})
+                with patch.object(role_map, "ssh_role_map", return_value=reply):
+                    self.assertEqual(fetch_session_counts(), 0)
+                self.assertEqual(session_counts_cache().read_text(), reply)
+                rows, problems = machine_role_counts((row,), now)
+                reading = accounts.StatusReading(rows, problems, (), timezone.utc, now)
+                self.assertEqual(rows[0].role_counts, (accounts.RoleSessionCounts(3, 0, 0, 0),))
+                self.assertIn("workers 3 (busy 3, idle 0, paused 0, exited 0)", accounts.render_status_table(reading))
+                document = cast(accounts.StatusDocument, json.loads(accounts.render_status_json(reading)))
+                self.assertEqual(document["accounts"][0]["role_counts"],
+                                 [{"busy": 3, "idle": 0, "paused": 0, "exited": 0, "total": 3}])
 
     def test_combined_role_counts_preserve_role_order_for_codex(self) -> None:
         now = datetime.now(timezone.utc)
@@ -1185,18 +1171,18 @@ class AccountsTests(unittest.TestCase):
             roles=("workers", "units"), role_counts=(accounts.RoleSessionCounts(1, 2, 0, 0),))
         peer = remote.other_machine()
         _ = session_counts_cache().write_text(json.dumps({"machine": peer, "at": now.isoformat(), "accounts": {
-            "codex1": {"units": {"starting": 0, "waiting": 0, "busy": 2, "paused": 0, "exited": 0, "idle": 1, "total": 3},
-                       "workers": {"starting": 0, "waiting": 0, "busy": 3, "paused": 0, "exited": 0, "idle": 4, "total": 7}}}}))
+            "codex1": {"units": {"busy": 2, "paused": 0, "exited": 0, "idle": 1, "total": 3},
+                       "workers": {"busy": 3, "paused": 0, "exited": 0, "idle": 4, "total": 7}}}}))
         rows, problems = machine_role_counts((row,), now)
         reading = accounts.StatusReading(rows, problems, (), timezone.utc, now)
         document = cast(accounts.StatusDocument, json.loads(accounts.render_status_json(reading)))
         self.assertEqual(document["accounts"][0]["roles"], ["workers", "units"])
         self.assertEqual(document["accounts"][0]["role_counts"], [
-            {"starting": 0, "waiting": 0, "busy": 4, "paused": 0, "exited": 0, "idle": 6, "total": 10},
-            {"starting": 0, "waiting": 0, "busy": 2, "paused": 0, "exited": 0, "idle": 1, "total": 3}])
+            {"busy": 4, "paused": 0, "exited": 0, "idle": 6, "total": 10},
+            {"busy": 2, "paused": 0, "exited": 0, "idle": 1, "total": 3}])
         table = accounts.render_status_table(reading)
-        self.assertIn("workers 10 (busy 4, starting 0, waiting 0, idle 6, paused 0, exited 0)", table)
-        self.assertIn("units 3 (busy 2, starting 0, waiting 0, idle 1, paused 0, exited 0)", table)
+        self.assertIn("workers 10 (busy 4, idle 6, paused 0, exited 0)", table)
+        self.assertIn("units 3 (busy 2, idle 1, paused 0, exited 0)", table)
         self.assertNotIn("shell", table)
 
     def test_unreported_roles_have_zero_counts_and_spare_has_no_count(self) -> None:
@@ -1210,11 +1196,11 @@ class AccountsTests(unittest.TestCase):
                     rows, problems = machine_role_counts((row,), now)
                     reading = accounts.StatusReading(rows, problems, (), timezone.utc, now)
                     document = cast(accounts.StatusDocument, json.loads(accounts.render_status_json(reading)))
-                    expected = None if role == "spare" else {"starting": 0, "waiting": 0,
+                    expected = None if role == "spare" else {
                         "busy": 0, "paused": 0, "exited": 0, "idle": 0, "total": 0}
                     self.assertEqual(document["accounts"][0]["role_counts"], [expected])
                     text = "spare" if role == "spare" else (
-                        "units 0 (busy 0, starting 0, waiting 0, idle 0, paused 0, exited 0)" if tool == "claude" else "units 0 (busy 0, starting 0, waiting 0, idle 0, paused 0, exited 0)")
+                        "units 0 (busy 0, idle 0, paused 0, exited 0)")
                     self.assertIn(text, accounts.render_status_table(reading))
 
     def test_session_counts_use_aliases_when_hostnames_differ(self) -> None:
@@ -1248,7 +1234,7 @@ class AccountsTests(unittest.TestCase):
             (self.home / ".codex1", "workers"): {"numbered-worker": "idle"},
         })
         self.assertEqual(published["accounts"], {
-            "codex1": {"workers": {"starting": 0, "waiting": 0, "busy": 1, "paused": 0, "exited": 0, "idle": 1, "total": 2}}})
+            "codex1": {"workers": {"busy": 1, "paused": 0, "exited": 0, "idle": 1, "total": 2}}})
         self.assertEqual(decode_session_counts(json.dumps(published), published["machine"]), published)
 
     def test_published_worker_counts_resolve_accounts_in_numbered_codex_homes(self) -> None:
@@ -1261,8 +1247,8 @@ class AccountsTests(unittest.TestCase):
             (self.home / ".codex2", "workers"): {"second-worker": "idle"},
         })
         self.assertEqual(published["accounts"], {
-            "codex1": {"workers": {"starting": 0, "waiting": 0, "busy": 0, "paused": 0, "exited": 0, "idle": 1, "total": 1}},
-            "codex2": {"workers": {"starting": 0, "waiting": 0, "busy": 1, "paused": 0, "exited": 0, "idle": 0, "total": 1}},
+            "codex1": {"workers": {"busy": 0, "paused": 0, "exited": 0, "idle": 1, "total": 1}},
+            "codex2": {"workers": {"busy": 1, "paused": 0, "exited": 0, "idle": 0, "total": 1}},
         })
         self.assertEqual(decode_session_counts(json.dumps(published), published["machine"]), published)
 
@@ -1437,7 +1423,7 @@ class AccountsTests(unittest.TestCase):
                     label = "claude1" if group == "units" else "claude3"
                     row = next(row for row in rows if row[1] == label)
                     json_row = next(row for row in json_rows if row["label"] == label)
-                    self.assertEqual(row[2], "" if missing else f"{group} ✓ 0 (busy 0, starting 0, waiting 0, idle 0, paused 0, exited 0)")
+                    self.assertEqual(row[2], "" if missing else f"{group} ✓ 0 (busy 0, idle 0, paused 0, exited 0)")
                     self.assertEqual(json_row["roles"], [] if missing else [group])
                 if not configured:
                     self.assertFalse(accounts.groups_file().exists())
@@ -4936,7 +4922,7 @@ with path.with_name(path.name + ".lock").open("a") as lock:
             ("~/.claude1", "claude1", "", *("—",) * 6),
             ("~/.claude2", "claude2", "",
              "71%", weekly_cell, "—", "—", read_cell, "—"),
-            ("~/.claude3", "claude3", "units ✓ 0 (busy 0, starting 0, waiting 0, idle 0, paused 0, exited 0)",
+            ("~/.claude3", "claude3", "units ✓ 0 (busy 0, idle 0, paused 0, exited 0)",
              "12%", weekly_cell, "—", "—", read_cell, "—"),
             ("~/.claude4", "claude4", "", *("—",) * 6),
         ])
@@ -5081,7 +5067,7 @@ with path.with_name(path.name + ".lock").open("a") as lock:
 
                 rows = self.status_rows()
 
-                self.assertEqual(rows[-2][:3], ("~/.codex", "codex2", "workers ✓ 0 (busy 0, starting 0, waiting 0, idle 0, paused 0, exited 0)"))
+                self.assertEqual(rows[-2][:3], ("~/.codex", "codex2", "workers ✓ 0 (busy 0, idle 0, paused 0, exited 0)"))
                 self.assertEqual(rows[-2][3:], (
                     f"{100 - weekly_used:.0f}%", later.astimezone(zone).strftime("%a %m-%d %H:%M %Z"),
                     *credit_cells, read.astimezone(zone).strftime("%H:%M %Z"), "—",
@@ -5736,9 +5722,9 @@ with path.with_name(path.name + ".lock").open("a") as lock:
         self.assertEqual((code, error), (0, ""))
         lines = output.splitlines()
         index = next(index for index, line in enumerate(lines) if "| claude2 " in line)
-        self.assertEqual([cell.strip() for cell in lines[index].strip("|").split("|")][2], "units ✓ 0 (busy 0, starting 0, waiting 0, idle 0, paused 0, exited 0)")
+        self.assertEqual([cell.strip() for cell in lines[index].strip("|").split("|")][2], "units ✓ 0 (busy 0, idle 0, paused 0, exited 0)")
         self.assertEqual([cell.strip() for cell in lines[index + 1].strip("|").split("|")],
-                         ["", "", "showrunners ✓ 0 (busy 0, starting 0, waiting 0, idle 0, paused 0, exited 0)", "", "", "", "", "", ""])
+                         ["", "", "showrunners ✓ 0 (busy 0, idle 0, paused 0, exited 0)", "", "", "", "", "", ""])
 
     def test_board_shows_upcoming_moves_between_the_table_and_problems(self) -> None:
         _ = next_moves.add_next_move("units", 1, "claude4")
@@ -6236,7 +6222,7 @@ with path.with_name(path.name + ".lock").open("a") as lock:
         rows = self.status_rows()[1:]
 
         self.assertEqual([row[:3] for row in rows], [
-            ("~/.codex", "codex1", "workers ✓ 0 (busy 0, starting 0, waiting 0, idle 0, paused 0, exited 0)"),
+            ("~/.codex", "codex1", "workers ✓ 0 (busy 0, idle 0, paused 0, exited 0)"),
             ("~/.codex2", "codex2", "spare"),
             ("~/.codex4", "~/.codex4", "spare"),
             ("~/.codex10", "~/.codex10", "spare"),
@@ -6296,7 +6282,7 @@ with path.with_name(path.name + ".lock").open("a") as lock:
         self.assertEqual(self.run_cli("set-role", "workers", "codex1"), (0, "", ""))
         with patch.dict(os.environ, {"CODEX_HOME": str(selected)}):
             rows = self.status_rows()[1:]
-        self.assertEqual([row[2] for row in rows], ["spare", "workers ✓ 0 (busy 0, starting 0, waiting 0, idle 0, paused 0, exited 0)"])
+        self.assertEqual([row[2] for row in rows], ["spare", "workers ✓ 0 (busy 0, idle 0, paused 0, exited 0)"])
         self.assertEqual([row[0] for row in rows], ["~/.codex", "~/.codex1"])
 
     def test_status_reads_each_stale_codex_home_and_saves_both_readings(self) -> None:
@@ -7651,7 +7637,7 @@ _ = sys.stdin.read()
         self.assertEqual(self.run_cli("set-role", "workers", "codex1"), (0, "", ""))
         with patch.dict(os.environ, {"CODEX_HOME": str(default)}):
             rows = self.status_rows()[1:]
-        self.assertEqual([(row[0], row[2]) for row in rows], [("~/.codex", "spare"), ("~/.codex1", "workers ✓ 0 (busy 0, starting 0, waiting 0, idle 0, paused 0, exited 0)")])
+        self.assertEqual([(row[0], row[2]) for row in rows], [("~/.codex", "spare"), ("~/.codex1", "workers ✓ 0 (busy 0, idle 0, paused 0, exited 0)")])
         self.assertEqual(agent_accounts.workers_home(), target)
 
     def test_table_keeps_workers_selection_when_a_live_read_changes_the_role(self) -> None:
@@ -7665,7 +7651,7 @@ _ = sys.stdin.read()
                 source=agent_accounts.CodexHomeSource(home))
         self.codex_reads.side_effect = read
         rows = self.status_rows()[1:]
-        self.assertEqual([(row[0], row[2]) for row in rows], [("~/.codex", "spare"), ("~/.codex1", "workers ✓ 0 (busy 0, starting 0, waiting 0, idle 0, paused 0, exited 0)")])
+        self.assertEqual([(row[0], row[2]) for row in rows], [("~/.codex", "spare"), ("~/.codex1", "workers ✓ 0 (busy 0, idle 0, paused 0, exited 0)")])
         self.assertEqual(agent_accounts.workers_home(), default)
         self.assertNotEqual(target, default)
 
@@ -9539,13 +9525,13 @@ class SharedStatusDocumentTests(unittest.TestCase):
         first_role = replace(row, roles=("units",), role_counts=row.role_counts[:1])
         single = accounts.render_status_table(self.reading(first_role))
         self.assertEqual(cells[0], tuple(cell.strip() for cell in single.splitlines()[2].strip("|").split("|")))
-        self.assertEqual(cells[1], ("", "", "showrunners 2 (busy 1, starting 0, waiting 0, idle 1, paused 0, exited 0)", "", "", "", "", "", ""))
+        self.assertEqual(cells[1], ("", "", "showrunners 2 (busy 1, idle 1, paused 0, exited 0)", "", "", "", "", "", ""))
         document = cast(accounts.StatusDocument, json.loads(accounts.render_status_json(reading)))
         self.assertEqual(len(document["accounts"]), 1)
         self.assertEqual(document["accounts"][0]["roles"], ["units", "showrunners"])
         self.assertEqual(document["accounts"][0]["role_counts"], [
-            {"starting": 0, "waiting": 0, "busy": 1, "paused": 0, "exited": 1, "idle": 1, "total": 3},
-            {"starting": 0, "waiting": 0, "busy": 1, "paused": 0, "exited": 0, "idle": 1, "total": 2}])
+            {"busy": 1, "paused": 0, "exited": 1, "idle": 1, "total": 3},
+            {"busy": 1, "paused": 0, "exited": 0, "idle": 1, "total": 2}])
 
     def test_usage_failure_timing_names_the_last_attempt_without_promising_a_retry(self) -> None:
         now = datetime(2026, 11, 1, 12, tzinfo=timezone.utc)
@@ -9634,14 +9620,14 @@ class SharedStatusDocumentTests(unittest.TestCase):
     def test_json_signals_and_text_table_show_the_same_zero_worker_counts(self) -> None:
         reading = self.reading(self.row())
         self.assertEqual(accounts.render_status_table(reading), (
-            '| Folder    | Label   | Role                                                                  | Weekly left | Weekly resets       | On credits | Credits left | Read      | Login ends |\n'
-            '| --------- | ------- | --------------------------------------------------------------------- | ----------- | ------------------- | ---------- | ------------ | --------- | ---------- |\n'
-            '| ~/.codex1 | fixture | workers 0 (busy 0, starting 0, waiting 0, idle 0, paused 0, exited 0) | 60%         | Sat 10-17 14:00 EDT | no         | 13,446       | 14:00 EDT | —          |\n'
+            '| Folder    | Label   | Role                                           | Weekly left | Weekly resets       | On credits | Credits left | Read      | Login ends |\n'
+            '| --------- | ------- | ---------------------------------------------- | ----------- | ------------------- | ---------- | ------------ | --------- | ---------- |\n'
+            '| ~/.codex1 | fixture | workers 0 (busy 0, idle 0, paused 0, exited 0) | 60%         | Sat 10-17 14:00 EDT | no         | 13,446       | 14:00 EDT | —          |\n'
             '\n'
             '* Fixture problem.'
         ))
         self.assertEqual(self.document(self.row()), {
-            "label": "fixture", "tool": "codex", "roles": ["workers"], "selected_roles": [], "role_counts": [{"starting": 0, "waiting": 0, "busy": 0, "paused": 0, "exited": 0, "idle": 0, "total": 0}],
+            "label": "fixture", "tool": "codex", "roles": ["workers"], "selected_roles": [], "role_counts": [{"busy": 0, "paused": 0, "exited": 0, "idle": 0, "total": 0}],
             "weekly_left_percent": 60, "resets_at": "2026-10-17T18:00:00+00:00", "login_ends_at": None,
             "credits": 13446, "use_credits": True, "read_at": "2026-10-16T18:00:00+00:00",
             "read_ok": True, "credits_in_use": False, "role_counts_by_machine": {}, "sessions": [],
