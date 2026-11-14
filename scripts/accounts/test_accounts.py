@@ -842,10 +842,13 @@ class AccountsTests(unittest.TestCase):
                           patch.object(pane_launch, "record_directory", return_value=records),
                           patch.object(accounts, "_session_config_dir", side_effect=live_directory),
                           patch.object(detached_run_process, "process_args", return_value=process_args),
+                          patch.object(detached_run_process, "supervisor_records", return_value={run_path.resolve(): frozenset({90001})}
+                              if supervisor == "live" else {}),
                           patch.object(worker_lifecycle, "read_json_object", wraps=worker_lifecycle.read_json_object) as reads):
                         status = accounts.read_status(source=accounts.StoredUsageOnly())
+                    # The status read opens only records that a live supervisor names.
                     if supervisor != "none":
-                        self.assertEqual(sum(call.args == (run_path,) for call in reads.call_args_list), 1)
+                        self.assertEqual(sum(call.args == (run_path,) for call in reads.call_args_list), int(supervisor == "live"))
                     role = "units" if kind == "unit" else "showrunners"
                     label = "claude4" if activity else "claude2"
                     document = cast(accounts.StatusDocument, json.loads(accounts.render_status_json(status)))
@@ -862,10 +865,12 @@ class AccountsTests(unittest.TestCase):
                         with (patch.object(staff, "snapshot", return_value=snapshot),
                               patch.object(sessions, "running_sessions", return_value=observed),
                               patch.object(detached_run_process, "process_args", return_value=process_args),
+                              patch.object(detached_run_process, "supervisor_records", return_value={run_path.resolve(): frozenset({90001})}
+                                  if supervisor == "live" else {}),
                               patch.object(worker_lifecycle, "read_json_object", wraps=worker_lifecycle.read_json_object) as reads):
                             selected = live_units.units_in(parent.name, listing)
                         if supervisor != "none":
-                            self.assertEqual(sum(call.args == (run_path,) for call in reads.call_args_list), 1)
+                            self.assertEqual(sum(call.args == (run_path,) for call in reads.call_args_list), int(supervisor == "live"))
                         rendered = unit_phases.table(selected, {}, snapshot=snapshot, pane_rows={})
                         self.assertIn(f"| {member.name} | {expected} |", rendered)
 
@@ -1045,6 +1050,8 @@ class AccountsTests(unittest.TestCase):
                               worker_panes.OpenWorker(current_target, "w1:p1", "/dev/fixture", herdr.AgentStatus.STARTING)]}
                               if ownership == "pane" and family == "codex" else {}),
                           patch.object(detached_run_process, "process_args", return_value=process_args),
+                          patch.object(detached_run_process, "supervisor_records", return_value={run_path.resolve(): frozenset({90001})}
+                              if supervisor == "live" else {}),
                           patch.object(accounts, "_local_codex_processes", return_value={
                               target.current_session: accounts.CodexRoleProcess(990, activity)} if family == "codex" and ownership != "pane" else {}),
                           patch.object(account, "process_codex_home", return_value=account.ProcessCodexHome(self.home / ".codex1")),

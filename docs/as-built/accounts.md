@@ -427,6 +427,8 @@ Local role counts read the registry, staff, pane launches, and worker records wi
 `session_state.classify` supplies the shared unit status for the accounts board and the units table.
 An exit record takes precedence over a pause record.
 A busy or starting pane gives `busy`. Live detached work also gives `busy`.
+On Linux, live detached work comes from one /proc scan for `detached_runs.py supervise` processes.
+The read opens only the records that those supervisors name. Without /proc, it reads each record.
 Exit and pause records take priority over all activity states.
 Without a live detached run, a missing live session gives `exited`.
 Other live activity gives `idle`.

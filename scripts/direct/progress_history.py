@@ -2063,8 +2063,12 @@ class DispatchRunNotRecorded(Enum):
     MISSING = "the worker has no dispatch state link"
 
 
+def _dispatch_state_links() -> Path:
+    return staff.record_path().parent / "dispatches"
+
+
 def _dispatch_state_link(worker_id: staff.StaffId) -> Path:
-    return staff.record_path().parent / "dispatches" / str(worker_id)
+    return _dispatch_state_links() / str(worker_id)
 
 
 def recorded_dispatch_run(worker_id: staff.StaffId) -> RecordedDispatchRun | DispatchRunNotRecorded:
@@ -2074,6 +2078,27 @@ def recorded_dispatch_run(worker_id: staff.StaffId) -> RecordedDispatchRun | Dis
     except FileNotFoundError:
         return DispatchRunNotRecorded.MISSING
     return RecordedDispatchRun(path.parent)
+
+
+def recorded_dispatch_runs() -> dict[staff.StaffId, RecordedDispatchRun]:
+    """Map each linked worker to its pass state run with one read of the link folder."""
+    try:
+        with os.scandir(_dispatch_state_links()) as entries:
+            links = {entry.name: (entry.path, os.readlink(entry.path)) for entry in entries if entry.is_symlink()}
+    except FileNotFoundError:
+        return {}
+    # Many workers link to one run; resolve each target once.
+    runs: dict[str, RecordedDispatchRun | DispatchRunNotRecorded] = {}
+    found: dict[staff.StaffId, RecordedDispatchRun] = {}
+    for name, (path, target) in links.items():
+        if target not in runs:
+            try:
+                runs[target] = RecordedDispatchRun(Path(path).resolve(strict=True).parent)
+            except FileNotFoundError:
+                runs[target] = DispatchRunNotRecorded.MISSING
+        if isinstance(run := runs[target], RecordedDispatchRun):
+            found[staff.StaffId(name)] = run
+    return found
 
 
 def _link_dispatch_state(worker_id: staff.StaffId, session_dir: Path) -> None:
