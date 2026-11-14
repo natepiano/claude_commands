@@ -56,6 +56,12 @@ The Codex command sync names Morty's skill `producer-morty`.
 `PRODUCER_FOLDER_ROOT` in `config/staff.conf` selects the document root, with default `~/rust/hanadocs`.
 Each producer uses `<root>/<name>/README.md`.
 The [shared resume path](shutdown-and-restart.md#producer-launch-and-admission) admits a first conversation through `staff.ensure`.
+A producer's `worktree` is its launch folder and owns no path.
+`by_worktree` skips producers, and two producers can record one folder.
+`merge_checkpoint.branch_keep_reason` and `branch_page.list_branches` read no branch from a producer's folder.
+`staff.transfer_producer(identity, session, home, folder)` sets `current_session`, `home`, and the launch folder in one transaction.
+It refuses a row that is not a producer and a session that another row holds.
+The hidden `transfer-producer` CLI verb sends the write to the owner machine.
 
 ## Backend and hold evidence
 
@@ -213,7 +219,7 @@ The shared pane launch builder uses `set_home`.
 | `scripts/mac_test/mac_test.py` | read | initial_snapshot, by_id, StaffId; holder_name shows the current name of a fixed holder key, delivery_target sends to the staff id |
 | `scripts/message/escalate.py` | read | active, snapshot |
 | `scripts/message/failed_lookup.py` | read | snapshot |
-| `scripts/message/morty_identity.py` | read | native_id |
+| `scripts/message/morty_identity.py` | read | snapshot; holder returns the current_session of the producer row named morty |
 | `scripts/message/postmaster.py` | read | snapshot, StaffSnapshot, by_id |
 | `scripts/message/rca.py` | read | active, snapshot |
 | `scripts/message/recipient_test_support.py` | read | staff.json path |
@@ -297,6 +303,7 @@ The shared pane launch builder uses `set_home`.
 | `scripts/agents/member_account.py` | write | StaffRow, SessionHome, set_home; repairs the home from live process evidence |
 | `scripts/agents/pane_record.py` | read | initial_snapshot |
 | `scripts/agents/pane_restore.py` | read | row_operation |
+| `scripts/agents/producer_transfer.py` | write | initial_snapshot, runtime_id, native_id, slot_operation, row_operation, transfer_producer |
 | `scripts/agents/remote_control.py` | read | initial_snapshot |
 | `scripts/agents/restart.py` | write | initial_snapshot, row_operation, set_home |
 | `scripts/agents/session_types.py` | read | snapshot |

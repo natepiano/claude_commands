@@ -20,6 +20,7 @@ from unittest import mock
 from scripts.production.rename_test_support import FolderMoveBackend, FolderMoveFixture
 from scripts.herdr import herdr_types
 from scripts.production.cli_fixture import invoke_cli
+from scripts.lib.state_home_test_support import isolate_state_home
 from scripts.accounts import accounts
 from scripts.whoami import agent_accounts
 from scripts.agents import restart
@@ -83,6 +84,10 @@ def mac_process_commands(root: Path, responses: Mapping[str, object]) -> Generat
               "HERDR_PLATFORM": "darwin", "FAKE_HERDR_RESPONSES": str(response_path),
               "FAKE_HERDR_LOG": str(root / "mac-process-log")})):
         yield
+
+
+def setUpModule() -> None:
+    isolate_state_home()
 
 
 @final

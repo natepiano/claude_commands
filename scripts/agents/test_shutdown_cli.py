@@ -24,6 +24,7 @@ from typing import cast, final, override
 from unittest import mock
 
 from scripts.accounts import accounts
+from scripts.lib.state_home_test_support import isolate_state_home
 from scripts.herdr import herdr_types
 from scripts.agents import worker_lifecycle
 from scripts.direct import progress_history
@@ -54,7 +55,7 @@ from scripts.production.staff_test_support import (
     CHECKOUT,
     unit_membership,
 )
-from scripts.agents import shutdown, remote, stop_resume, restart, pane_record as staff_pane_record, pane_record
+from scripts.agents import shutdown, remote, stop_resume, restart, pane_record as staff_pane_record, pane_record, producer_transfer
 from scripts.agents.stop_results import StopResult
 
 from scripts.production import rename_test_support as support
@@ -124,14 +125,26 @@ class AgentsUsageTests(unittest.TestCase):
         self.assertEqual(status, 0)
         self.assertEqual(errors, "")
         self.assertEqual([line.split()[1] for line in output.splitlines()[1:]],
-                         ["help", "status", "pause", "exit", "pause", "resume", "resume", "retire", "rename", "move", "restart", "stop", "remove-stray"])
+                         ["help", "status", "pause", "exit", "pause", "resume", "resume", "retire", "rename", "move", "restart", "stop", "remove-stray", "transfer"])
         self.assertIn("resume NAME", output)
+        self.assertIn("transfer NAME [--model MODEL --effort EFFORT]", output)
         self.assertIn("stop SESSION", output)
         self.assertIn("remove-stray NAME SESSION", output)
         self.assertIn("[ACCOUNT]", output)
         self.assertIn("--dry-run", output)
         for command in ("records", "held-sessions", "remote-control"):
             self.assertNotIn(command, output)
+
+    def test_transfer_gives_the_name_and_settings_to_the_producer_transfer(self) -> None:
+        with mock.patch.object(producer_transfer, "transfer", return_value=0) as transfer:
+            self.assertEqual(self.invoke(["transfer", "morty", "--model", "opus", "--effort", "high"])[0], 0)
+            self.assertEqual(self.invoke(["transfer", "brain"])[0], 0)
+        self.assertEqual(transfer.call_args_list, [mock.call("morty", model="opus", effort="high"),
+                                                   mock.call("brain", model="", effort="")])
+        with mock.patch.object(producer_transfer, "transfer", side_effect=ValueError("morty: no producer row")):
+            code, output, errors = self.invoke(["transfer", "morty"])
+        self.assertEqual((code, output), (2, ""))
+        self.assertIn("morty: no producer row", errors)
 
     def test_help_option_prints_the_same_public_usage(self) -> None:
         option = self.invoke(["--help"])
@@ -159,6 +172,7 @@ STOP_SESSION = stop_resume.stop
 def setUpModule() -> None:
     unittest.enterModuleContext(foreign_hostname())
     unittest.enterModuleContext(mock.patch.dict(os.environ, {"USER_ZONE": "America/New_York"}))
+    isolate_state_home()
 
 def git(where: Path, *arguments: str) -> str:
     return subprocess.run(["git", "-C", str(where), *arguments], check=True, capture_output=True,

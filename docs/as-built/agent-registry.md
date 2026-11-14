@@ -125,9 +125,9 @@ The [progress recorder](unit-progress-history.md#configuration-digest) uses the 
 
 ### Python launch settings
 
-`models_registry.launch_settings(section, key, family="assigned") -> LaunchSettings` gives Python callers the shell resolver's result.
+`models_registry.launch_settings(section, key, family="assigned", *, configuration=None) -> LaunchSettings` gives Python callers the shell resolver's result.
 A `claude` or `codex` family reads that family's row through `_agents_resolve_in_family`, whatever the assignment is.
-It builds a `LaunchModelConfiguration` in Python from `_snapshot`, so an inherited `MODELS_LAUNCH_CONFIGURATION` decides the result.
+Without `configuration`, it builds a `LaunchModelConfiguration` in Python from `_snapshot`, so an inherited `MODELS_LAUNCH_CONFIGURATION` decides the result. A writer passes its candidate text as `configuration`.
 It starts one `bash`, which sources `models_config.sh` and reads `configuration_shell` output from stdin.
 Bash loads that table with `_models_table_load` and runs the real `agents_resolve`. No Python registry process starts.
 The child environment sets `MODELS_CONFIG_TIER_ONLY=1`, so this path never synchronizes the Codex catalog.

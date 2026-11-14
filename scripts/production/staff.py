@@ -588,7 +588,8 @@ class StaffSnapshot:
         return _row_by_path(self.rows, names)
 
     def by_worktree(self, machine: str, path: Path) -> StaffRow | None:
-        matches = [row for row in self.rows if isinstance(row.worktree, PresentWorktree)
+        """A producer's worktree is its launch folder and owns no path."""
+        matches = [row for row in self.rows if row.kind != "producer" and isinstance(row.worktree, PresentWorktree)
                    and row.worktree.machine == machine and path.is_relative_to(row.worktree.path)]
         return max(matches, key=lambda row: len(cast(PresentWorktree, row.worktree).path.parts), default=None)
 
@@ -961,7 +962,8 @@ def _validate(rows: list[StaffRow], unknown_rows: Sequence[dict[str, object]] = 
             raise StaffRefused(f"{row.kind} cannot hold worktree")
         if row.kind not in ("showrunner", "producer") and not isinstance(row.doc, DocUnfilled):
             raise StaffRefused(f"{row.kind} cannot hold doc")
-        if isinstance(row.worktree, PresentWorktree):
+        if row.kind != "producer" and isinstance(row.worktree, PresentWorktree):
+            # Two producers can start in one folder; a producer's worktree owns no path.
             location = (row.worktree.machine, row.worktree.path)
             if location in worktrees:
                 raise StaffRefused(f"duplicate present worktree: {location[0]}:{location[1]}")
@@ -1552,6 +1554,26 @@ def update_current_session(old_session: StaffId, new_session: StaffId) -> StaffR
         return _transaction(edit)
 
 
+def transfer_producer(identity: StaffId, session: StaffId, home: SessionHome, folder: PresentWorktree) -> StaffRow:
+    """Give a producer row to a proved conversation: its session, account home and launch folder."""
+    _ = native_id(session)
+    if not is_owner():
+        return _remote_row(["transfer-producer", identity, session, "--home", str(home.path),
+                            "--machine", folder.machine, "--path", str(folder.path)])
+    def edit(rows: list[StaffRow]) -> StaffRow:
+        row = _required(rows, identity)
+        if row.kind != "producer":
+            raise StaffRefused("transfer-producer requires a producer")
+        if any(session in (other.id, other.current_session) for other in rows if other.id != row.id):
+            raise StaffRefused(f"{session}: runtime identity already belongs to another member")
+        changed = replace(row, current_session=session, home=home,
+                          worktree=_keep_location_fields(folder, row.worktree))
+        rows[rows.index(row)] = changed
+        return changed
+    with row_operation(identity):
+        return _transaction(edit)
+
+
 @dataclass(frozen=True)
 class ShowrunnerRole:
     name: str
@@ -2037,6 +2059,7 @@ class _MoveCommand(Protocol):
 
 class _Arguments:
     hold_record: str = ""
+    home: str = ""
     runtime_id: str = ""
     new_id: str = ""
     value: str = ""
@@ -2116,6 +2139,13 @@ def _parser() -> argparse.ArgumentParser:
     _ = session_parser.add_argument("--json", action="store_true")
     _ = session_parser.add_argument("--row-write", action="store_true", help=argparse.SUPPRESS)
     _ = add.add_argument("--runtime-id", default="")
+    transfer_parser = verbs.add_parser("transfer-producer", help=argparse.SUPPRESS)
+    _ = transfer_parser.add_argument("target")
+    _ = transfer_parser.add_argument("new_id")
+    _ = transfer_parser.add_argument("--home", required=True)
+    _ = transfer_parser.add_argument("--machine", required=True)
+    _ = transfer_parser.add_argument("--path", required=True)
+    _ = transfer_parser.add_argument("--json", action="store_true")
     for command in ("promote-unit", "demote-showrunner"):
         director = verbs.add_parser(command, help=argparse.SUPPRESS)
         _ = director.add_argument("target")
@@ -2193,6 +2223,10 @@ def _mutate(arguments: _Arguments, seed_text: str) -> StaffRow | StaffSnapshot |
         return ensure_worker(native_id(arguments.target), arguments.name, StaffId(arguments.parent))
     if arguments.verb == "update-current-session":
         return update_current_session(StaffId(arguments.target), native_id(arguments.new_id))
+    if arguments.verb == "transfer-producer":
+        return transfer_producer(StaffId(arguments.target), native_id(arguments.new_id),
+                                 SessionHome(Path(arguments.home).absolute()),
+                                 PresentWorktree(arguments.machine, Path(arguments.path)))
     if arguments.verb == "set-worktree":
         worktree = (PresentWorktree(arguments.machine, Path(arguments.path)) if arguments.state == "present"
                     else RemovedWorktree(arguments.machine, Path(arguments.path),
@@ -2301,7 +2335,7 @@ def _main(arguments: _Arguments) -> int:
                                     arguments.verb == "ensure" and arguments.kind == "worker"):
         raise StaffRefused("row writes are for worker admission and retirement")
     seed_text = sys.stdin.read() if arguments.verb == "apply-seed" else ""
-    with operation() if is_owner() and not arguments.row_write and arguments.verb not in ("set-worker-role", "set-home", "set-run", "clear-run") else nullcontext():
+    with operation() if is_owner() and not arguments.row_write and arguments.verb not in ("set-worker-role", "set-home", "set-run", "clear-run", "transfer-producer") else nullcontext():
         result = _mutate(arguments, seed_text)
     if isinstance(result, tuple):
         print(json.dumps(result))
