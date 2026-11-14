@@ -303,6 +303,24 @@ Several tabs with the producer label therefore do not select a different convers
 The shared native process reader uses Claude's session registry to prove a plain `claude` start.
 The process arguments need no session ID.
 
+`agents transfer NAME [--model MODEL --effort EFFORT]` gives a producer role to the conversation that runs it.
+`producer_transfer.transfer` holds the `producer-first-NAME` slot and the row lock for these steps:
+
+1. Refuse a caller that another staff row records. Refuse a producer on another machine.
+2. Prove the caller through `stop_resume.producer_adoption_launch`: native id, family, account home, folder, and pane.
+3. Refuse a Claude caller outside the showrunners account; the refusal names the `agents move` command.
+4. Validate the settings through `models_registry.producer_settings`. Without options, the configured family must match the caller.
+5. Stop the old conversation through `restart.stop_row`, print its `catch_up.py` command, and close its panes.
+6. Publish `[producers].NAME` through `models_registry.store_producer`.
+7. Write the row through `staff.transfer_producer`, then publish the pane record as the producer binding.
+8. Give the tab the producer name through `retitle_row`; the saved layout supplies the position of the old tab.
+
+`restart.restart(stop_all=True, only=(row id,))` then restarts the caller outside the row lock.
+The restart runs in a detached process and sends no opening prompt.
+The row id, the document, and the `staff:<row id>` message queue do not change.
+Each step is safe to run again; a caller that already holds the row skips step 5.
+A failure between steps 6 and 7 leaves the new settings on the old session until the next run.
+
 `agents remove-stray NAME SESSION` removes a local stray producer conversation.
 The command uses this order:
 

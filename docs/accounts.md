@@ -515,6 +515,8 @@ Run `~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py role worker
 A swap reads both usage windows and the credits before it changes the role.
 An unknown usage reading prints one anomaly and permits the move.
 Pane workers move under their worker locks.
+A worker already on the target account is not moved, and its pane stays as it is.
+A move changes only the account. The worker keeps its family and the model, effort and tier of its saved launch.
 An idle worker closes its pane only when the shared close check allows it.
 The check keeps the pane open for a held dispatch lock or a live launcher.
 An account move stops and resumes a worker with a live detached run on the target account, including an idle worker.
