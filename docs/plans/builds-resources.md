@@ -2604,3 +2604,14 @@ Each Mac run without `--target-dir` trims the mirror target to `mac_budget_gib.<
 **Gotchas:** node is not on PATH on natedev; run `memory_page_proof.mjs` through `nix shell nixpkgs#nodejs -c node`.
 
 **Ruled out:** all of app.slice as "Agents" — it also holds browsers and editors.
+
+### Phase 121 — Every floor removal writes its journal line, whichever caller holds the lock  · status: todo
+
+**Why:** `scripts/lint/invoke.sh` `sweep_after_step` starts `sweep.py` (budget and floor passes) in the background after each lint step, with its output to /dev/null. On 2026-11-13 from 21:44 to 21:47 that sweep held `floor.lock` and removed 32.2 GiB. The disk-floor service run logged only "another sweep is holding it", and `read_sweep_journal` and the floor alert had no removal lines.
+
+**Work:**
+1. When `systemd-cat` is on PATH, `sweep_after_step` pipes the background sweep's output to `systemd-cat -t lint-sweep`. The pipeline keeps no fd of the caller.
+2. With no `systemd-cat` (the Mac), the output goes to /dev/null as now.
+3. `SweepStartupTests` in `scripts/lint/test_invoke_scope.py`: a fake `systemd-cat` gets the sweep's lines and the `lint-sweep` identifier; without it the sweep still starts; the caller's output closes before the sweep ends.
+
+**Files:** `scripts/lint/invoke.sh`, `scripts/lint/test_invoke_scope.py`.
