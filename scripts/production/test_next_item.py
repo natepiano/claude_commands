@@ -217,7 +217,7 @@ class NextItemTests(unittest.TestCase):
                                       date(2026, 10, 15), "", doc, record=staff.snapshot())
         _ = doc.write_text(doc.read_text() + f"- **Change review:** `{path.with_name('change-review - demo.md')}`\n")
         self.assertEqual(run("show", "--kind", "change", "--production", "demo"), (0, "\n".join([
-            "change", "natedev/C1 Panels keep shields", "  How to check: Run `hana`. You see: Each panel has its shield",
+            "change", "demo/C1 Panels keep shields", "  How to check: Run `hana`. You see: Each panel has its shield",
             "  Merged: 2026-10-15", "  Production: demo", ""]), ""))
 
     def test_each_kind_shows_its_own_production_and_with_all_below_each_lower_one_never_above(self) -> None:
@@ -330,7 +330,7 @@ class NextItemTests(unittest.TestCase):
                 mock.patch.object(showrunners, "timer_docs", return_value={"top": top, "kid": kid}), \
                 mock.patch.object(proposals_folder, "owner_docs", return_value=[kid]):
             self.assertEqual([entry.item.splitlines()[0] for entry in next_item.change_queue(kid).entries],
-                             ["C1 kid change"])
+                         ["kid/C1 kid change"])
 
     def attached_changes(self) -> dict[str, Path]:
         docs = {name: self.root / f"{name}-production.md" for name in ("top", "kid", "grand")}
@@ -373,7 +373,7 @@ class NextItemTests(unittest.TestCase):
         lists = {path: path.read_bytes() for path in (self.root / "change-review").glob("*.md")}
         for order, expected in (("urgent", "kid/C10 Urgent child change"),
                                 ("oldest", "kid/C9 Earlier child change"),
-                                ("newest", "C434 Newest child change")):
+                                ("newest", "kid/C434 Newest child change")):
             code, output, error = run("show", "--kind", "change", "--order", order, "--production", unit_lookup.doc_owner(doc, staff.snapshot()).name)
             self.assertEqual((code, error), (0, ""))
             self.assertEqual(output.splitlines()[:2], ["change", expected])
@@ -442,7 +442,7 @@ class NextItemTests(unittest.TestCase):
         _ = broken.write_bytes(b"\xff")
         code, output, error = review_show(doc)
         self.assertEqual(code, 0)
-        self.assertEqual(output.splitlines()[0], "C9 Current child change")
+        self.assertEqual(output.splitlines()[0], "kid/C9 Current child change")
         self.assertEqual(output.splitlines()[-1], "1 more to review")
         self.assertEqual(len(error.splitlines()), 1)
         self.assertIn(str(broken), error)
@@ -457,7 +457,7 @@ class NextItemTests(unittest.TestCase):
         _ = broken.write_bytes(b"\xff")
         code, output, error = run("show", "--kind", "change", "--order", "oldest", "--production", unit_lookup.doc_owner(doc, staff.snapshot()).name)
         self.assertEqual(code, 0)
-        self.assertEqual(output.splitlines()[1], "C9 Current child change")
+        self.assertEqual(output.splitlines()[1], "kid/C9 Current child change")
         self.assertEqual(len(error.splitlines()), 1)
         self.assertIn(str(broken), error)
         errors = io.StringIO()
@@ -472,7 +472,7 @@ class NextItemTests(unittest.TestCase):
         saved = earlier.read_bytes()
         earlier.unlink()
         self.assertEqual(run("show", "--kind", "change", "--order", "newest", "--production", unit_lookup.doc_owner(doc, staff.snapshot()).name)[1].splitlines()[1],
-                         "C434 Newest child change")
+                         "kid/C434 Newest child change")
         queue = next_item.change_queue(doc)
         self.assertEqual(urgency.pinned(queue.name), "C434")
         _ = earlier.write_bytes(saved)
@@ -493,7 +493,7 @@ class NextItemTests(unittest.TestCase):
         _ = earlier.write_bytes(saved)
         code, output, error = run("show", "--kind", "change", "--order", "newest", "--production", unit_lookup.doc_owner(doc, staff.snapshot()).name)
         self.assertEqual((code, error), (0, ""))
-        self.assertEqual(output.splitlines()[1], "C9 Current child change")
+        self.assertEqual(output.splitlines()[1], "kid/C9 Current child change")
         self.assertIn("C434", urgency.ended(queue.name))
         entries = urgency.queue_order(next_item.change_queue(doc).entries, queue.name)
         self.assertEqual(entries[-1].key, "C434")
@@ -509,7 +509,7 @@ class NextItemTests(unittest.TestCase):
             self.assertEqual(change_review.scope_list(doc), own)
             code, output, error = run("show", "--kind", "change", "--order", "oldest", "--production", unit_lookup.doc_owner(doc, staff.snapshot()).name)
             self.assertEqual((code, error), (0, ""))
-            self.assertEqual(output.splitlines()[1], "C9 Earlier child change")
+            self.assertEqual(output.splitlines()[1], "kid/C9 Earlier child change")
             self.assertEqual(footer_counts.changes(doc), 2)
             self.assertEqual(footer_counts.counts_line(footer_counts.read_counts(doc)), "For you: 2 changes")
 
@@ -519,7 +519,7 @@ class NextItemTests(unittest.TestCase):
         _ = broken.write_text(broken.read_text().replace("| blocks |", "| invalid |"))
         code, output, error = run("show", "--kind", "change", "--order", "oldest", "--production", unit_lookup.doc_owner(doc, staff.snapshot()).name)
         self.assertEqual(code, 0)
-        self.assertEqual(output.splitlines()[1], "C9 Current child change")
+        self.assertEqual(output.splitlines()[1], "kid/C9 Current child change")
         self.assertEqual(len(error.splitlines()), 1)
         self.assertIn(str(broken), error)
         errors = io.StringIO()

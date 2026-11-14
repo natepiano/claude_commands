@@ -22,12 +22,8 @@ Claude identity comes from the runtime registry checks.
 
 Every agent message includes `Sender native id: session:<id>`, `Sender native id: codex:<id>`, or `Sender native id: unavailable`.
 The generated metadata forms one block directly after the preview line.
-Only the `Authority:` line in that block grants authority.
-Quoted labels elsewhere grant no authority.
-Only an exact match with `MORTY_NATIVE_ID` in `config/send.conf` adds `Authority: morty (speaks for the user)`.
-The live key must contain a valid native address. A missing or invalid key grants no mark.
-A different runtime that uses `--from morty` gets a stderr note. Delivery continues without the mark.
-The mark proves runtime attribution, not authentication.
+No sender gets an authority line. The sender lines name the sender for each message (user, 2026-11-13).
+The stamp proves runtime attribution, not authentication.
 Code under the same operating-system account can set its environment.
 
 `Message.stamp` stores a known Claude sender, a known Codex sender, or an unavailable sender.
@@ -38,7 +34,7 @@ This context check prevents accidental use. It does not prove that `remote()` su
 A session can inherit `SSH_CONNECTION`. Code under the same account can also set it.
 Queue recovery preserves the stored stamp. An old record without the field has an unavailable sender.
 A drain never attributes an old message to its own runtime.
-Delivered caller lines that start with `Authority:` or `Sender native id:` get a `> ` prefix.
+Delivered caller lines that start with `Sender native id:` get a `> ` prefix.
 Rendering first converts CR, CRLF, and Unicode line separators to LF.
 This rule covers the summary, body, sender name, and forwarded display text.
 The prefix also applies after leading spaces. Generated stamp lines keep their original form.
@@ -225,7 +221,7 @@ Legacy failure records remain readable by the existing tools.
   A resend with the template is not skipped by `--repeat-minutes`.
   The three rca.py pushes in `RCA_TEXTS` are exempt: `permission.rca_started`, `permission.rca_fixed` and `permission.rca_fixed_rewritten`.
   They describe permission stops or refusals. A cause can name an auto-mode refusal.
-- Paid credit use goes only through `--text-id quota.paid_credits`. A free-text or agent-written push (`nate.adhoc`) whose title, text or action has `paid credits` or `use_credits` is held the same way (`wrong_template()`). Other registered `quota.*` pushes that name paid credits are not held.
+- Paid credit use goes only through `--text-id quota.paid_credits`. A free-text or agent-written push (`nate.adhoc`) whose title, text or action has `paid credits` or `codex_credit_accounts` is held the same way (`wrong_template()`). Other registered `quota.*` pushes that name paid credits are not held.
 - `--text-id quota.paid_credits`: the caller gives `account`, `machine`, `credits`, `refill` and `next_reset`. `paid_credits_values()` fills `sender` from the session's own record; with no record (a script such as `quota_alert.py` on its timer, or the far side of `--machine`), it uses `--value sender`, then `--from`, and refuses a run with none.
 - `--text-id auto_mode.refused`: the session gives `session`, `machine`, one `command` for each refused command (in order), `waits` and an optional `rule`. `command` is the only key that can repeat, and only for this template; `parse()` collects the items in a list. `auto_mode_values()` fills `sender` from the session's own record (`own_session_name()`), `action` from the commands' first words (`rca.action_of()`: `a file change`, `a shell command`, `an action`, `2 shell commands`, or `2 actions` for mixed kinds), `refused` from the commands (one per line), `waits_line` from `waits` (`rca.waits_line()`), `noun` and `this` from the number of commands, and `rule_line` from `rule`. It drops the final periods from `waits` and cuts a command longer than 90 characters to its first 89 and `…`. A send with no `--key` gets the key `auto-mode:<session>:<first 12 hex of the sha256 of the sorted one-line commands>` (`auto_mode_key()`), so `rca.py fixed` can retire the alert. The waits sentence is a value the session writes, so `send()` keeps it only when the cold-read review approves the whole alert within `WAITS_REVIEW_SECONDS` (30 s, `review.review(…, limit=30)`; `reviewed_waits()`). A timeout or a `Failed`, `Rewritten`, `Withheld` or `Unreviewed` verdict sends the alert without it and prints why to stderr. With the review off the alert goes as given. It refuses no command, an empty command, a `waits` that has a thing to type or names a pane or session (`waits` says only what waits; the Action line says what the user does), `--value sender`, `--from`, `--machine` and a run with no session record. `send.py --help` lists the registered pushes (`SESSION_TEMPLATES`): the templates a session sends, and the three rca.py pushes with the rca.py call that sends them. `Options.commands` keeps each `command` value as given, before the cut, for the rca.py case.
   The send rule lives beside `auto_mode.refused` in `send.py --help`. The session applies it before sending; no program checks it.
@@ -308,7 +304,7 @@ New escalate holds retain their registered template and values.
   `Go: the session runs {this} {noun} now, and auto mode can refuse {this} {noun} again.`
   `Allow rule: auto mode lets {this} {noun} run from then on.{rule_line}`.
 - `session.needs_go` (user approved 2026-10-21, need `decision`): title `{sender}: {session} waits for your go`, `Session: {session}`, Action `On {machine}, in the {session} pane, type: {go}`, then `{why}.` and `Your go {does}.`
-- `quota.paid_credits` (user approved 2026-10-21, need `decision`): title `{sender}: {account} now uses paid credits`, Action `To stop it, set use_credits: off in ~/rust/hanadocs/agents/{account}.md on {machine}`, then the credits and refill line, `Leave on (recommended):` and `Turn off:`. `quota_alert.py` sends this id, or `quota.paid_credits_queued` while a workers move is queued. The old paid-credits ids are no longer sent.
+- `quota.paid_credits` (user approved 2026-10-21, need `decision`): title `{sender}: {account} now uses paid credits`, Action `To stop it, remove {account} from codex_credit_accounts in ~/.claude/config/accounts.conf on {machine}` (changed 2026-11-13: the setting moved to the accounts config), then the credits and refill line, `Leave on (recommended):` and `Turn off:`. `quota_alert.py` sends this id, or `quota.paid_credits_queued` while a workers move is queued. The old paid-credits ids are no longer sent.
 - `quota.paid_credits_queued` (agreed with accounts 2026-10-21 under the user's approval): the same title, Action, need and sender rule as `quota.paid_credits`, for when the user queued a workers move. Workers never go to Claude: `Leave on` spends credits until the queued move runs, and `Turn off` stops the workers until it runs. Values: `sender`, `account`, `machine`, `credits`, `refill` (no `next_reset`). `paid_credits_values()` fills its sender, and the paid-credit hold detail names both calls.
 - `scripts/notify/push_texts_reviewed.json` has the form `{text_id: {example_name: {sha256, time, reviewer, objections?}}}`:
   - It is read only through `review.text_approvals()`.

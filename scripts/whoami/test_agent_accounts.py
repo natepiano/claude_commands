@@ -301,6 +301,39 @@ class SharedUsageReadTests(unittest.TestCase):
         self.assertEqual(report.plan, "max")
         self.assertEqual(report.weekly_remaining, 75)
 
+    def test_live_login_end_uses_the_same_loaded_metadata_with_or_without_disk_identity(self) -> None:
+        end = datetime(2026, 12, 4, 21, 7, tzinfo=timezone.utc)
+        cases: tuple[agent_accounts.ClaudeOauth, ...] = ({}, {"refreshTokenExpiresAt": None},
+                                                       {"refreshTokenExpiresAt": int(end.timestamp() * 1000)})
+        for disk_identity in (False, True):
+            for metadata in cases:
+                with self.subTest(disk_identity=disk_identity, metadata=metadata):
+                    self.now += timedelta(seconds=100)
+                    oauth: agent_accounts.ClaudeOauth = {"accessToken": "fixture", "subscriptionType": "max"}
+                    oauth.update(metadata)
+                    with (patch.object(agent_accounts, "claude_on_disk", return_value=agent_accounts.Report(
+                              "Claude", email="shared@example.invalid")),
+                          patch.object(agent_accounts, "claude_credentials", return_value={"claudeAiOauth": oauth}) as credentials,
+                          patch.object(agent_accounts, "command_json", return_value={
+                              "loggedIn": True, "email": "shared@example.invalid", "authMethod": "claude.ai",
+                              "subscriptionType": "max"}) as cli,
+                          patch.object(urllib.request, "urlopen", side_effect=self.response)):
+                        report = agent_accounts.claude_live(self.home / ".claude2", use_disk_identity=disk_identity)
+                    credentials.assert_called_once_with(self.home / ".claude2")
+                    self.assertEqual(cli.call_count, 0 if disk_identity else 1)
+                    self.assertEqual(report.login_ends_at, agent_accounts.LoginEndKnown(end)
+                                     if metadata.get("refreshTokenExpiresAt") is not None else agent_accounts.LoginEndUnknown())
+                    self.assertEqual(report.weekly_remaining, 75)
+
+    def test_stale_access_token_keeps_the_separate_login_end(self) -> None:
+        end = datetime(2026, 12, 4, 21, 7, tzinfo=timezone.utc)
+        with (patch.object(agent_accounts, "claude_credentials", return_value={"claudeAiOauth": {
+                  "accessToken": "fixture", "expiresAt": 1, "refreshTokenExpiresAt": int(end.timestamp() * 1000)}}),
+              patch.object(urllib.request, "urlopen", side_effect=AssertionError("stale token sent"))):
+            report = self.read()
+        self.assertEqual(report.login_ends_at, agent_accounts.LoginEndKnown(end))
+        self.assertEqual(report.usage_read_outcome, agent_accounts.UsageReadOutcome.STALE_TOKEN)
+
     def test_missing_disk_subscription_keeps_cli_plan_label(self) -> None:
         folder = self.home / ".claude2"
         folder.mkdir()

@@ -62,7 +62,7 @@ def launch():
     arguments = sys.argv[4:]
     import runpy
     sys.argv = [target if mode in {"file", "m"} else "-c", *arguments]
-    runpy.run_path(os.path.join(root, "scripts/lib/python_startup/sitecustomize.py"), run_name="_shim_python_startup")["select_checkout"](sys.argv)
+    runpy.run_path(os.path.join(root, "scripts/lib/python_startup/sitecustomize.py"), run_name="_shim_python_startup")["start_process"](sys.argv)
     namespace = sys.modules["__main__"].__dict__
     builtins = namespace["__builtins__"]
     namespace.clear()

@@ -521,8 +521,15 @@ class PhaseStateTests(unittest.TestCase):
     def test_a_held_reservation_is_never_replaced_or_cleared_by_hand(self) -> None:
         phase_reservation._write_state(self.phase_dir(), ACTIVE)  # pyright: ignore[reportPrivateUsage]
         self.assertEqual(self.run_verb("enroll", "--board", "board_ready")[0], 2)
-        self.assertEqual(self.run_verb("clear")[0], 2)
-        self.assertEqual(self.state(), ACTIVE)
+        for status in ("active", "outstanding", ""):
+            with self.subTest(status=status), mock.patch.object(phase_reservation, "lifecycle", return_value=status):
+                self.assertEqual(self.run_verb("clear")[0], 2)
+                self.assertEqual(self.state(), ACTIVE)
+        with mock.patch.object(phase_reservation, "lifecycle", return_value="released_without_checkpoint") as board:
+            self.assertEqual(self.run_verb("clear"), (0, ""))
+        self.assertEqual(board.call_args.args[1], "r1")
+        self.assertFalse((self.phase_dir() / phase_reservation.STATE_FILE).exists())
+        self.assertFalse((self.phase_dir() / phase_reservation.RELEASED_FILE).exists())
 
     def test_committed_then_clear_needs_the_released_checkpoint(self) -> None:
         phase_reservation._write_state(self.phase_dir(), ACTIVE)  # pyright: ignore[reportPrivateUsage]

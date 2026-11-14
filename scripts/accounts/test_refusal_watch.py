@@ -35,6 +35,7 @@ from scripts.accounts.home_test_support import scratch_account_home
 from scripts.accounts import accounts, moves, next_moves, refusal_watch, refusals, role_map
 from scripts.accounts.move_test_support import FakeSessionMoves, MoveCall
 from scripts.agents import stop_resume
+from scripts.agents.test_support import write_machine_config
 from scripts.message import send as message_send
 from scripts.whoami import run_out
 from scripts.whoami import account
@@ -124,6 +125,7 @@ class RefusalWatchTests(unittest.TestCase):
             "SHUTDOWN_STATE_DIR": str(self.home / "shutdown"),
             "NOTIFIER_SESSIONS_DIR": str(self.home / "sessions"), "USER_ZONE": "America/New_York",
         }, clear=True)))
+        write_machine_config(Path(os.environ["CONF_DIR"]))
         for name in ("send", "postmaster", "codex_daemon"):
             _ = shutil.copy2(Path(__file__).resolve().parents[2] / "config" / f"{name}.conf",
                              Path(os.environ["CONF_DIR"]) / f"{name}.conf")
@@ -2424,8 +2426,8 @@ class RefusalWatchTests(unittest.TestCase):
         rows = [line for line in output.splitlines() if line.startswith("|")][2:]
         self.assertTrue(rows)
         roles = [row.split("|")[3].strip() for row in rows]
-        self.assertIn("units 1 (busy 0, starting 0, waiting 0, idle 1, paused 0, exited 0)", roles)
-        self.assertIn("showrunners 1 (busy 0, starting 0, waiting 0, idle 1, paused 0, exited 0)", roles)
+        self.assertIn("units 1 (busy 0, idle 1, paused 0, exited 0)", roles)
+        self.assertIn("showrunners 1 (busy 0, idle 1, paused 0, exited 0)", roles)
         self.assertFalse(any("✓" in role for role in roles))
         self.assertEqual(self.snapshot(), before)
 

@@ -20,6 +20,7 @@ from scripts.lib.signal_test_support import install_signal_pid_guard
 from scripts.accounts.home_test_support import scratch_account_home
 from scripts.accounts import accounts, next_moves, refusal_watch, refusals, role_map
 from scripts.accounts.nix_env_fake import fake_nix_loader, imports_with_nix_loader
+from scripts.agents.test_support import write_machine_config
 from scripts.whoami import agent_accounts
 
 send_role_map_command = role_map.ssh_role_map
@@ -57,6 +58,7 @@ class RoleMapTests(unittest.TestCase):
             "AGENT_NOTES_DIR": str(self.home / "notes"),
             "USER_ZONE": "America/New_York", "PATH": os.defpath,
         }, clear=True)))
+        write_machine_config(Path(os.environ["CONF_DIR"]))
         _ = self.enterContext(patch.object(role_map, "ROLE_MAP_HOST", "natedev"))
         _ = self.enterContext(patch.object(socket, "gethostname", return_value="macbook"))
         _ = self.enterContext(patch.object(role_map, "_login_home", return_value=role_map.LoginHome(self.home)))

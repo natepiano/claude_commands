@@ -26,7 +26,7 @@ from scripts.herdr import herdr_types
 from scripts.herdr import pane_launch
 from scripts.herdr import herdr
 from scripts.agents import remote
-from scripts.lib import git_exclude, models_registry
+from scripts.lib import git_exclude, git_files, models_registry
 from scripts.lib.transcripts import open_transcript, transcript_paths
 
 SCRIPTS = Path(__file__).resolve().parents[1]
@@ -870,14 +870,13 @@ def launch_session(
 
 def opening_record(production: Production, unit: str) -> Path:
     """Keep pending prompt work in the checkout's Git directory, outside tracked files."""
-    checkout = production.checkout
-    directory = checkout / ".git"
-    if directory.is_file():
-        pointer = directory.read_text(encoding="utf-8").strip()
-        if not pointer.startswith("gitdir: "):
-            raise Refusal(f"invalid Git directory pointer: {directory}")
-        directory = (checkout / pointer.removeprefix("gitdir: ")).resolve()
-    return directory / "add-unit-openings" / f"{unit}.json"
+    try:
+        git_dir = git_files.at(production.checkout).git_dir
+    except git_files.NotACheckout:
+        git_dir = production.checkout / ".git"
+    except git_files.UnreadableGitFiles as error:
+        raise Refusal(f"invalid Git directory: {error}") from error
+    return git_dir / "add-unit-openings" / f"{unit}.json"
 
 
 def pending_opening(production: Production, unit: str, session_id: str) -> bool:

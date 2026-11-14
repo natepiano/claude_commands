@@ -1,6 +1,7 @@
 """Check restart record migration with private staff and shutdown stores."""
 from __future__ import annotations
 
+import fcntl
 import io
 import json
 import os
@@ -38,6 +39,16 @@ class ShutdownRecordTests(ShutdownTestCase):
         shutdown_record.update(started=[first.id], pending=[unit.id, second.id])
         self.assertEqual(shutdown_record.read(), [unit.id, second.id])
         self.assertCountEqual(staff.snapshot().find(kind="worker", parent=unit.id), [first, second])
+
+    def test_remove_started_uses_the_record_lock_and_preserves_other_rows(self) -> None:
+        row = fixture_member("producer", name="record-started")
+        shutdown_record.save(["earlier", str(row.id), "other"])
+        with staff.row_operation(str(row.id)):
+            with patch.object(fcntl, "flock", wraps=fcntl.flock) as locked:
+                shutdown_record.remove_started([str(row.id)])
+        locked.assert_called_once()
+        self.assertEqual(locked.call_args.args[1], fcntl.LOCK_EX)
+        self.assertEqual(shutdown_record.read(), ["earlier", "other"])
 
     def test_migration_resumes_after_first_file_and_finished_rerun_changes_nothing(self) -> None:
         owner = fixture_member("showrunner", name="record-owner")
