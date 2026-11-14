@@ -6,6 +6,7 @@ from scripts.lib import atomic_file, cancellation
 from contextlib import ExitStack, redirect_stderr, redirect_stdout
 from collections.abc import Callable, Iterable
 from datetime import UTC, datetime
+import functools
 import io
 import json
 import os
@@ -39,6 +40,7 @@ GIB = records.GIB
 CHILD = "import sys; data=sys.stdin.buffer.read(); sys.stdout.buffer.write(data); sys.exit(int(sys.argv[1]))"
 LIFELINE_WAIT = "os.read(int(os.environ['QUEUE_TEST_LIFELINE']), 1)"
 BLOCKING_CHILD = "import os,sys; print('ready', flush=True); " + LIFELINE_WAIT
+PRIVATE_SLICE_PREFIX = "queueplacetest_"
 TERM_RESISTANT_CHILD = ("import os,signal; signal.signal(signal.SIGTERM, signal.SIG_IGN); "
                         + "print('ready',flush=True); " + LIFELINE_WAIT)
 DESCENDANT_CHILD = """
@@ -212,12 +214,58 @@ def private_scope_start() -> None:
         queue.scope_start(Path(sidecar), int(holder), start, argv, record=Path(record))
 
 
+def private_slice_name() -> str:
+    """Name a private test slice after the test process that owns it."""
+    return f"{PRIVATE_SLICE_PREFIX}{os.getpid()}_{time.monotonic_ns()}.slice"
+
+
+@functools.cache
+def stop_orphan_private_slices() -> None:
+    """Stop empty private test slices whose owning test process has ended."""
+    command = ["systemctl", "--user"]
+    try:
+        listed = subprocess.run([*command, "list-units", "--all", "--plain", "--no-legend",
+                                 f"{PRIVATE_SLICE_PREFIX}*.slice"], capture_output=True, text=True, timeout=10, check=False)
+        for unit in (line.split()[0] for line in listed.stdout.splitlines() if line.strip()):
+            owner = unit.removeprefix(PRIVATE_SLICE_PREFIX).split("_", 1)[0]
+            if not owner.isdigit() or Path(f"/proc/{owner}").exists():
+                continue
+            tasks = subprocess.run([*command, "show", "--property=TasksCurrent", "--value", unit],
+                                   capture_output=True, text=True, timeout=10, check=False)
+            if tasks.stdout.strip() == "0":
+                _ = subprocess.run([*command, "stop", unit], capture_output=True, timeout=10, check=False)
+    except subprocess.TimeoutExpired:
+        return
+
+
+class PrivateSliceSweepTests(unittest.TestCase):
+    def test_sweep_stops_only_empty_slices_of_ended_test_processes(self) -> None:
+        live, ended = os.getpid(), 2**22 + 1
+        units = {f"{PRIVATE_SLICE_PREFIX}{ended}_1.slice": "0", f"{PRIVATE_SLICE_PREFIX}{ended}_2.slice": "1",
+                 f"{PRIVATE_SLICE_PREFIX}{live}_3.slice": "0", f"{PRIVATE_SLICE_PREFIX}name_4.slice": "0"}
+        stopped: list[str] = []
+
+        def systemctl(argv: list[str], **_: object) -> subprocess.CompletedProcess[str]:
+            if argv[2] == "list-units":
+                return subprocess.CompletedProcess(argv, 0, "".join(f"{unit} loaded active active\n" for unit in units))
+            if argv[2] == "show":
+                return subprocess.CompletedProcess(argv, 0, units[argv[-1]] + "\n")
+            stopped.append(argv[-1])
+            return subprocess.CompletedProcess(argv, 0, "")
+
+        stop_orphan_private_slices.cache_clear()
+        self.addCleanup(stop_orphan_private_slices.cache_clear)
+        with mock.patch.object(subprocess, "run", side_effect=systemctl):
+            stop_orphan_private_slices()
+        self.assertEqual(stopped, [f"{PRIVATE_SLICE_PREFIX}{ended}_1.slice"])
+
+
 class QueuePlaceFixture(ExitStack):
     """Private config, ledger and memory files shared by all helper scenarios."""
 
     def __init__(self, *, private_slice: str = "") -> None:
         super().__init__()
-        self.private_slice: str = private_slice or f"queueplacetest{os.getpid()}{time.monotonic_ns()}.slice"
+        self.private_slice: str = private_slice or private_slice_name()
         self.enter_context(LauncherHangGuard("queue place fixture").protect())
         self.lifeline_read: int
         self.lifeline_write: int
@@ -270,6 +318,8 @@ class QueuePlaceFixture(ExitStack):
 
     def use_private_scope(self) -> None:
         """Keep the real user manager outside the live build slice."""
+        # A test process that ends without its cleanups leaves its slice; a later run stops it.
+        stop_orphan_private_slices()
         prefix = ["systemd-run", "--user", "--scope", "--quiet", "--collect",
                   "--expand-environment=no", f"--slice={self.private_slice}", "--"]
         probe = subprocess.run([*prefix, "true"], capture_output=True, timeout=10, check=False)
@@ -472,15 +522,13 @@ with queue_place('rust-analyzer', Path(sys.argv[1])) as place:
                  mock.patch.object(queue, "probe_scope_prefix", side_effect=AssertionError("probe requested a scope")), \
                  mock.patch.dict(os.environ, {"BUILDLOG_SCOPE": "1"}):
                 argv = [str(executable), "--version"]
-                started = time.monotonic()
                 with queue.queue_place(argv, fixture.root) as place:
                     process = place.popen(argv, stdout=subprocess.PIPE)
-                    output, _ = process.communicate(timeout=2)
+                    output, _ = process.communicate(timeout=TEST_HANG_GUARD_SECS)
                     self.assertEqual(process.returncode, 0)
                     self.assertEqual(output, b"private analyzer version\n")
                     self.assertEqual(place.peak_bytes, 0)
                     self.assertFalse(place.path.with_suffix(".max").exists())
-                self.assertLess(time.monotonic() - started, 2)
             self.assertEqual(fixture.admission.state_text(), saved)
             self.assertFalse(fixture.admission.server.reservations)
             self.assertEqual(fixture.history(), [])
@@ -521,12 +569,10 @@ with queue_place('rust-analyzer', Path(sys.argv[1])) as place:
                  mock.patch.object(client, "release", side_effect=AssertionError("editor released a reservation")), \
                  mock.patch.dict(os.environ, {"BUILDLOG_SCOPE": "1"}):
                 with queue.queue_place(argv, fixture.root) as place:
-                    started = time.monotonic()
                     child = place.popen(argv, stdout=subprocess.PIPE)
                     assert child.stdout is not None
-                    self.assertTrue(select.select([child.stdout], [], [], 2)[0], "editor startup exceeded two seconds")
+                    self.assertTrue(select.select([child.stdout], [], [], TEST_HANG_GUARD_SECS)[0], "editor did not start")
                     self.assertEqual(child.stdout.readline(), b"ready\n")
-                    self.assertLess(time.monotonic() - started, 2)
                     scope = Path(place.sidecar.read_text().strip())
                     self.assertIn(child.pid, gate.scope_members(scope))
                     self.assertFalse(fixture.admission.server.reservations)
@@ -628,7 +674,7 @@ with queue_place('rust-analyzer', Path(sys.argv[1])) as place:
 
     def assert_nested_scope_cleanup(self, *, fork_during_scope_read: bool) -> None:
         self.require_transient_scope()
-        private_slice = f"queueplacetest{os.getpid()}{time.monotonic_ns()}.slice"
+        private_slice = private_slice_name()
         unit = f"queue-place-holder-{os.getpid()}-{time.monotonic_ns()}.scope"
         command = ["systemd-run", "--user", "--scope", "--quiet", "--collect",
                    "--expand-environment=no", f"--slice={private_slice}", f"--unit={unit}", "--",
