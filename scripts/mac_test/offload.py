@@ -2371,6 +2371,17 @@ def workspace_has_linux_only(repo_root: Path, excluded: set[str]) -> bool:
     return False
 
 
+def has_linux_only(repo_root: Path, package: str, excluded: set[str]) -> bool:
+    """Check a named package alone, or the whole workspace when no package is named.
+
+    linux_only keeps a package's own steps off the Mac. A package that depends on
+    one still builds there, because each linux_only crate has macOS dependencies.
+    """
+    if package:
+        return package in excluded
+    return workspace_has_linux_only(repo_root, excluded)
+
+
 def linux_kind_permitted(values: dict[str, str], kind: str) -> bool:
     return all(step in ('test', 'check', 'doc', 'lint', 'example', 'build')
                and step in comma_values(values.get('kinds', '')) for step in remote_step_kinds(kind))
@@ -2402,16 +2413,11 @@ def mac_step_eligibility(config: OffloadConfig, repo_root: Path, package: str,
     key = f"linux_only.{repository.name}"
     if key not in config.values:
         return IneligibleMacStep("repo")
-    excluded = comma_values(config.values[key])
-    if verb == "nextest" and package:
-        if package in excluded:
+    try:
+        if has_linux_only(repo_root, package, comma_values(config.values[key])):
             return IneligibleMacStep("linux_only")
-    else:
-        try:
-            if workspace_has_linux_only(repo_root, excluded):
-                return IneligibleMacStep("linux_only")
-        except (OSError, UnicodeError, ValueError):
-            return IneligibleMacStep("repo")
+    except (OSError, UnicodeError, ValueError):
+        return IneligibleMacStep("repo")
     if isinstance(read_backoff(time.time(), target), ActiveBackoff):
         return IneligibleMacStep("backoff")
     return repository
@@ -2441,7 +2447,8 @@ def run_offload(
         decline_path.unlink(missing_ok=True)
     if not linux and isinstance(request.source, StagedDocSnapshot):
         try:
-            if workspace_has_linux_only(request.source.root, comma_values(config.values[f"linux_only.{repository.name}"])):
+            if has_linux_only(request.source.root, request.package,
+                              comma_values(config.values[f"linux_only.{repository.name}"])):
                 return declined("linux_only", started)
         except (OSError, UnicodeError, ValueError):
             return declined("repo", started)
