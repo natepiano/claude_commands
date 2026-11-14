@@ -39,11 +39,11 @@ class CensusTests(unittest.TestCase):
         expected = census.Census(
             (census.CensusMachine("natedev", True), census.CensusMachine("mac", False)),
             (census.CensusSession("4dbdb78e", "busy"), census.CensusSession("01a18dbb", None)),
-            (census.CensusWorker(staff.StaffId("handler-impl"), "handler-impl", staff.StaffId("handler-unit"), "busy",
+            (census.CensusWorker(staff.StaffId("handler-impl"), "handler-impl", staff.StaffId("handler-unit"), "busy", "verify test",
                                  census.CensusPass("impl", "8"),
                                  (census.CensusRun("verify test", 1794600060.0, "running"),
                                   census.CensusRun("lint", None, "missing"))),
-             census.CensusWorker(staff.StaffId("handler-test"), "handler-test", staff.StaffId("handler-unit"), "idle",
+             census.CensusWorker(staff.StaffId("handler-test"), "handler-test", staff.StaffId("handler-unit"), "idle", "",
                                  census.NoPass(), ())))
         self.assertEqual(census.parse(json.dumps(SAMPLE)), expected)
 
@@ -62,6 +62,8 @@ class CensusTests(unittest.TestCase):
              "census: machines[0].reachable is not true or false"),
             (json.dumps({**SAMPLE, "workers": [{**worker, "status": 3}]}),
              "census: workers[0].status is not text or null"),
+            (json.dumps({**SAMPLE, "workers": [{**worker, "activity": 3}]}),
+             "census: workers[0].activity is not text or null"),
             (json.dumps({**SAMPLE, "workers": [{**worker, "runs": [{"label": "x", "started_at": 1, "state": "done"}]}]}),
              "census: workers[0].runs[0].state is not one of running, finished_queued, missing"),
             (json.dumps({**SAMPLE, "workers": [{**worker, "runs": [{"label": "x", "started_at": True,

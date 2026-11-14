@@ -112,7 +112,7 @@ ETA Plan appears when a unit has unfinished plan phases or a promise for an unfi
    A row without an open phase lists every census worker of the unit.
    Each detached run shows first, as `<name> waiting on run: <label> <elapsed>`, `<name> result queued: <label>`, or `<name> run gone: <label>`.
    A running run without a start time omits the elapsed time.
-   A busy worker without a run shows `<name> working`.
+   A busy worker without a run shows `<name> waiting` or `<name> starting` when its tile activity ends in that word, else `<name> working`.
    Idle workers add `+<n> idle` after other workers.
 7. **Non-Phase Work** shows `—` for an open phase row because Notes already describes that phase.
    A row without a recorded phase instance keeps the existing summary for work outside the plan.

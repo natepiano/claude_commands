@@ -99,10 +99,10 @@ def session_of(member: staff.StaffRow, status: str | None) -> census.CensusSessi
     return census.CensusSession(member.current_session, status)
 
 
-def census_worker(name: str, parent: staff.StaffId, *, status: str | None = "busy", phase: str = "",
-                  runs: Sequence[census.CensusRun] = ()) -> census.CensusWorker:
+def census_worker(name: str, parent: staff.StaffId, *, status: str | None = "busy", activity: str | None = None,
+                  phase: str = "", runs: Sequence[census.CensusRun] = ()) -> census.CensusWorker:
     assignment = census.CensusPass("impl", phase) if phase else census.NoPass()
-    return census.CensusWorker(staff.StaffId(f"{name}-id"), name, parent, status, assignment, tuple(runs))
+    return census.CensusWorker(staff.StaffId(f"{name}-id"), name, parent, status, activity, assignment, tuple(runs))
 
 
 def tiles(*, sessions: Sequence[census.CensusSession] = (),
@@ -742,7 +742,10 @@ class UnitPhasesTests(unittest.TestCase):
         ]
         cases: list[tuple[Sequence[census.CensusWorker] | census.CensusFailed, str]] = [
             (workers, "a waiting on run: x 1m · b result queued: y · c run gone: z · d working +1 idle"),
-            ([census_worker("a", parent, runs=[census.CensusRun("w", None, "running")])], "a waiting on run: w"),
+            ([census_worker("a", parent, runs=[census.CensusRun("w", None, "running")]),
+              census_worker("q", parent, activity="impl · waiting"), census_worker("s", parent, activity="starting"),
+              census_worker("t", parent, activity="impl · thinking"), census_worker("j", parent, activity="verify test")],
+             "a waiting on run: w · q waiting · s starting · t working · j working"),
             ([census_worker("idle", parent, status="idle")], "—"),
             ([census_worker("held", parent, status="paused")], "—"), ([], "—"),
             (census.CensusFailed("census took longer than 10 s"), "—")]

@@ -50,8 +50,14 @@ class CensusWorker(NamedTuple):
     name: str
     parent_staff_id: staff.StaffId
     status: str | None
+    activity: str | None
     assignment: CensusPass | NoPass
     runs: tuple[CensusRun, ...]
+
+    @property
+    def live_word(self) -> str:
+        """Return the live word at the end of the tile's activity text, as `waiting` in `impl · waiting`."""
+        return (self.activity or "").rpartition(" · ")[2]
 
 
 class Census(NamedTuple):
@@ -122,7 +128,7 @@ def _worker(value: object, where: str) -> CensusWorker:
     fields = _object(value, where)
     return CensusWorker(staff.StaffId(_text(fields, "staff_id", where)), _text(fields, "name", where),
                         staff.StaffId(_text(fields, "parent_staff_id", where)), _optional_text(fields, "status", where),
-                        _assignment(fields.get("pass"), f"{where}.pass"),
+                        _optional_text(fields, "activity", where), _assignment(fields.get("pass"), f"{where}.pass"),
                         tuple(_run(run, f"{where}.runs[{index}]")
                               for index, run in enumerate(_list(fields, "runs", where))))
 

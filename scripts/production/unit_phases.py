@@ -234,6 +234,8 @@ def pending_eta_cell(events: list[dict[str, object]], open_phase_ids: tuple[str,
     return " · ".join(parts) or display_cells.NONE
 
 
+# The live activity words that a busy worker without a run shows in place of `working` (sdlc, C1489).
+SHOWN_ACTIVITIES = ("starting", "waiting")
 RUN_TEXT: dict[census.RunState, str] = {"running": "waiting on run", "finished_queued": "result queued",
                                         "missing": "run gone"}
 
@@ -254,7 +256,8 @@ def workers_cell(workers: Sequence[census.CensusWorker] | census.CensusFailed, *
         if worker.runs:
             continue
         if worker.status == "busy":
-            working.append(f"{worker.name} working")
+            word = worker.live_word
+            working.append(f"{worker.name} {word if word in SHOWN_ACTIVITIES else 'working'}")
         elif worker.status == "idle":
             idle += 1
     result = " · ".join([*bearing, *working])

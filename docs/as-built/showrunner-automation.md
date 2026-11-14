@@ -812,7 +812,8 @@ An unstaffed session requires an explicit native id and an explicit unit name.
     `census_workers` selects the census workers whose `parent_staff_id` is the unit.
     An open phase row keeps only the workers whose open pass names that phase instance.
     `workers_cell` shows each detached run first: `waiting on run: <label> <elapsed>`, `result queued: <label>`, or `run gone: <label>`.
-    A busy worker without a run shows `working`; idle workers add `+<n> idle`.
+    A busy worker without a run shows its live word when `CensusWorker.live_word` is in `SHOWN_ACTIVITIES` (`starting`, `waiting`), else `working`.
+    `live_word` is the text after the last ` · ` of the tile activity, as `waiting` in `impl · waiting`. Idle workers add `+<n> idle`.
     Its cell keeps the existing 80-character limit.
     The table reads no panes, run records or process table for Workers.
     Non-Phase Work shows `—` for open phase rows because Notes already describes each phase.
