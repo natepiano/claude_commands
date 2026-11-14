@@ -1206,6 +1206,7 @@ class Deployment:
             outputs = self._stack(settings)
             manifest: dict[str, object] = {
                 'deployment_id': ledger.text(saved, 'deployment_id'), 'revision': revision,
+                'instance_types': values.words('instance_types'),
                 'bucket': outputs['GateBucket'], 'artifact_prefix': 'artifacts/' + outputs['GateRoleId'] + ':',
                 'regions': [{'region': settings.region, 'image': settings.ami_id, 'subnets': subnets,
                     'template': outputs['GateLaunchTemplate'], 'version': outputs['GateLaunchVersion'],

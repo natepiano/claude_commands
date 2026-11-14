@@ -217,9 +217,9 @@ def over_limit(row: HanaProcess, config: HanaInstancesConfig) -> bool:
 
 
 def run_ssh(command: list[str]) -> subprocess.CompletedProcess[str]:
-    from scripts.mac_test import offload
+    from scripts.mac_test import eligibility
     return subprocess.run(command, capture_output=True, text=True, check=False,
-                          timeout=offload.read_config().probe_timeout_s)
+                          timeout=eligibility.read_config().probe_timeout_s)
 
 
 def run_local(command: list[str]) -> subprocess.CompletedProcess[str]:
@@ -227,12 +227,12 @@ def run_local(command: list[str]) -> subprocess.CompletedProcess[str]:
 
 
 def remote_environment(pid: int, ssh_runner: Callable[[list[str]], subprocess.CompletedProcess[str]]) -> dict[str, str]:
-    from scripts.mac_test import offload
+    from scripts.mac_test import eligibility, offload
     # Reuse herdr's stable argv/environment boundary on the machine being inspected.
     program = ("import json; "
                "from scripts.herdr.herdr import darwin_process_environment; "
                f"print(json.dumps(darwin_process_environment({pid})))")
-    result = ssh_runner([*offload.ssh_prefix(offload.read_config()),
+    result = ssh_runner([*offload.ssh_prefix(eligibility.read_config()),
                          "~/.claude/scripts/lib/py -c " + shlex.quote(program)])
     if result.returncode:
         raise ValueError(f"mac:{pid}: environment could not be read")
@@ -265,10 +265,10 @@ def collect_processes(
             raise ValueError("mac: local process table could not be read")
         rows = mac_processes(result.stdout, environment_reader)
     else:
-        from scripts.mac_test import offload
+        from scripts.mac_test import eligibility, offload
         rows = local_source()
         try:
-            result = ssh_runner([*offload.ssh_prefix(offload.read_config()), DARWIN_PS])
+            result = ssh_runner([*offload.ssh_prefix(eligibility.read_config()), DARWIN_PS])
             if result.returncode:
                 problems.append("mac: unreachable")
             else:
@@ -294,7 +294,7 @@ def darwin_identity(pid: int, runner: Callable[[list[str]], subprocess.Completed
 
 def remote_stop(row: HanaProcess, config: HanaInstancesConfig,
                 ssh_runner: Callable[[list[str]], subprocess.CompletedProcess[str]]) -> None:
-    from scripts.mac_test import offload
+    from scripts.mac_test import eligibility, offload
     # Read the complete table so a failed ps cannot be mistaken for an absent pid.
     command = f"""same_process() {{
     table=$(LC_ALL=C TZ=UTC ps -axww -o pid=,lstart=) || return 2
@@ -317,7 +317,7 @@ same_process
 identity_status=$?
 [ "$identity_status" = 1 ] && gone
 exit 2"""
-    result = ssh_runner([*offload.ssh_prefix(offload.read_config()), command])
+    result = ssh_runner([*offload.ssh_prefix(eligibility.read_config()), command])
     if result.returncode or result.stdout.strip() != "hana-instances: process gone":
         raise ValueError(f"mac:{row.pid}: stop could not be confirmed")
 

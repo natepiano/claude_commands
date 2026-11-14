@@ -1081,7 +1081,7 @@ def backend(row: StaffRow) -> ClaudeBackend | CodexBackend | BackendUnavailable:
 def _found_backends(rows: Sequence[StaffRow],
                     running: frozenset[str] | None = None) -> dict[StaffId, ClaudeBackend | CodexBackend]:
     """Find worker sessions with one scan of each real session folder."""
-    from scripts.lib.transcripts import transcript_paths, uncompressed_path
+    from scripts.lib.transcripts import transcript_stems
     from scripts.message import session_records as sessions
 
     accounts = import_module("scripts.whoami.agent_accounts")
@@ -1100,10 +1100,7 @@ def _found_backends(rows: Sequence[StaffRow],
             for folder in ("sessions", "archived_sessions"):
                 real_folder = (home / folder).resolve()
                 if real_folder not in ids_by_folder:
-                    ids_by_folder[real_folder] = [
-                        StaffId(uncompressed_path(path).stem[-36:])
-                        for path in transcript_paths(real_folder)
-                    ]
+                    ids_by_folder[real_folder] = [StaffId(stem[-36:]) for stem in transcript_stems(real_folder)]
                 for session_id in ids_by_folder[real_folder]:
                     identity = wanted.get(session_id)
                     if identity is not None:
