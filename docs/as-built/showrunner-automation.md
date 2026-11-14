@@ -724,8 +724,14 @@ An unstaffed session requires an explicit native id and an explicit unit name.
     The work table prints `| Unit | Notes | Non-Phase Work | Queued |`.
     Workers uses the configured display name.
     ETA Plan appears for unfinished plan phases or promises for unfinished targets without open rows.
-    Status uses the [shared session classifier](accounts.md#status-counts-and-notes).
-    A live Claude or Codex pane supplies live evidence.
+    Status and Workers come from one `census.read()`, which runs `cargo-handler census --json` within `units_census_seconds`.
+    `unit_phases.main` submits the census to its read pool with the unit and plan reads, so the reads overlap.
+    `census.parse` accepts schema 1 and 2 and returns `Census` with `CensusMachine`, `CensusDirector` and `CensusWorker` records, or `CensusFailed(reason)`.
+    A worker carries `CensusPass(role, phase)` or `NoPass`, and its `CensusRun` records.
+    `census_status` gives the director's status word for the unit's staff ID, or `—` when the word is null.
+    An unlisted unit shows `exited` when its machine is a reachable census machine, and `—` otherwise.
+    A failed census gives `—` in Status and Workers and one anomaly line; the table has no other source for these cells.
+    The style table keeps the [shared session classifier](accounts.md#status-counts-and-notes).
     The status table and the style table add **Machine** after **Status** only when a row runs on another machine.
     The home machine is the `kind.<machine>=local` entry in `config/build_targets.conf`.
     `worker.py list` places the optional machine field after the account field, and takes the machine from the parent's worktree.
@@ -753,9 +759,9 @@ An unstaffed session requires an explicit native id and an explicit unit name.
     The existing staff snapshot resolves a holder's staff ID or current session ID to its staff name.
     An unknown holder keeps its recorded name or ID.
     Reasons that start with `waiting on`, `waiting for`, or either phrase after `blocked:` need no extra wait prefix.
-    `worker_runs.phase_waits(events, instance_id)` reads starts, holder updates, and wait or pass finishes.
+    `phase_waits.phase_waits(events, instance_id)` reads starts, holder updates, and wait or pass finishes.
     `PhaseWait` carries the reason, start time, and `NamedWaitHolder` or `UnnamedWaitHolder`.
-    Wait text does not change the session classifier in Status.
+    Wait text does not change the census word in Status.
     Notes, Non-Phase Work, and Queued preserve every word of each displayed item or title.
     Each phase table calls `display_cells.wrapped` separately.
     Each table removes columns whose cells are all `—`.
@@ -800,13 +806,12 @@ An unstaffed session requires an explicit native id and an explicit unit name.
     Without an unfinished plan or such a promise, the cell shows `—`.
     The finish never precedes any open or not-started plan phase's latest promise, including checkpoint promises.
     Times use the production zone and a short date outside the current day.
-    `worker_runs.phase_workers(session, events, instance_id, runs)` reads open passes for that phase from the run records.
-    It shows waiting detached runs, queued results, missing runs, and working workers.
+    `census_workers` selects the census workers whose `parent_staff_id` is the unit.
+    An open phase row keeps only the workers whose open pass names that phase instance.
+    `workers_cell` shows each detached run first: `waiting on run: <label> <elapsed>`, `result queued: <label>`, or `run gone: <label>`.
+    A worker without a run shows `working` when busy or starting, and `waiting` when waiting; idle workers add `+<n> idle`.
     Its cell keeps the existing 80-character limit.
-    Run workers appear first; finished passes remove their workers.
-    Rows without an open phase keep the existing pane observation rules.
-    The command reads panes once for the displayed units and their workers.
-    It shares one lazy process snapshot and reads no CPU totals or log tails.
+    The table reads no panes, run records or process table for Workers.
     Non-Phase Work shows `—` for open phase rows because Notes already describes each phase.
     Rows without a recorded phase instance keep the existing summary for work outside the plan.
     Queued combines the first queue item with the first unfinished plan phase, excluding done and open phases.
