@@ -901,17 +901,18 @@ def checked_git(repo: Path, *arguments: str) -> str:
 def repo_git_work(repo: Path) -> GitWork:
     if checked_git(repo, "status", "--porcelain", "--untracked-files=all").strip():
         return GitWork.UNSAVED
-    refs = checked_git(repo, "for-each-ref", "--format=%(refname)")
+    refs = checked_git(repo, "for-each-ref", "--format=%(refname) %(objectname)").splitlines()
     linked = (repo / ".git").is_file()
-    if not linked and "refs/stash" in refs.splitlines():
+    if not linked and any(line.split(" ", 1)[0] == "refs/stash" for line in refs):
         return GitWork.UNSAVED
     # An empty repository has no commit to lose. A broken HEAD fails closed below.
     head = checked_git(repo, "rev-parse", "--git-path", "HEAD").strip()
     head_path = Path(head) if os.path.isabs(head) else repo / head
     head_text = head_path.read_text(encoding="utf-8").strip()
-    if not refs.strip() and head_text.startswith("ref: "):
+    if not refs and head_text.startswith("ref: "):
         return GitWork.SAVED
     sources: list[str] = []
+    source_tags: set[str] = set()
     for remote in checked_git(repo, "remote").splitlines():
         url = checked_git(repo, "remote", "get-url", remote).strip()
         if url.startswith("file://"):
@@ -923,7 +924,11 @@ def repo_git_work(repo: Path) -> GitWork:
             continue
         source = Path(url) if os.path.isabs(url) else repo / url
         sources.extend(checked_git(source, "for-each-ref", "--format=%(objectname)", "refs/heads/").splitlines())
-    tips = ["HEAD"] if linked else ["HEAD", "--branches", "--tags"]
+        source_tags.update(checked_git(source, "for-each-ref", "--format=%(refname) %(objectname)", "refs/tags/").splitlines())
+    # A tag that a local source holds with the same object is the source's copy, not work of the clone.
+    own_tags = [line.split(" ", 1)[0] for line in refs
+                if line.startswith("refs/tags/") and line not in source_tags]
+    tips = ["HEAD"] if linked else ["HEAD", "--branches", *own_tags]
     remaining = checked_git(repo, "-c", "core.alternateRefsPrefixes=refs/heads/", "rev-list", "-n1",
                             *tips, "--not", "--remotes", "--alternate-refs", *sources)
     return GitWork.UNSAVED if remaining.strip() else GitWork.SAVED
