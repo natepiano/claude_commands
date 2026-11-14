@@ -189,6 +189,11 @@ Exit 6 means busy before submission.
 A blocked Codex worker receives `shift+left`, the answer through `pane send-text`, and two `enter` keys.
 Herdr checks the target before each key.
 Idle workers and blocked Claude workers use `agent prompt`.
+For an active pass, that prompt includes the saved DONE instruction without changing the pass or saved delivery.
+Use `answer` to resubmit work when compaction consumed the assignment prompt.
+A turn without an assistant reply reports `no DONE` when the transcript records compaction after the accepted dispatch prompt.
+The pass stays active, and the pane stays open, including a managed worker with `end_worker` set.
+The matching DONE reply then uses the normal completion hook.
 The command refuses workers held by another parent.
 A repeated saved launcher reads the transcript and returns without another submission.
 For a completed dispatch, each explicit rerun sends one completion notice through the shared hook code.
@@ -317,6 +322,31 @@ An idle worker remains closed until assignment.
 A live session stays unchanged.
 A failed start retains the row on the restart list.
 Restart sends no work prompt.
+
+Restart starts a session in its own pane, as `docs/as-built/shutdown-and-restart.md` describes.
+It waits within `OWN_PANE_SHELL_SECONDS` for that pane to reach the shell.
+When the wait ends first, the start is refused with one line, and the row stays on the restart list.
+A new tab opens only for a session with no own pane; a restart never splits a pane beside a worker.
+For the pane in the saved launch record, restart also waits within `START_SECONDS` for an exiting agent.
+It reuses that pane when fresh reads prove a shell with no native agent.
+The existing resume-check loop closes the old shell through the restore path when its agent exits.
+The loop uses `RESUME_CHECK_SECONDS` and `RESUME_CHECK_INTERVAL_SECONDS`.
+A caller without shared resume checks runs the same cleanup loop before `start_row` returns.
+Failed destination cleanup uses the destination session.
+Source cleanup uses the source session and its original terminal.
+If the old agent outlives that check, one anomaly names the pane, which stays for retire.
+A pane with a live agent, another native owner, or a changed terminal stays open.
+The source record stays until closure, absence, or another native owner is proved.
+Producer publication also keeps a prior binding while its pane remains open.
+It removes a prior binding when a read proves absence or another native owner.
+Consumers select a proved native pane before retained bindings.
+When no native pane exists, consumers select the newest retained publication and keep the older records.
+
+Retirement stops the unit and its workers before it closes their panes.
+It closes each owned retained shell across tabs, even when the director pane is absent.
+It keeps foreign panes and live agents.
+herdr removes a tab when its last pane closes.
+Retirement cannot find an idle shell whose launch record was lost before this fix.
 
 Producers use their current `[producers]` model and effort through the shared launch code.
 Codex producers select the workers account; Claude producers select the showrunners account.

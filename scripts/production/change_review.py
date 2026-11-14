@@ -374,8 +374,13 @@ def next_number(text: str) -> int:
     return max((int(found.group(1)) for found in _NUMBER.finditer(text)), default=0) + 1
 
 
+def now() -> datetime:
+    """The current time in the user's zone."""
+    return datetime.now(user_zone())
+
+
 def today() -> date:
-    return datetime.now(user_zone()).date()
+    return now().date()
 
 
 def _cell(text: str) -> str:
@@ -417,6 +422,35 @@ def list_file(showrunner: str, *, sources: list[Path] | None = None) -> Path:
 def _owner(path: Path) -> str:
     """The showrunner a list is named for."""
     return path.stem.removeprefix(PREFIX)
+
+
+def display_id(row: dict[str, str], showrunner: str) -> str:
+    """Show the current responsible showrunner beside the local row number."""
+    return f"{showrunner}/{row['#'].rpartition('/')[2]}"
+
+
+def review_routing(paths: Iterable[Path]) -> change_routing.StaffRouting:
+    """Prepare the shared staff resolver for the requested lists."""
+    return _routing_from_snapshots(_review_snapshots(paths))
+
+
+def _routing_from_snapshots(snapshots: Mapping[Path, ReviewListSnapshot]) -> change_routing.StaffRouting:
+    """Resolve ownership from the same list reads used for row lookup."""
+    record = staff.snapshot()
+    documents = {member.name: member.doc.path for member in record.find(kind="showrunner")
+                 if isinstance(member.doc, (staff.LiveDoc, staff.WrappedDoc))}
+    documents = change_routing.production_documents(documents,
+        ((_owner(path), snapshot.text) for path, snapshot in snapshots.items()))
+    return change_routing.StaffRouting(record, documents)
+
+
+def row_display_id(path: Path, row: str) -> str:
+    """Resolve the displayed identity without changing the stored list identity."""
+    local = row.rpartition("/")[2]
+    found = next((item for item in review_rows(path) if item["#"] == local), None)
+    if found is None:
+        raise ChangeReviewError(f"{row} is not on the list to review")
+    return display_id(found, review_routing((path,)).owner(found, path).tab)
 
 
 def _shown(doc: Path) -> str:
@@ -623,10 +657,18 @@ def row_entries(rows: list[dict[str, str]], *, sources: list[Path] | None = None
     return entries
 
 
+def prerequisite_key(after: str, source: Path, current: Path) -> str:
+    """Map a stored prerequisite to its key in the current list's queue."""
+    if after and "/" not in after and source.absolute() != current.absolute():
+        after = f"{_owner(source)}/{after}"
+    return after.removeprefix(f"{_owner(current)}/")
+
+
 def ordered(rows: list[dict[str, str]], path: Path) -> list[dict[str, str]]:
     """The rows in urgency.py's order: the pinned row first while it waits, then by urgency, then by C
     number; a row the user moved to the end last."""
-    return [entry.item for entry in urgency.queue_order(row_entries(rows), queue(path))]
+    entries = [replace(entry, after=prerequisite_key(entry.after, path, path)) for entry in row_entries(rows)]
+    return [entry.item for entry in urgency.queue_order(entries, queue(path))]
 
 
 def _sort(path: Path, lines: list[str]) -> None:
@@ -642,11 +684,12 @@ def append_rows(path: Path, changes: Sequence[Visible | PublicationChange], day:
                 producers: Sequence[staff.StaffId | UnknownProducer] = (), *,
                 record: staff.StaffSnapshot, repo: Path = _CURRENT_REPO,
                 on_hold: Callable[[PublicationChange], None] | None = None,
-                merge_changes: Sequence[PublicationChange] = ()) -> list[str]:
+                merge_changes: Sequence[PublicationChange] = (), added_at: datetime | None = None) -> list[str]:
     """Add changes to To review with fixed staff IDs from record.
 
     owners supplies production documents; producers supplies fixed staff IDs for plain Visible changes.
     merge_changes supplies every change of this merge routed to this list.
+    added_at puts the time of day after the date in the Merged cell.
     """
     if not changes:
         return []
@@ -686,7 +729,8 @@ def append_rows(path: Path, changes: Sequence[Visible | PublicationChange], day:
         if merged and (held := _held(columns, lines[first:end], plain, merged)):
             raise ChangeReviewError(f"{held} already holds that change from merge {merged}; no row added")
         number = next_number("".join(lines))
-        when = f"{day.isoformat()} · {_cell(merged)}" if merged else day.isoformat()
+        added = f"{day.isoformat()} {added_at:%H:%M}" if added_at is not None else day.isoformat()
+        when = f"{added} · {_cell(merged)}" if merged else added
         rows = [_row(path, columns, {"#": f"C{number + offset}", "Change": _cell(items[index].change), "Merged": when,
                                      "On the Mac build": NOT_YET, CHECK: _cell(items[index].how()), URGENCY: _cell(rank),
                                      KIND: "", PRODUCER: str(row_producers[index]) if isinstance(row_producers[index], str) else "",
@@ -809,6 +853,7 @@ class ProductionReviewList:
 class ScopedReviewEntry:
     review_list: ProductionReviewList
     entry: urgency.Entry[dict[str, str]]
+    owner: change_routing.ChangeOwner
 
 
 def scope_lists(path: Path, doc: Path, below: bool = False, *,
@@ -844,18 +889,7 @@ def _routed_review_entries(path: Path, doc: Path, below: bool, record: staff.Sta
         _ = listed.setdefault(source.absolute(), ProductionReviewList(source, _owner(source)))
     documents = {row.name: row.doc.path for row in record.find(kind="showrunner")
                  if isinstance(row.doc, (staff.LiveDoc, staff.WrappedDoc))}
-    snapshots: dict[Path, ReviewListSnapshot] = {}
-    for source in listed:
-        if sources is not None:
-            sources.append(source)
-        try:
-            snapshot = review_snapshot(source)
-        except (ChangeReviewError, OSError, UnicodeError) as error:
-            if sources is not None:
-                raise ValueError(str(error)) from error
-            print(f"change review: {source}: {error}", file=sys.stderr)
-            continue
-        snapshots[source] = snapshot
+    snapshots = _review_snapshots(listed, sources=sources)
     documents = change_routing.production_documents(documents,
         ((listed[source].default_production, snapshot.text) for source, snapshot in snapshots.items()))
     routing = change_routing.StaffRouting(record, documents, sources=sources)
@@ -889,15 +923,18 @@ def scoped_review_entries(path: Path, doc: Path, below: bool = False) -> list[Sc
     record = staff.snapshot()
     scope = review_scope(doc, below, record)
     grouped: dict[Path, tuple[ProductionReviewList, list[dict[str, str]]]] = {}
+    owners: dict[tuple[Path, str], change_routing.ChangeOwner] = {}
     for review_list, owner, row in _routed_review_entries(path, doc, below, record):
         if owner.tab in scope:
             if review_list.path not in grouped:
                 grouped[review_list.path] = (review_list, [])
             grouped[review_list.path][1].append(row)
+            owners[review_list.path, row["#"]] = owner
     found: list[ScopedReviewEntry] = []
     for review_list, rows in grouped.values():
         try:
-            found.extend(ScopedReviewEntry(review_list, entry) for entry in row_entries(rows))
+            found.extend(ScopedReviewEntry(review_list, entry, owners[review_list.path, entry.key])
+                         for entry in row_entries(rows))
         except ChangeReviewError as error:
             print(f"change review: {review_list.path}: {error}", file=sys.stderr)
     return found
@@ -912,15 +949,16 @@ def scope_rows(path: Path, doc: Path, below: bool = False) -> list[dict[str, str
 
 
 def scope_entries(path: Path, doc: Path, below: bool = False) -> list[urgency.Entry[dict[str, str]]]:
-    """Keep current-list IDs and pins; name other rows and their prerequisites with their list."""
+    """Show the responsible showrunner while retaining list-based queue keys and prerequisites."""
     entries: list[urgency.Entry[dict[str, str]]] = []
     for scoped in scoped_review_entries(path, doc, below):
         entry = scoped.entry
         prefix = (f"{_owner(scoped.review_list.path)}/"
                   if scoped.review_list.path.absolute() != path.absolute() else "")
         key = prefix + entry.key
-        after = prefix + entry.after if entry.after and "/" not in entry.after else entry.after
-        entries.append(replace(entry, key=key, item=entry.item | {"#": key}, after=after))
+        after = prerequisite_key(entry.after, scoped.review_list.path, path)
+        entries.append(replace(entry, key=key,
+                               item=entry.item | {"#": display_id(entry.item, scoped.owner.tab)}, after=after))
     return entries
 
 
@@ -941,7 +979,11 @@ class ChangeQueue:
 def change_queue(path: Path, scope: Path | WholeReviewList, below: bool = False) -> ChangeQueue:
     """The same change rows and pin for /next and change_review show."""
     if isinstance(scope, WholeReviewList):
-        return ChangeQueue(queue(path), row_entries(change_routing.waiting_rows(path, pending(path))))
+        routing = review_routing((path,))
+        entries = row_entries(change_routing.waiting_rows(path, pending(path)))
+        return ChangeQueue(queue(path), [replace(entry, item=entry.item | {
+            "#": display_id(entry.item, routing.owner(entry.item, path).tab)},
+            after=prerequisite_key(entry.after, path, path)) for entry in entries])
 
     record = staff.snapshot()
     name = unit_lookup.doc_owner(scope, record).name
@@ -1498,6 +1540,21 @@ def review_snapshot(path: Path) -> ReviewListSnapshot:
     return ReviewListSnapshot(text, pending, reviewed)
 
 
+def _review_snapshots(paths: Iterable[Path], *, sources: list[Path] | None = None) -> dict[Path, ReviewListSnapshot]:
+    """Report unreadable lists once. A source collector requires complete reads."""
+    snapshots: dict[Path, ReviewListSnapshot] = {}
+    for path in paths:
+        if sources is not None:
+            sources.append(path)
+        try:
+            snapshots[path] = review_snapshot(path)
+        except (ChangeReviewError, OSError, UnicodeError) as error:
+            if sources is not None:
+                raise ValueError(str(error)) from error
+            print(f"change review: {path}: {error}", file=sys.stderr)
+    return snapshots
+
+
 def set_row_kind(path: Path, row: str, kind: str, production: Path) -> str:
     """Classify by whether the change alters something the user runs or sees."""
     if kind not in REVIEW_KINDS:
@@ -1546,17 +1603,18 @@ def save_verdict(path: Path, row: str, verdict: str, production: Path) -> Verdic
     """Save a verdict and remove its scratch folders without printing output."""
     verdict = _words("verdict", verdict)
     local_row = _row_id("row", row.rpartition("/")[2])
+    shown = row_display_id(path, local_row)
     warnings: list[str] = []
     result = record_verdict(path, local_row, verdict, today(), production, report_warning=warnings.append)
     lines: list[str] = []
     if isinstance(result, VerdictConflict):
-        reason = (f'change review: {row} has the verdict "{result.recorded}" from {result.day}; '
+        reason = (f'change review: {shown} has the verdict "{result.recorded}" from {result.day}; '
                   + 'this verdict is not recorded')
         return VerdictRefused(end_row_scratch(path, local_row), reason, warnings)
     if isinstance(result, VerdictAlreadyRecorded):
-        lines.append(f"{row} already has this verdict ({result.day}); the list is unchanged")
+        lines.append(f"{shown} already has this verdict ({result.day}); the list is unchanged")
     merged = result.merged.text if isinstance(result.merged, RecordedMerge) else "not recorded"
-    lines.append(f"{row} landed" if lands(verdict) else f"{row} returns to its unit (merged {merged})")
+    lines.append(f"{shown} landed" if lands(verdict) else f"{shown} returns to its unit (merged {merged})")
     lines.extend(end_row_scratch(path, local_row))
     return VerdictSaved(lines, warnings)
 
@@ -1771,9 +1829,10 @@ def list_ready(repo: Path, production: Path, merge_branch: str, *,
             if isinstance(selection, CompletedStep):
                 selected = [change for change in changes if isinstance(change.item.readiness, AfterStep)
                             and change.item.readiness.step == selection.step]
-            rows.extend(append_rows(path, selected, today(), short, owner_doc, record=record, repo=repo,
+            stamp = now()
+            rows.extend(append_rows(path, selected, stamp.date(), short, owner_doc, record=record, repo=repo,
                                     on_hold=note if isinstance(selection, ReadinessScan) else None,
-                                    merge_changes=merge_changes[path]))
+                                    merge_changes=merge_changes[path], added_at=stamp))
     if isinstance(selection, CompletedStep) and not matched_step:
         raise ChangeReviewError(f"{selection.merged}: no change waits for step {selection.step!r}; no row added")
     return rows
@@ -1843,16 +1902,48 @@ class ReviewRowTarget:
 
 def _row_option(options: CommandLine) -> ReviewRowTarget:
     """The list and local row ID selected by --row, as /next printed it."""
-    name, separator, row = options.row.strip().rpartition("/")
+    return resolve_row(options.row, production=options.production,
+                       review_list=Path(options.list) if options.list else None)
+
+
+def resolve_row(value: str, *, production: str = "", review_list: Path | None = None,
+                selected_list_only: bool = False) -> ReviewRowTarget:
+    """Resolve CLI row inputs with the explicit list or the production's selected list."""
+    name, separator, row = value.strip().rpartition("/")
     row = _row_id("row", row)
+    if separator and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", name) is None:
+        raise ChangeReviewError(f"--row {value!r} is not a row id such as C3 or production/C3")
+    if review_list is not None:
+        path = review_list.expanduser()
+    else:
+        try:
+            doc = production_doc(production)
+        except ChangeReviewError:
+            if production or not separator:
+                raise
+            path = list_file(name)
+        else:
+            path = scope_list(doc)
     if not separator:
-        return ReviewRowTarget(_list(options), row)
-    if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", name) is None:
-        raise ChangeReviewError(f"--row {options.row!r} is not a row id such as C3 or production/C3")
-    path = list_file(name)
-    if options.list and Path(options.list).expanduser().resolve() != path.resolve():
-        raise ChangeReviewError(f"--row {options.row} names {path}, which differs from --list {options.list}")
-    return ReviewRowTarget(path, row)
+        return ReviewRowTarget(path, row)
+    paths = ((path,) if review_list is not None or selected_list_only else tuple(dict.fromkeys((path, list_file(name),
+        *sorted(lists_directory().glob(PREFIX + "*.md"))))))
+    snapshots = _review_snapshots(paths)
+    routing = _routing_from_snapshots(snapshots)
+    matches: dict[Path, ReviewRowTarget] = {}
+    for candidate, snapshot in snapshots.items():
+        for item in (*snapshot.pending, *snapshot.reviewed):
+            if item["#"] == row and (name == routing.list_owner(candidate)
+                                      or name == routing.owner(item, candidate).tab):
+                matches[candidate.resolve()] = ReviewRowTarget(candidate, row)
+    if len(matches) == 1:
+        return next(iter(matches.values()))
+    if matches:
+        choices = ", ".join(str(candidate) for candidate in matches)
+        raise ChangeReviewError(f"{value} matches several lists; pass --list: {choices}")
+    if review_list is not None or selected_list_only:
+        raise ChangeReviewError(f"--row {value} differs from --list {path}; no matching row belongs to that showrunner")
+    raise ChangeReviewError(f"{value} is not on a review list")
 
 
 def _row_id(name: str, value: str) -> str:
@@ -1862,7 +1953,7 @@ def _row_id(name: str, value: str) -> str:
     return row
 
 
-def _rank_option(options: CommandLine) -> str:
+def _rank_option(options: CommandLine, destination: Path) -> str:
     """The Urgency cell --urgency, --due and --after give; empty for a normal row."""
     try:
         level = urgency.read(options.urgency, options.due)
@@ -1870,7 +1961,12 @@ def _rank_option(options: CommandLine) -> str:
         raise ChangeReviewError(str(error)) from None
     if level.level == urgency.USER:
         level = urgency.mark(datetime.now(user_zone()).replace(tzinfo=None))
-    return urgency.cell(level, _row_id("after", options.after) if options.after.strip() else "")
+    after = ""
+    if options.after.strip():
+        target = resolve_row(options.after, production=options.production,
+                             review_list=Path(options.list) if options.list else None, selected_list_only=True)
+        after = target.row if target.path.resolve() == destination.resolve() else f"{_owner(target.path)}/{target.row}"
+    return urgency.cell(level, after)
 
 
 def _backfill_targets(options: CommandLine) -> tuple[list[Path], list[Path]]:
@@ -1888,11 +1984,12 @@ def _run(options: CommandLine) -> int:
             merged = options.merged.strip()
             if merged:
                 _require_main(repo, merged)
-            item, rank = _visible(options), _rank_option(options)
             path = _list(options)
+            item, rank = _visible(options), _rank_option(options, path)
             record = staff.snapshot()
-            rows = append_rows(path, [item], today(), merged, production_doc(options.production), rank,
-                               producers=[producer_at(repo, record)], record=record)
+            stamp = now()
+            rows = append_rows(path, [item], stamp.date(), merged, production_doc(options.production), rank,
+                               producers=[producer_at(repo, record)], record=record, added_at=stamp)
             row = row_id(rows[0])
             print(row)
             for line in hold_for_row(path, row, options.hold or []):
@@ -1913,14 +2010,14 @@ def _run(options: CommandLine) -> int:
                   if shown is not None else "nothing to review")
         case "mark-important":
             target = _row_option(options)
-            now = datetime.now(user_zone()).replace(tzinfo=None)
-            print(mark_row(target.path, target.row, now, production_doc(options.production)))
+            marked_at = datetime.now(user_zone()).replace(tzinfo=None)
+            print(mark_row(target.path, target.row, marked_at, production_doc(options.production)))
         case "set-kind":
             target = _row_option(options)
             print(set_row_kind(target.path, target.row, options.kind, production_doc(options.production)))
         case "verdict":
             target = _row_option(options)
-            result = save_verdict(target.path, options.row.strip(), options.verdict, production_doc(options.production))
+            result = save_verdict(target.path, target.row, options.verdict, production_doc(options.production))
             for warning in result.warnings:
                 print(warning, file=sys.stderr)
             if isinstance(result, VerdictRefused):

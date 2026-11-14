@@ -175,7 +175,8 @@ New-note rules:
 Repeats and the link rule:
 
 - `_same_repeat` compares a repeat with the stored note apart from `date_created` and `date_modified`, and apart from `completed_date` when `--completed` is omitted. Equal prints `unchanged`. Different fields fail with `use amend`. The same title under another link fails with `make the title more specific`.
-- `_reject_duplicate_link` allows one live note per link in a project. Another title on that link needs `--separate-result`. `supersede` may reuse the link of its own `--old` notes.
+- Direct note writes require `--separate-result` when another live title holds the link in that project. `supersede` may reuse its `--old` notes' link.
+- Landing a review proposal treats its row as a separate result. It accepts a shared link even when the saved `separate_result` is false.
 - A repeated `supersede` finishes any `--old` note still live. An `--old` note superseded by something else is refused with `old note <title> is not live`.
 - `supersede --split` lifts that refusal: an `--old` note that is already superseded gains the new note in `replaced_by` and stays superseded, and the call prints `superseded: <old> → <new>`. On a live `--old` note the flag changes nothing. A repeat prints `unchanged:` for the new note and adds no event. Replacements of one note that share a link pass `--separate-result`, because the link rule exempts only the `--old` notes. `--split` with `--review` is refused (`--split cannot be combined with --review`), and `propose` does not take the flag. argparse turns it into `ReplacementPolicy = ReplaceLiveNotes | ExtendReplacementSet`.
 - `amend --evidence` skips items already stored. `amend --crate` drops `release` values of crates that left the list.
@@ -221,9 +222,20 @@ Release refusals, each checked before any write:
 | `add`/`supersede --review ROW` | lands with the saved arguments, the saved `completed` included; prints the write lines, then `[[<title>]]` | `unchanged: [[<note>]]` | refused | `no proposal for <ROW>; run propose first` |
 | `drop --review ROW --verdict TEXT` | becomes dropped | refused | `unchanged: <ROW>` | refused |
 
-A row is `A<n>` or `C<n>`, bare for a row of hana's list `~/rust/hanadocs/change-review/change-review - hana.md`, else qualified by its list: `<list>/C<n>`, where `<list>` is the showrunner `~/rust/hanadocs/change-review/change-review - <list>.md` is named for (`natedev/C3`). Every list numbers its rows from 1, so only the qualifier keeps two lists' rows apart; a qualified row is stored at `proposals/<list>/<ROW>.json`. `propose` refuses a bare row for any project but hana: `feature_log: a claude review row names its list: <list>/C3`. `add`, `supersede` and `drop` take the row as `propose` saved it.
+A feature-log review ID uses `A<n>` or `C<n>` on hana's list.
+Other lists use `<list>/C<n>`, where `<list>` comes from `change-review - <list>.md`, such as `natedev/C3`.
+Each list numbers its rows from 1.
+The qualifier separates equal row numbers in different lists.
+The proposal path is `proposals/<list>/<ROW>.json`.
+`propose` refuses a bare row for projects other than hana.
+`add`, `supersede`, and `drop` use the ID that `propose` saved.
+These stored IDs remain valid when the review page or `/next` displays the responsible showrunner, such as `sdlc/C3`.
 
 A verb that differs from the proposal's fails and names the right verb. `propose` also requires every `--old` note to exist and be live.
+
+Different review rows can land notes on the same merge link in order.
+Landing keeps the saved proposal arguments unchanged.
+Repeating a landed row creates no note or event.
 
 ### Digest
 
@@ -374,7 +386,8 @@ Rules the backfill followed, which bind any correction:
 - Project repositories are evidence: read at a recorded ref, never edited. `inventory.py` runs git with `GIT_OPTIONAL_LOCKS=0`.
 - `PROJECTS`, `vault_dir()`, `state_dir()` and `locked()` are the import surface. No other script reads a path constant. Every write to notes, events, proposals, the cursor and ledgers holds `locked()`.
 - A refusal writes nothing. Repeating a writing call adds no second note and no second event.
-- One live note per link per project unless `--separate-result`. A live note has `replaced_by: []`; a superseded note names at least one replacement, and every note it names exists.
+- Shared live links require `--separate-result` or a review proposal for each result. A live note has `replaced_by: []`.
+- A superseded note names at least one replacement. Each replacement note exists.
 - A split loses nothing: every sentence of the old note is in a replacement or in a remainder that holds no release.
 - `--link`, `--completed` and `--release` on `amend` require `--backfill`; link and date travel together.
 - A new note's `completed_date` is the given `--completed` or the linked commit's committer date. It never falls back to the logging date: a commit no checkout holds is refused.
@@ -408,7 +421,7 @@ The script:
 - A test that omits `--completed` needs a link to a real commit in a temp checkout; a made-up sha is refused.
 - A note is dated from natedev's checkouts. A commit not yet fetched into any of them is refused until it is fetched or `--completed` is given.
 - A kill between a note and its event leaves a note with no event; the next identical call appends it. For link, date and release amendments the order is reversed: the event exists and the note lags until a retry.
-- `propose` checks a link against notes already written. Two open proposals for one merge cannot see each other, so the second is refused at landing unless every row carries `--separate-result`.
+- `propose` checks links against existing notes. Landing accepts separate review rows on one link, including old proposals without `--separate-result`.
 - `--backfill` only omits the `@Unreleased` default; `add`, `supersede` and `amend` each accept `--backfill --release X@Unreleased`.
 - `amend` takes no `--production` or `--unit`; they belong to `add` and `supersede`.
 - A `live` read can fail once with `missing opening frontmatter delimiter` when it catches a note mid-rewrite while Obsidian runs on natedev. The script's own writes are atomic, and `.<name>.tmp` files are never globbed.

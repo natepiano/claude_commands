@@ -3,24 +3,37 @@ from __future__ import annotations
 
 import json
 import os
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone, tzinfo
 from pathlib import Path
 import shutil
 import subprocess
+import tempfile
 import unittest
-from typing import cast, override
+from typing import ClassVar, cast, override
 from unittest.mock import patch
 
+from scripts.direct import simplify_daily
 from scripts.lib.py_floor_test_support import interpreter_cache_environment
 from scripts.lib.git_test_support import commit_repository
+from scripts.lib.checkout_test_support import copy_runtime
 from scripts.lib.nix_env_test_support import NixFixture, ROOT
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lib.test_models_registry import write_registry
 from scripts.lint.memory_test_support import write_config_fixture
+from scripts.production.cli_fixture import invoke_cli, process_boundary, process_boundary_for_case
 from scripts.whoami.account_test_support import write_claude_account
 
 
+class ReviewTime(datetime):
+    @classmethod
+    @override
+    def now(cls, tz: tzinfo | None = None) -> ReviewTime:
+        moment = cls.fromisoformat(os.environ["SIMPLIFY_TEST_NOW"])
+        return moment.astimezone(tz) if tz is not None else moment.replace(tzinfo=None)
+
+
 class DailySimplifyTests(NixFixture):
+    agent_exec: ClassVar[Path]
     origin: Path = Path()
     session: Path = Path()
     calls: Path = Path()
@@ -29,6 +42,25 @@ class DailySimplifyTests(NixFixture):
     first: str = ""
     real_git: str = ""
     day: str = "2026-11-05"
+
+    @classmethod
+    @override
+    def setUpClass(cls) -> None:
+        super().setUpClass()
+        launcher = Path(cls.enterClassContext(tempfile.TemporaryDirectory()))
+        for folder, names in (
+            ("agents", ("agent_exec.sh", "models_config.sh", "claude_account.sh", "claude_result.py")),
+            ("lib", ("py", "package_root.py", "models_registry.py", "nix_env.py")),
+        ):
+            destination = launcher / "scripts" / folder
+            destination.mkdir(parents=True)
+            for name in names:
+                _ = shutil.copy2(ROOT / "scripts" / folder / name, destination / name)
+        direct = launcher / "scripts/direct"
+        direct.mkdir()
+        _ = (direct / "assign_gate.py").write_text("# Admission succeeds in this private fixture.\n")
+        copy_runtime(launcher, configuration=False)
+        cls.agent_exec = launcher / "scripts/agents/agent_exec.sh"
 
     @override
     def setUp(self) -> None:
@@ -88,7 +120,7 @@ if sys.argv[0].endswith(("assign.py", "simplify_daily.py")):
                 simplify_daily.write_text_atomic = publish_status
     sys.setprofile(enter)
 ''')
-        self.env["PYTHONPATH"] = os.pathsep.join((str(startup), str(ROOT)))
+        self.env["PYTHONPATH"] = os.pathsep.join((str(ROOT / "scripts/lib/python_startup"), str(startup)))
         self.script(self.bin / "claude", '''import json, os, subprocess, sys, uuid
 from pathlib import Path
 session = sys.argv[sys.argv.index("--session-id") + 1] if "--session-id" in sys.argv else str(uuid.uuid4())
@@ -123,10 +155,15 @@ raise SystemExit(1 if failed else 0)
         return commit_repository(self.work, content, env={**self.env, "GIT_AUTHOR_DATE": at, "GIT_COMMITTER_DATE": at})
 
     def launch(self, *, session: Path | None = None) -> subprocess.CompletedProcess[str]:
-        return subprocess.run(["bash", str(ROOT / "scripts/direct/assign.sh"), "--role", "simplify",
-                               "--session-dir", str(session or self.session), "--cwd", str(self.work)],
-                              env=self.env, capture_output=True, text=True, check=False,
-                              timeout=TEST_HANG_GUARD_SECS)
+        arguments = ["--session-dir", str(session or self.session), "--cwd", str(self.work)]
+        if process_boundary_for_case(self):
+            return subprocess.run(["bash", str(ROOT / "scripts/direct/assign.sh"), "--role", "simplify", *arguments],
+                                  env=self.env, capture_output=True, text=True, check=False,
+                                  timeout=TEST_HANG_GUARD_SECS)
+        with (patch.object(simplify_daily, "datetime", ReviewTime),
+              patch.object(simplify_daily, "AGENT_EXEC", self.agent_exec)):
+            return invoke_cli(simplify_daily, lambda: simplify_daily.main(arguments), arguments,
+                              {**self.env, "MODELS_CONFIG_TIER_ONLY": "1"}, Path.cwd())
 
     def reviews(self) -> list[dict[str, object]]:
         return ([cast(dict[str, object], json.loads(line)) for line in self.calls.read_text().splitlines()]
@@ -147,6 +184,7 @@ raise SystemExit(1 if failed else 0)
         self.assertEqual(self.reviews(), [])
         self.assertEqual(self.refs(), {})
 
+    @process_boundary
     def test_first_run_reviews_the_diff_from_the_commit_before_the_cutoff(self) -> None:
         result = self.launch()
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
@@ -283,6 +321,7 @@ raise SystemExit(1 if failed else 0)
         self.assertEqual(self.reviews(), [])
         self.assertEqual(self.refs()["refs/simplify/last"], self.before)
 
+    @process_boundary
     def test_a_failed_reviewed_status_write_keeps_the_last_ref(self) -> None:
         self.env["SIMPLIFY_TEST_STATUS_FAILURE"] = "1"
         _ = self.git("update-ref", "refs/simplify/last", self.before, repository=self.origin)

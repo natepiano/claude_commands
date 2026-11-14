@@ -1119,7 +1119,7 @@ class AgentNotesTests(unittest.TestCase):
             events.append("refusal")
             return ["fixture refusal decision", *unit_watchdog.run(self.now, dry_run=False)]
         with (patch.object(sys, "argv", ["agent_notes.py"]),
-              patch.object(herdr, "_proc_root", return_value=proc),
+              patch.object(herdr, "proc_root", return_value=proc),
               patch.object(herdr, "_process_sessions", wraps=herdr._process_sessions) as scans,  # pyright: ignore[reportPrivateUsage]
               patch.object(agent_notes, "live_reports", return_value=[report]) as reports,
               patch.object(agent_notes, "resolve_workers_home", return_value=home),

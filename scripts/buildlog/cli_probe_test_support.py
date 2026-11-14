@@ -79,7 +79,7 @@ def measure_cli_work(command: str, environment: dict[str, str], row_count: int) 
          + "from scripts.buildlog import store; "
          + f"store.host_name = lambda: {host!r}; probe_cli()", command],
         cwd=Path(__file__).resolve().parents[2],
-        env={**environment, "PYTHONPATH": str(Path(__file__).resolve().parents[2]), "BUILDLOG_TEST_INSTRUCTION_LIMIT": str(row_count * 500)},
+        env={**environment, "PYTHONPATH": str(Path(__file__).resolve().parents[1] / "lib/python_startup"), "BUILDLOG_TEST_INSTRUCTION_LIMIT": str(row_count * 500)},
         capture_output=True, text=True, check=False, timeout=test_hang_guard.TEST_HANG_GUARD_SECS,
     )
     if result.returncode != 0:

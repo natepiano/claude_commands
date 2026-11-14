@@ -1336,6 +1336,78 @@ class PromptSubmissionTests(unittest.TestCase):
         self.assertIsInstance(result, herdr.PromptSubmitted)
         self.assertGreater(cursor.offsets[self.path], before)
 
+    def check_start_cursor(self, *, supplied: bool, native_identity_changes: bool) -> None:
+        self.write_turn("prelaunch-only-history", kind="assistant", seconds_after_launch=-1)
+        historical_size = self.path.stat().st_size
+        requested = (herdr.SessionTranscript(self.transcript.config_dir, "before-native")
+                     if native_identity_changes else self.transcript)
+        source = self.path.with_name(requested.session_id + ".jsonl")
+        if source != self.path:
+            _ = source.write_bytes(self.path.read_bytes())
+        cursor: herdr.TranscriptCursor | herdr.UnspecifiedPromptTranscript = herdr.UnspecifiedPromptTranscript()
+        if supplied:
+            cursor = herdr.TranscriptCursor(requested, self.launched_at)
+            cursor.skip_existing_turns()
+        publications: list[herdr.SessionTranscript] = []
+        seen: list[herdr.TranscriptCursor] = []
+        positions: list[dict[Path, int]] = []
+        original_read = herdr.TranscriptCursor.read_turns
+
+        def read_turns(reader: herdr.TranscriptCursor) -> list[tuple[datetime, dict[str, object]]]:
+            seen.append(reader)
+            positions.append(dict(reader.offsets))
+            return original_read(reader)
+
+        def start(*_args: object, **_kwargs: object) -> subprocess.CompletedProcess[str]:
+            self.write_turn("resume the saved work")
+            self.write_turn("Resumed work", kind="assistant", seconds_after_launch=2)
+            return subprocess.CompletedProcess(["fixture agent start"], 0, "", "")
+
+        def publish(actual: herdr.SessionTranscript) -> None:
+            publications.append(actual)
+
+        def native_session(*_args: object, **_kwargs: object) -> str:
+            native.return_value = herdr.NativeAgentProcess(
+                herdr.PaneSessionReport(self.transcript.session_id), "fixture-prompt-recipient", {})
+            return self.transcript.session_id
+
+        cast(Mock, self.start).side_effect = start
+        with (patch.object(herdr, "native_process", return_value=herdr.NativeAgentProcess(
+                  herdr.PaneSessionReport(requested.session_id), "fixture-prompt-recipient", {})) as native,
+              patch.object(self.client, "native_session", side_effect=native_session),
+              patch.object(herdr.TranscriptCursor, "read_turns", read_turns),
+              patch.object(json, "loads", wraps=json.loads) as parsed):
+            outcome = self.client.start_agent("moved-session", "destination:p1", "claude",
+                ["--resume", requested.session_id],
+                herdr.OpeningPrompt("resume the saved work", requested, publish, cursor), 1000)
+        self.assertIsInstance(outcome, herdr.PromptSubmitted)
+        cast(Mock, self.start).assert_called_once()
+        self.assertEqual(self.typed, [])
+        self.assertEqual(self.enters, [])
+        self.assertEqual(publications, [self.transcript])
+        self.assertTrue(seen)
+        self.assertTrue(all(reader is seen[0] for reader in seen))
+        if supplied:
+            self.assertIs(seen[0], cursor)
+        self.assertEqual(seen[0].transcript, self.transcript)
+        self.assertEqual(positions[0], {} if native_identity_changes else {self.path: historical_size})
+        self.assertEqual(len(seen[0].read_turns()), 2)
+        self.assertEqual(any("prelaunch-only-history" in str(value)
+                            for parsed_call in parsed.call_args_list
+                            for value in cast(tuple[object, ...], parsed_call.args)), native_identity_changes)
+
+    def test_start_positions_an_automatic_cursor_before_the_agent_command(self) -> None:
+        self.check_start_cursor(supplied=False, native_identity_changes=False)
+
+    def test_start_keeps_a_supplied_cursor_and_its_publication_callback(self) -> None:
+        self.check_start_cursor(supplied=True, native_identity_changes=False)
+
+    def test_start_moves_a_supplied_cursor_to_the_native_transcript(self) -> None:
+        self.check_start_cursor(supplied=True, native_identity_changes=True)
+
+    def test_start_moves_an_automatic_cursor_to_the_native_transcript(self) -> None:
+        self.check_start_cursor(supplied=False, native_identity_changes=True)
+
     def test_transcript_cursor_reads_only_appended_bytes_after_its_first_poll(self) -> None:
         self.write_turn("old context " * 1000, kind="assistant", seconds_after_launch=-1)
         first_size = self.path.stat().st_size
@@ -5274,7 +5346,7 @@ class HerdrTests(unittest.TestCase):
             self.assertEqual(herdr.herdr_processes(), [])
             self.assertEqual(herdr.herdr_processes(), [])
             self.assertEqual(scans.call_count, 2)
-        with patch.object(herdr, "_proc_root", return_value=self.root / "missing") as roots:
+        with patch.object(herdr, "proc_root", return_value=self.root / "missing") as roots:
             with herdr.process_snapshot():
                 self.assertEqual(herdr.herdr_processes(), [])
                 self.assertEqual(herdr.herdr_processes(), [])
@@ -6849,6 +6921,34 @@ class SavedLayoutTests(unittest.TestCase):
             for title in titles:
                 _ = client.open_tab(space, title, "/repo", {})
         return client
+
+    def test_launch_ignores_an_unreadable_identity_in_another_rows_retained_pane(self) -> None:
+        owner = unit_membership("natedev", "report")
+        _ = unit_membership("natedev", "accounts")
+        client = LayoutHerdr()
+        pane = client.open_tab("natedev", owner.name, str(self.root), {})
+        tab = next(tab for tab in client.tabs if tab["pane_id"] == pane)
+        _ = tab.pop("session_id")
+        entry = pane_launch.launch(pane, owner.current_session, str(self.root), {}, ["claude"])
+        pane_launch.save(pane_launch.record_directory() / "fixture.json", {pane: entry})
+        record = staff.initial_snapshot()
+        with herdr.pane_evidence_run():
+            panes = client.listed("pane")
+            cached = client.scan_row_panes(record, panes)
+            self.assertEqual(cached, herdr.RowPaneScan({}, []))
+            tab["session_id"] = owner.current_session
+            with (patch.object(herdr, "pane_native_process",
+                               side_effect=herdr.NativeRegistryUnavailable("pid 992000: native registry identity is unavailable")) as decoded,
+                  patch.object(client, "run_in_pane"),
+                  patch.object(herdr, "start_agent", return_value=herdr.PromptSubmissionNotRequired()) as started):
+                result = herdr.launch_prepared_agent("fixture", herdr.NewTab("natedev", "accounts"),
+                    herdr.PreparedAgentEnvironment(self.root, {}), "codex", [], herdr.NoOpeningPrompt(),
+                    5000, agent="accounts", client=client)
+                self.assertGreater(decoded.call_count, 0)
+                started.assert_called_once()
+        self.assertNotEqual(result.pane, pane)
+        self.assertIsInstance(result.outcome, herdr.PromptSubmissionNotRequired)
+        self.assertIn(tab, client.tabs)
 
     def test_saved_row_tab_uses_the_supplied_fallback_workspace(self) -> None:
         client = LayoutHerdr()

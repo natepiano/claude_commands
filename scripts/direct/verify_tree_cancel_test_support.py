@@ -157,7 +157,7 @@ class VerifyTreeCancelFixture(VerifyTokenOwnershipFixture):
             "TEST_CONTROL": str(self.control), "VERIFY_TREE_WATCH_S": "0.2",
             "UNIT_RUN_DIR": str(self.board), "UNIT_SESSION_DIR": str(self.board),
             "UNIT_TEAM_ROLE": "test",
-            "PYTHONPATH": str(VERIFY.resolve().parents[2]), "BUILDLOG_SYNC": "1",
+            "PYTHONPATH": str(VERIFY.resolve().parents[1] / "lib/python_startup"), "BUILDLOG_SYNC": "1",
             "PYTHONDONTWRITEBYTECODE": "1", "NEXTEST_TEST_THREADS": "4",
         })
 
@@ -179,7 +179,9 @@ class VerifyTreeCancelFixture(VerifyTokenOwnershipFixture):
 
     @staticmethod
     def write_tool(path: Path, code: str) -> None:
-        _ = path.write_text(f"#!{sys.executable}\n" + code)
+        startup = Path(__file__).resolve().parents[1] / "lib/python_startup/sitecustomize.py"
+        bootstrap = f"import runpy, sys\nrunpy.run_path({str(startup)!r}, run_name='_fixture_python_startup')['select_checkout'](sys.argv)\n"
+        _ = path.write_text(f"#!{sys.executable}\n" + bootstrap + code)
         path.chmod(0o755)
 
     @staticmethod

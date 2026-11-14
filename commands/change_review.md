@@ -8,6 +8,9 @@ description: Add a change for the user to check to the top-level showrunner's ch
 
 For `/change_review` with no action:
 
+The command prints the Hana console link with Changes selected.
+The console navigation switches between Changes and Builds.
+
 1. Run the page script:
 
    ```sh
@@ -35,7 +38,7 @@ On exit 1 report its one line.
 
 ## Find the list
 
-Every action finds the list from its production, written `<production>` below:
+Every action finds the list from its production, written `[--production <name>]` below:
 
 - A showrunner passes nothing: the script finds the production from this
   session's update timer, as `/showrunner:proposals` does. A session with no
@@ -70,7 +73,7 @@ carries: a showrunner's own change, a fix outside a run, or a change nobody
 sees in the app, such as a table's columns or a status line.
 
 ```sh
-… add <production> --change "<what changed for you>" --check "<how to try it: where and what to type>" --see "<what you see>" [--merged <hash>] [--urgency <level>] [--due <ISO>] [--after C<n>]
+… add [--production <name>] --change "<what changed for you>" --check "<how to try it: where and what to type>" --see "<what you see>" [--merged <hash>] [--urgency <level>] [--due <ISO>] [--after C<n>]
 ```
 
 `--urgency` is `blocks` (work stops until the user checks it), `soon` (with
@@ -85,7 +88,8 @@ type; `--see` is what the person then sees. Example: `--change "The Units table
 shows each unit's phase" --check "In a showrunner session on natedev, type
 /showrunner:units" --see "Each row has a Phase column"`. The row's How to
 check cell is `<how to try it> You see: <what you see>`. Pass `--merged` when a
-commit holds the change. It prints the new row's id, such as `C12`.
+commit holds the change. The Merged cell holds the date and time of the add, in the
+user's zone, then the commit: `2026-11-13 16:20 · 31770c75`. It prints the new row's id, such as `C12`.
 
 ## list-ready and live
 
@@ -122,10 +126,13 @@ To rewrite a row still to review, such as one that lacks where to try it or
 what the person sees:
 
 ```sh
-… edit <production> --row <id> --change "<what changed for you>" --check "<how to try it>" --see "<what you see>"
+… edit [--production <name>] --row <id> --change "<what changed for you>" --check "<how to try it>" --see "<what you see>"
 ```
 
-Pass the ID as `/next` shows it, such as `C434` or `sdlc/C9`.
+Pass the displayed ID, such as `sdlc/C9`.
+The prefix names the responsible showrunner, even when another showrunner's list stores the row.
+Commands also accept the list-based ID and a bare row number with the selected list.
+Pass `--list <path>` when the displayed ID matches several lists.
 The row keeps its id, its Merged cell and its place. It prints the new row.
 
 ## show
@@ -178,13 +185,16 @@ The Mac block states that updates can take five minutes while the Mac is reachab
 The last line tells the user that requests clear automatically and asks them to refresh after the rebuild.
 An empty view shows `No rebuilds needed.`
 Rebuilds has no showrunner menu, card navigation, Skip for now, or answer form.
+The status line also shows open needs as `rebuild natedev` or `rebuild mac`, even before system evaluation completes.
+It combines these needs with cached system comparisons without duplicate machines.
+`rebuild.eval_timeout` in `config/statusline.conf` sets the evaluation limit to 120 seconds.
+`rebuild.eval_retry_seconds` sets a 600-second wait after failed or partial evaluations; a new commit bypasses this wait.
 
 The Changes tab contains every waiting change.
 Each card starts with its 20px title; section labels use 17px text.
-One closed Details disclosure holds the ID, date, commit, and kind, with 16px space after the title.
-How to check or Proof stays in the main view.
-Works and Does not work are the main actions.
-Ask showrunner to check, Ask a question, and Send feedback are secondary actions.
+How to check or Proof follows the title.
+Works, Does not work, Ask showrunner to check, Ask a question, Send feedback, and Skip for now share one wrapping row.
+Aligned lines under the buttons always show `change`, `date`, `time`, `commit`, and `kind`; an unknown value has no line.
 The Does not work button submits `not works` and saves `not works: <text>` when the user supplies text.
 An open Production cell holds the unit's fixed staff id or the showrunner's fixed staff id.
 The reader follows a unit's current staff parent and displays current names.
@@ -240,12 +250,12 @@ A nonblocking lock prevents two renders from sending one alert at once.
 The router records acceptance only after the sender accepts or queues the alert.
 Do not ask for a batch size or take page answers in chat.
 
-The diagnostic command `show <production>` still prints the current row and count.
+The diagnostic command `show [--production <name>]` still prints the current row and count.
 
 The list keeps the order of `/next` (`commands/next.md`): the row `show`
 printed stays first until its verdict. When the user calls a row important,
-run `mark-important <production> --row <id>`, with the ID as `/next` shows it,
-such as `C434` or `sdlc/C9`.
+run `mark-important [--production <name>] --row <id>`, with the ID as `/next` shows it,
+such as `sdlc/C434` or `sdlc/C9`.
 
 ## A folder for the user to try
 
@@ -269,15 +279,18 @@ A verdict beginning `works` or `fine`, after optional `okay`/`ok` and a row id
 (`c17`), lands the row. Case and later words do not affect the result; any
 other start returns it to its unit. In a Hana or `~/.claude` production, the showrunner first runs the
 feature-log step of `/showrunner:produce` → `<CloseChangeReview/>`; a failure
-there leaves the row open. Then:
+there leaves the row open.
+Different review rows can land feature-log notes on one merge link without `--separate-result`.
+The review page sends one failure alert per list, row, and error text.
+Then:
 
 ```sh
-… verdict <production> --row <id> --verdict "<the user's words>"
+… verdict [--production <name>] --row <id> --verdict "<the user's words>"
 ```
 
-Pass the ID as `/next` shows it, such as `C434` or `sdlc/C9`.
+Pass the displayed ID, such as `sdlc/C9`, or its existing list-based ID.
 It moves the row to `## Reviewed` with the verdict, today's date and its Merged cell, and prints
-`C<n> landed` or `C<n> returns to its unit (merged …)`. Either way it removes
+`<showrunner>/C<n> landed` or `<showrunner>/C<n> returns to its unit (merged …)`. Either way it removes
 the row's scratch folders and prints `removed <path>` for each.
 The Producer cell stays with the row in Reviewed.
 Send a returning row and the user's words to its Producer staff id.
@@ -309,7 +322,7 @@ Use the `verdict` command above for both. The row stays out of the user's count 
 3. Save the answer with this command:
 
 ```sh
-"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/review_links/change_page.py" answer-question --production <showrunner name> --list <list> --row C<n> --question <id> --text "<answer>"
+"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/review_links/change_page.py" answer-question --production <showrunner name> --list <list> --row <showrunner>/C<n> --question <id> --text "<answer>"
 ```
 
 The row returns to the user's count with the question and answer below the change.
@@ -325,7 +338,7 @@ The command refuses an old or unknown ID, a different answer, or a row without a
 3. Record what you did with the feedback id:
 
 ```sh
-"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/review_links/change_page.py" answer-question --production <showrunner name> --list <list> --row C<n> --question <id> --text "<what you did>"
+"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/review_links/change_page.py" answer-question --production <showrunner name> --list <list> --row <showrunner>/C<n> --question <id> --text "<what you did>"
 ```
 
 The note returns the row to the user's waiting count.

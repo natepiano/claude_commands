@@ -47,7 +47,8 @@ from scripts.buildlog import store
 from scripts.lib import test_phase
 
 from scripts.build_queue.scope_activity import (
-    IdleService, LiveBuildRun, NoLiveBuildRun, NotServiceSlice, ScopeActivityReader, ScopeProcesses,
+    IdleService, LiveBuildRun, NoLiveBuildRun, NotServiceSlice, RunningServiceJob, WaitingServiceJob, UnmatchedServiceJob,
+    ScopeActivityReader, ScopeProcesses,
 )
 from scripts.lint.build_shape import build_shape, recorded_build_shape
 from scripts.lib.atomic_file import atomic_sample, write_text_atomic
@@ -525,7 +526,7 @@ def read_system(plan: SystemReadingPlan, readings: Readings, proc: Proc, clock: 
             members[reading.cgroup] = frozenset(gate.scope_members(Path(reading.cgroup)))
         except (OSError, ValueError):
             members[reading.cgroup] = frozenset()
-        if not isinstance(reading.job_state, NotServiceSlice):
+        if not isinstance(records.recorded_service_state(reading), NotServiceSlice):
             programs = gate.member_programs(members[reading.cgroup].intersection(processes), proc.path)
             workers[reading.cgroup] = frozenset(pid for pid, name in programs.items() if name == "Runner.Worker")
     scope_process_memory = {pid: gate.process_memory({pid}, proc.path)
@@ -1454,7 +1455,8 @@ class AdmissionServer:
         tree_pids = gate.process_tree(roots, dict(evidence.processes))
         result: list[records.UnownedSliceMemory] = []
         for memory in evidence.unowned:
-            required = not isinstance(memory.job_state, NotServiceSlice)
+            state = records.recorded_service_state(memory)
+            required = not isinstance(state, NotServiceSlice)
             if not required and memory.cgroup in owned:
                 continue
             scoped = [scope_memory[scope] for scope in gate.owned_scope_roots(scope_memory, Path(memory.cgroup))] if required else []
@@ -1466,12 +1468,17 @@ class AdmissionServer:
             use = sum(item.anonymous.bytes if required and isinstance(item.anonymous, records.AnonymousRunUse)
                       else item.bytes for item in duplicate)
             use += sum(item.anonymous.bytes for item in scoped if isinstance(item.anonymous, records.AnonymousRunUse))
-            job = memory.job_state
             workers = evidence.scope_workers.get(memory.cgroup, frozenset())
+            job = (gate.service_job_state(workers, dict(evidence.processes), tree_pids | scoped_pids,
+                    [waiting.row for waiting in self.waiters.values()],
+                    state.started_at if isinstance(state,
+                        (RunningServiceJob, WaitingServiceJob, UnmatchedServiceJob)) else 0.0)
+                   if required else state)
+            legacy_job = memory.job_state
             if workers and all(gate.process_tree({pid: evidence.processes[pid].start},
                                dict(evidence.processes)).intersection(tree_pids | scoped_pids) for pid in workers):
-                job = IdleService()
-            result.append(replace(memory, bytes=max(0, memory.bytes - use), job_state=job,
+                legacy_job = IdleService()
+            result.append(replace(memory, bytes=max(0, memory.bytes - use), job_state=legacy_job, service_job_state=job,
                                   swap_bytes=max(0, memory.swap_bytes - sum(item.swap_bytes for item in (*duplicate, *scoped)))))
         return tuple(result)
 
@@ -2026,7 +2033,8 @@ class AdmissionServer:
     def _read_host_evidence(self, key: placement.HostEvidenceKey) -> placement.HostEvidence:
         """Read provider policy and exact claims outside the service loop."""
         from scripts.build_targets import build_targets, target_config
-        from scripts.mac_test import claim_state, offload
+        from scripts.mac_test import claim_state
+        from scripts.mac_test.eligibility import MacVerb, verb_kind
 
         request = self.host_requests[key]
         destination = key.destination
@@ -2035,7 +2043,7 @@ class AdmissionServer:
         target = next((target for target in target_config.read_targets() if target.name == destination.target), None)
         if target is None:
             return placement.HostEvidenceUnavailable(key, self.clock.now(), "target is no longer configured")
-        kind = offload.verb_kind(cast(offload.MacVerb, request.profile.step))
+        kind = verb_kind(cast(MacVerb, request.profile.step))
         if kind not in ("check", "lint", "doc", "test", "build", "example", "final"):
             return placement.HostEvidenceUnavailable(key, self.clock.now(), "command policy is unavailable")
         if isinstance(target, target_config.SshTarget):

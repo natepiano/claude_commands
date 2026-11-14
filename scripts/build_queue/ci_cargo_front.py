@@ -27,6 +27,7 @@ from scripts.build_queue import admission_records as records
 from scripts.build_queue import progress_profile as progress
 from scripts.build_queue import queue_place
 from scripts.build_queue import step_estimator
+from scripts.lib import cancellation
 from scripts.lib.descendants import adopt_descendants
 
 
@@ -180,7 +181,7 @@ def run_cargo(command: str, arguments: Sequence[str], child_path: str, shared_fo
             status = error.code if isinstance(error.code, int) else 1
             raise
         finally:
-            with queue_place.defer_cleanup_signals():
+            with cancellation.defer_cleanup_signals():
                 try:
                     place.finish(failed=status != 0)
                 finally:

@@ -10,8 +10,10 @@ import fcntl
 import io
 import json
 import os
+import select
 import shlex
 import subprocess
+import sys
 import tempfile
 import threading
 import unittest
@@ -38,7 +40,11 @@ from scripts.production.change_review import Invisible, Malformed, Visible
 # Importable once change_review has put scripts/lib on the path.
 from scripts.lib import scratch
 from scripts.lib import urgency
-from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.lib.fork_test_support import ForkChild, ForkChildren
+from scripts.lib.test_hang_guard import LauncherHangGuard, TEST_HANG_GUARD_SECS
+from scripts.production.cli_fixture import invoke_cli
+
+TIMER_DOCS = showrunners.timer_docs
 
 LIST = """# Change review list
 
@@ -888,12 +894,26 @@ class StampTest(unittest.TestCase):
             '  - "~/worktrees/demo-trunk/docs/plans/demo-production.md"', "showrunner: natedev", "---"])
 
 
+ADD_TIME = datetime(2026, 11, 13, 16, 20, tzinfo=ZoneInfo("America/New_York"))
+"""The clock that the add tests read: the Merged cell holds its date and time."""
+
+
 def run(*arguments: str) -> tuple[int, str, str]:
     """The command line's exit code, standard output and standard error."""
     output, error = io.StringIO(), io.StringIO()
     with redirect_stdout(output), redirect_stderr(error):
         code = change_review.main(list(arguments))
     return code, output.getvalue(), error.getvalue()
+
+
+def run_review_child(arguments: list[str], environment: dict[str, str]) -> int:
+    """Run the real command with private output and the fresh CLI's timer reader."""
+    with mock.patch.object(showrunners, "timer_docs", TIMER_DOCS):
+        result = invoke_cli(change_review, lambda: change_review.main(arguments), arguments,
+                            {**environment, "MODELS_CONFIG_TIER_ONLY": "1"}, Path.cwd())
+    print(result.stdout, end="")
+    print(result.stderr, end="", file=sys.stderr)
+    return result.returncode
 
 
 def origin_commits(root: Path) -> tuple[Path, str, str]:
@@ -1377,18 +1397,53 @@ class ReadyListTests(ProducerFixture):
     def test_two_readiness_calls_share_the_list_lock_without_duplicate_rows(self) -> None:
         _ = self.merge_change("Change-Review: Concurrent | Read | One row")
         self.promote()
-        command = [str(Path(change_review.__file__).parents[1] / "lib/py"), str(Path(change_review.__file__)),
-                   "list-ready", "--repo", str(self.repo), "--production", "top"]
-        descriptor = os.open(self.listing.parent, os.O_RDONLY)
-        try:
-            fcntl.flock(descriptor, fcntl.LOCK_EX)
-            processes = [subprocess.Popen(command, env=os.environ.copy(), stdout=subprocess.PIPE,
-                                          stderr=subprocess.PIPE, text=True) for _ in range(2)]
-        finally:
-            os.close(descriptor)
-        for process in processes:
-            output, error = process.communicate(timeout=TEST_HANG_GUARD_SECS)
-            self.assertEqual(process.returncode, 0, output + error)
+        arguments = ["list-ready", "--repo", str(self.repo), "--production", "top"]
+        environment = os.environ.copy()
+        directory = self.listing.parent.stat()
+        guard = LauncherHangGuard("readiness list contention")
+
+        def ready(announcement: int) -> int:
+            real_flock = fcntl.flock
+
+            def observe_lock(descriptor: int, operation: int) -> None:
+                target = os.fstat(descriptor)
+                if operation == fcntl.LOCK_EX and (target.st_dev, target.st_ino) == (directory.st_dev, directory.st_ino):
+                    try:
+                        real_flock(descriptor, operation | fcntl.LOCK_NB)
+                    except BlockingIOError:
+                        _ = os.write(announcement, b"blocked")
+                        os.close(announcement)
+                    else:
+                        raise AssertionError("The parent must hold the list lock.")
+                    fcntl.flock = real_flock
+                real_flock(descriptor, operation)
+
+            with mock.patch.object(fcntl, "flock", observe_lock):
+                return run_review_child(arguments, environment)
+
+        with ForkChildren() as children:
+            descriptor = os.open(self.listing.parent, os.O_RDONLY)
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_EX)
+                processes: list[ForkChild] = []
+                for _ in range(2):
+                    reader, writer = children.pipe()
+                    processes.append(children.start(lambda writer=writer: ready(writer),
+                                                    close_fds=(descriptor,), pass_fds=(writer,)))
+                    self.assertEqual(select.select([reader], [], [], guard.remaining())[0], [reader],
+                                     "readiness did not reach the list lock")
+                    announcement = os.read(reader, 7)
+                    if not announcement:
+                        result = processes[-1].result(timeout=guard.remaining())
+                        self.fail("readiness ended before the list lock: " + result.stdout + result.stderr)
+                    self.assertEqual(announcement, b"blocked")
+                self.assertTrue(all(process.is_alive() for process in processes))
+            finally:
+                os.close(descriptor)
+            for child in processes:
+                process = child.result(timeout=guard.remaining())
+                output, error = process.stdout, process.stderr
+                self.assertEqual(process.returncode, 0, output + error)
         self.assertEqual([row["Change"] for row in change_review.pending(self.listing)], ["Concurrent"])
 
     def test_foreign_production_and_child_handoff_rows_keep_their_lists(self) -> None:
@@ -1538,10 +1593,11 @@ class MergedAddTests(unittest.TestCase):
                    "--change", "Ready change", "--check", "Read", "--see", "The change", *options)
 
     def test_add_accepts_an_ancestor_of_origin_main(self) -> None:
-        self.assertEqual(self.add("--merged", self.merged), (0, "C81\n", ""))
+        with mock.patch.object(change_review, "now", return_value=ADD_TIME):
+            self.assertEqual(self.add("--merged", self.merged), (0, "C81\n", ""))
         row = change_review.pending(self.path)[-1]
         self.assertEqual(row["Change"], "Ready change")
-        self.assertEqual(row["Merged"], f"{change_review.today().isoformat()} · {self.merged}")
+        self.assertEqual(row["Merged"], f"2026-11-13 16:20 · {self.merged}")
 
     def assert_merge_refused(self, merged: str) -> None:
         before = self.path.read_bytes()
@@ -1561,10 +1617,147 @@ class MergedAddTests(unittest.TestCase):
 
     def test_add_without_merged_does_not_require_a_repository(self) -> None:
         self.repo = self.root / "not-a-repository"
-        self.assertEqual(self.add(), (0, "C81\n", ""))
+        with mock.patch.object(change_review, "now", return_value=ADD_TIME):
+            self.assertEqual(self.add(), (0, "C81\n", ""))
         row = change_review.pending(self.path)[-1]
         self.assertEqual(row["Change"], "Ready change")
-        self.assertEqual(row["Merged"], change_review.today().isoformat())
+        self.assertEqual(row["Merged"], "2026-11-13 16:20")
+
+
+class ChangeIdentityTests(unittest.TestCase):
+    root: Path = Path()
+    path: Path = Path()
+    doc: Path = Path()
+
+    @override
+    def setUp(self) -> None:
+        self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        _ = self.enterContext(isolated_staff_file(self.root / "staff.json", {}))
+        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
+            "CHANGE_REVIEW_DIR": str(self.root), "REVIEW_LINKS_ROOT": str(self.root / "links"),
+            "NEXT_STATE_DIR": str(self.root / "next"), "SCRATCH_ROOT": str(self.root / "scratch"),
+            "SCRATCH_HOLDS": str(self.root / "holds.json")})))
+        self.path = self.root / "change-review - natedev.md"
+        top_doc = self.root / "top.md"
+        self.doc = self.root / "child.md"
+        for document in (top_doc, self.doc):
+            _ = document.write_text(f"- **Change review:** `{self.path}`\n")
+        top = fixture_member("showrunner", name="natedev", doc=staff.LiveDoc(remote.local_machine(), top_doc))
+        child = fixture_member("showrunner", name="sdlc", parent=top.id,
+                               doc=staff.LiveDoc(remote.local_machine(), self.doc))
+        unit = fixture_member("unit", name="unit-board", parent=child.id)
+        _ = self.path.write_text("---\nshowrunner: natedev\n---\n## To review\n\n"
+            + "| # | Change | How to check | Production | Producer | Merged |\n"
+            + "| --- | --- | --- | --- | --- | --- |\n"
+            + f"| C1 | Unit change | Read it | {child.id} | {unit.id} | 2026-11-01 |\n"
+            + "| C2 | Own change | Read it | | | 2026-11-02 |\n" + change_review.BODY[change_review.BODY.index("## Reviewed"):])
+
+    def test_show_uses_the_unit_parent_and_the_list_owner_without_changing_queue_keys(self) -> None:
+        before = self.path.read_bytes()
+        queue = change_review.change_queue(self.path, self.doc)
+        self.assertEqual([(entry.key, entry.item["#"]) for entry in queue.entries], [("C1", "sdlc/C1")])
+        whole = change_review.change_queue(self.path, change_review.WholeReviewList.ALL_ROWS)
+        self.assertEqual([entry.item["#"] for entry in whole.entries], ["sdlc/C1", "natedev/C2"])
+        with mock.patch.object(change_review, "production_doc", return_value=self.doc):
+            code, output, error = run("show", "--production", "sdlc", "--list", str(self.path))
+        self.assertEqual((code, error), (0, ""))
+        self.assertEqual(output.splitlines()[0], "sdlc/C1 Unit change")
+        self.assertEqual(self.path.read_bytes(), before)
+
+    def test_verdict_accepts_both_forms_and_keeps_the_stored_row_identity(self) -> None:
+        before = self.path.read_bytes()
+        for identity in ("sdlc/C1", "natedev/C1"):
+            for explicit in (False, True):
+                with self.subTest(identity=identity, explicit=explicit):
+                    _ = self.path.write_bytes(before)
+                    arguments = ["verdict", "--production", "sdlc", "--row", identity, "--verdict", "works"]
+                    if explicit:
+                        arguments.extend(("--list", str(self.path)))
+                    code, output, error = run(*arguments)
+                    self.assertEqual((code, output, error), (0, "sdlc/C1 landed\n", ""))
+                    self.assertEqual(change_review.review_rows(self.path)[-1]["#"], "C1")
+                    self.assertNotIn("sdlc/C1", self.path.read_text())
+                    self.assertEqual(run(*arguments), (0,
+                        f"sdlc/C1 already has this verdict ({change_review.today()}); the list is unchanged\n"
+                        + "sdlc/C1 landed\n", ""))
+
+    def test_verdict_resolves_the_displayed_id_from_the_selected_legacy_list(self) -> None:
+        legacy = self.root / "legacy-review.md"
+        _ = self.path.rename(legacy)
+        _ = self.doc.write_text(f"- **Change review:** `{legacy}`\n")
+        selected = change_review.scope_list(self.doc)
+        queue = change_review.change_queue(selected, self.doc)
+        self.assertEqual(queue.entries[0].item["#"], "sdlc/C1")
+        self.assertEqual(run("verdict", "--production", "sdlc", "--row", "sdlc/C1", "--verdict", "works"),
+                         (0, "sdlc/C1 landed\n", ""))
+        self.assertEqual(change_review.review_rows(legacy)[-1]["#"], "C1")
+        self.assertFalse(self.path.exists())
+
+    def test_qualified_verdict_skips_an_unrelated_list_with_invalid_utf8(self) -> None:
+        broken = self.root / "change-review - unrelated.md"
+        _ = broken.write_bytes(b"\xff")
+        code, output, error = run("verdict", "--production", "sdlc", "--row", "sdlc/C1", "--verdict", "works")
+        self.assertEqual((code, output), (0, "sdlc/C1 landed\n"))
+        self.assertEqual(len(error.splitlines()), 1)
+        self.assertIn(f"change review: {broken}:", error)
+        self.assertEqual(change_review.review_rows(self.path)[-1]["#"], "C1")
+        self.assertEqual(broken.read_bytes(), b"\xff")
+
+    def test_mark_important_resolves_the_selected_legacy_list_for_the_current_showrunner(self) -> None:
+        legacy = self.root / "legacy-review.md"
+        _ = self.path.rename(legacy)
+        _ = self.doc.write_text(f"- **Change review:** `{legacy}`\n")
+        session = next(member.current_session for member in staff.snapshot().rows if member.name == "sdlc")
+        with mock.patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": session}):
+            code, output, error = run("mark-important", "--row", "sdlc/C1")
+        self.assertEqual((code, error), (0, ""))
+        self.assertIn("C1", output)
+        row = next(item for item in change_review.pending(legacy) if item["#"] == "C1")
+        self.assertEqual(urgency.parse_cell(row[change_review.URGENCY])[0].level, urgency.USER)
+        self.assertFalse(self.path.exists())
+
+    def test_a_repeated_number_refuses_an_ambiguous_display_id(self) -> None:
+        other = self.root / "change-review - earlier.md"
+        _ = other.write_bytes(self.path.read_bytes())
+        with self.assertRaisesRegex(change_review.ChangeReviewError, "matches several lists"):
+            _ = change_review.resolve_row("sdlc/C1", production="sdlc")
+        target = change_review.resolve_row("sdlc/C1", review_list=self.path)
+        self.assertEqual((target.path, target.row), (self.path, "C1"))
+
+    def test_add_keeps_the_legacy_prerequisite_identity_relative_to_the_receiving_list(self) -> None:
+        legacy = self.root / "legacy-review.md"
+        rows = self.path.read_text().replace("| C1 |", "| C41 |")
+        _ = self.path.write_text(rows)
+        _ = legacy.write_text(rows)
+        _ = self.doc.write_text(f"- **Change review:** `{legacy}`\n")
+        code, output, error = run("add", "--production", "sdlc", "--repo", str(self.root),
+                                  "--change", "After the legacy row", "--check", "Read", "--see", "Text",
+                                  "--urgency", "blocks", "--after", "sdlc/C41")
+        self.assertEqual((code, output), (0, "C42\n"), error)
+        added = next(row for row in change_review.pending(self.path) if row["#"] == "C42")
+        self.assertEqual(urgency.parse_cell(added[change_review.URGENCY])[1], "legacy-review/C41")
+        self.assertEqual(legacy.read_text(), rows)
+        queue = change_review.change_queue(legacy, self.doc)
+        keys = {entry.key: entry.after for entry in queue.entries}
+        self.assertIn("C41", keys)
+        self.assertIn("natedev/C41", keys)
+        self.assertEqual(keys["natedev/C42"], "C41")
+        ordered = [entry.key for entry in urgency.queue_order(queue.entries, queue.name)]
+        self.assertLess(ordered.index("C41"), ordered.index("natedev/C42"))
+
+    def test_row_edits_and_prerequisites_accept_the_responsible_showrunner_id(self) -> None:
+        for action, arguments in (("edit", ("--change", "Edited", "--check", "Read", "--see", "Text")),
+                                  ("mark-important", ()), ("set-kind", ("--kind", "Read only"))):
+            with self.subTest(action=action):
+                code, _, error = run(action, "--production", "sdlc", "--list", str(self.path),
+                                     "--row", "sdlc/C1", *arguments)
+                self.assertEqual((code, error), (0, ""))
+                self.assertIn("C1", [row["#"] for row in change_review.pending(self.path)])
+                self.assertNotIn("sdlc/C1", self.path.read_text())
+        code, output, error = run("add", "--production", "sdlc", "--list", str(self.path),
+                                  "--change", "After it", "--check", "Read", "--see", "Text", "--after", "sdlc/C1")
+        self.assertEqual((code, output, error), (0, "C3\n", ""))
+        self.assertIn("after C1", change_review.pending(self.path)[-1]["Urgency"])
 
 
 class ActionTest(unittest.TestCase):
@@ -1595,13 +1788,14 @@ class ActionTest(unittest.TestCase):
     def test_add_takes_the_next_number_and_fills_the_mac_build_column_only_where_the_table_has_one(self) -> None:
         repo, *commits = origin_commits(self.path.parent)
         merged = commits[-1][:8]
-        self.assertEqual(run("add", "--repo", str(repo), "--production", DOC, "--list", str(self.path), "--change", "Tabs | spaces", "--check", "Look", "--see", "It",
-                             "--merged", merged), (0, "C81\n", ""))
-        day = change_review.today().isoformat()
-        self.assertIn(f"| C81 | Tabs \\| spaces | {day} · {merged} | not yet | Look. You see: It | {DEMO_ID} |  |\n\n## Questions",
+        with mock.patch.object(change_review, "now", return_value=ADD_TIME):
+            self.assertEqual(run("add", "--repo", str(repo), "--production", DOC, "--list", str(self.path), "--change", "Tabs | spaces", "--check", "Look",
+                                 "--see", "It", "--merged", merged), (0, "C81\n", ""))
+        self.assertIn(f"| C81 | Tabs \\| spaces | 2026-11-13 16:20 · {merged} | not yet | Look. You see: It | {DEMO_ID} |  |\n\n## Questions",
                       self.path.read_text(encoding="utf-8"))
-        self.assertEqual(run("add", "--production", DOC, "--list", str(self.fresh), "--change", "A", "--check", "B", "--see", "C")[1], "C1\n")
-        self.assertIn(f"| C1 | A | {day} | B. You see: C |", self.fresh.read_text(encoding="utf-8"))
+        with mock.patch.object(change_review, "now", return_value=ADD_TIME):
+            self.assertEqual(run("add", "--production", DOC, "--list", str(self.fresh), "--change", "A", "--check", "B", "--see", "C")[1], "C1\n")
+        self.assertIn("| C1 | A | 2026-11-13 16:20 | B. You see: C |", self.fresh.read_text(encoding="utf-8"))
 
     def test_add_refuses_a_second_row_for_the_same_merge_and_change_in_a_short_or_long_hash(self) -> None:
         repo, first, second = origin_commits(self.path.parent)
@@ -1661,16 +1855,26 @@ class ActionTest(unittest.TestCase):
         repo, *commits = origin_commits(self.path.parent)
         script = str(Path(change_review.__file__))
         python = str(Path(__file__).resolve().parents[1] / "lib/py")
-        for path, first in ((self.fresh, 1), (self.path, 81)):
-            numbers = [subprocess.run([python, script, "add", "--repo", str(repo), "--production", DOC, "--list", str(path),
-                                       "--change", item.change, "--check", item.check, "--see", item.see,
-                                       "--merged", commits[-1][:8]],
-                                      capture_output=True, text=True, check=True).stdout.strip()
-                       for item in changes]
-            self.assertEqual(numbers, [f"C{number}" for number in range(first, first + len(changes))])
-            rows = [row for row in change_review.pending(path) if row["#"] in numbers]
-            self.assertEqual([(row["#"], row["Change"], row[change_review.CHECK]) for row in rows],
-                             [(number, item.change, item.how()) for number, item in zip(numbers, changes)])
+        environment = os.environ.copy()
+        with ForkChildren() as children:
+            for path, first in ((self.fresh, 1), (self.path, 81)):
+                numbers: list[str] = []
+                for item in changes:
+                    arguments = ["add", "--repo", str(repo), "--production", DOC, "--list", str(path),
+                                 "--change", item.change, "--check", item.check, "--see", item.see,
+                                 "--merged", commits[-1][:8]]
+                    if path == self.fresh and not numbers:
+                        result = subprocess.run([python, script, *arguments], capture_output=True,
+                                                text=True, check=True, timeout=TEST_HANG_GUARD_SECS)
+                    else:
+                        child = children.start(lambda arguments=arguments: run_review_child(arguments, environment))
+                        result = child.result()
+                        result.check_returncode()
+                    numbers.append(result.stdout.strip())
+                self.assertEqual(numbers, [f"C{number}" for number in range(first, first + len(changes))])
+                rows = [row for row in change_review.pending(path) if row["#"] in numbers]
+                self.assertEqual([(row["#"], row["Change"], row[change_review.CHECK]) for row in rows],
+                                 [(number, item.change, item.how()) for number, item in zip(numbers, changes)])
 
     def test_add_refuses_an_empty_or_multi_line_part_and_writes_nothing(self) -> None:
         for change, check, see in (("", "Look", "It"), ("A", " ", "It"), ("A\nB", "Look", "It"), ("A", "Look", "")):
@@ -1764,7 +1968,7 @@ class ActionTest(unittest.TestCase):
 
     def test_show_prints_only_the_first_row_to_review_and_leaves_the_list_as_it_is(self) -> None:
         self.assertEqual(run("show", "--list", str(self.path)), (0, (
-            "C76 Panels keep shields\n  How to check: Launch Hana\n  Merged: 2026-10-14\n  On the Mac build: not yet\n\n"
+            "change-review/C76 Panels keep shields\n  How to check: Launch Hana\n  Merged: 2026-10-14\n  On the Mac build: not yet\n\n"
             + "1 more to review\n"), ""))
         self.assertEqual(self.path.read_text(encoding="utf-8"), LIST)
         self.assertEqual(run("show", "--list", str(self.fresh)), (0, "nothing to review\n", ""))
@@ -1778,7 +1982,9 @@ class ActionTest(unittest.TestCase):
             return out.strip()
 
         def shown() -> str:
-            return run("show", "--list", str(self.fresh))[1].split(" ", 1)[0]
+            identity = run("show", "--list", str(self.fresh))[1].split(" ", 1)[0]
+            self.assertTrue(identity.startswith("demo/"))
+            return identity.rpartition("/")[2]
 
         normal = add()
         self.assertEqual(shown(), normal)
@@ -1866,9 +2072,9 @@ class ActionTest(unittest.TestCase):
                 before = self.path.read_bytes()
                 code, output, error = run(*command)
                 self.assertEqual((code, error), (0, ""))
-                self.assertIn("C76 already has this verdict (", output)
-                self.assertIn("C76 landed\n" if verdict == "works" else
-                              "C76 returns to its unit (merged 2026-10-14)\n", output)
+                self.assertIn("change-review/C76 already has this verdict (", output)
+                self.assertIn("change-review/C76 landed\n" if verdict == "works" else
+                              "change-review/C76 returns to its unit (merged 2026-10-14)\n", output)
                 self.assertIn(f"removed {folder}\n", output)
                 self.assertFalse(folder.exists())
                 self.assertNotIn(os.path.realpath(folder), scratch.holds())
@@ -1903,7 +2109,7 @@ class ActionTest(unittest.TestCase):
             self.assertIsInstance(repeated.merged, change_review.MergeNotRecorded)
         code, output, error = run("verdict", "--production", DOC, "--list", str(self.path), "--row", "C76", "--verdict", "not yet")
         self.assertEqual((code, error), (0, ""))
-        self.assertIn("C76 returns to its unit (merged not recorded)", output)
+        self.assertIn("change-review/C76 returns to its unit (merged not recorded)", output)
         _ = self.path.write_text(LIST)
         earlier = change_review.record_verdict(self.path, "C70", "works", date(2026, 10, 16), PRODUCTION)
         self.assertIsInstance(earlier, change_review.VerdictAlreadyRecorded)
@@ -1913,9 +2119,9 @@ class ActionTest(unittest.TestCase):
 
     def test_works_or_fine_lands_and_any_other_verdict_returns_to_the_unit(self) -> None:
         self.assertEqual(run("verdict", "--production", DOC, "--list", str(self.path), "--row", "C76", "--verdict", "fine"),
-                         (0, "C76 landed\n", ""))
+                         (0, "change-review/C76 landed\n", ""))
         self.assertEqual(run("verdict", "--production", DOC, "--list", str(self.path), "--row", "C77", "--verdict", "still the old font | x"),
-                         (0, "C77 returns to its unit (merged 2026-10-14)\n", ""))
+                         (0, "change-review/C77 returns to its unit (merged 2026-10-14)\n", ""))
         self.assertIn("| C77 | Fonts redraw | still the old font \\| x |", self.path.read_text(encoding="utf-8"))
         self.assertTrue(change_review.lands("Works: it does"))
         self.assertFalse(change_review.lands("not fine"))
@@ -1926,9 +2132,9 @@ class ActionTest(unittest.TestCase):
             self.assertFalse(change_review.lands(verdict), verdict)
 
     def test_verdict_start_sets_the_printed_outcome_and_keeps_the_users_words(self) -> None:
-        for verdict, outcome in (("okay c17 works", "C76 landed"),
-                                 ("works: checked, no empty cwd", "C76 landed"),
-                                 ("not works", "C76 returns to its unit (merged 2026-10-14)")):
+        for verdict, outcome in (("okay c17 works", "change-review/C76 landed"),
+                                 ("works: checked, no empty cwd", "change-review/C76 landed"),
+                                 ("not works", "change-review/C76 returns to its unit (merged 2026-10-14)")):
             with self.subTest(verdict=verdict):
                 _ = self.path.write_text(LIST, encoding="utf-8")
                 self.assertEqual(run("verdict", "--production", DOC, "--list", str(self.path), "--row", "C76",
@@ -1945,9 +2151,9 @@ class ActionTest(unittest.TestCase):
         _ = change_review.append_rows(self.fresh, [Visible(name, "B", "C") for name in "XYZ"], date(2026, 10, 15), "",
                                       PRODUCTION, record=staff.snapshot())
         self.assertEqual(run("verdict", "--production", DOC, "--list", str(self.fresh), "--row", "C1", "--verdict", "works"),
-                         (0, f"C1 landed\nremoved {demo}\n", ""))
+                         (0, f"demo/C1 landed\nremoved {demo}\n", ""))
         self.assertEqual(run("verdict", "--production", DOC, "--list", str(self.fresh), "--row", "C2", "--verdict", "no"),
-                         (0, f"C2 returns to its unit (merged 2026-10-15)\nremoved {copy}\n", ""))
+                         (0, f"demo/C2 returns to its unit (merged 2026-10-15)\nremoved {copy}\n", ""))
         self.assertFalse(demo.exists() or copy.exists())
         self.assertTrue(kept.is_dir())
 
@@ -2113,7 +2319,7 @@ class CommitTest(unittest.TestCase):
                 if held:
                     _ = lock.write_text("", encoding="utf-8")
                 code, output, error = run(*command)
-                self.assertEqual((code, output), (0, f"{row} landed\n"))
+                self.assertEqual((code, output), (0, f"demo/{row} landed\n"))
                 if held:
                     self.assertIn(f"change review: {self.path} written but not committed: ", error)
                     self.assertEqual(len(error.splitlines()), 1)

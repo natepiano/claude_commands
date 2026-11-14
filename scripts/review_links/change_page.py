@@ -122,6 +122,12 @@ class StoredDeliverySlots(TypedDict, total=False):
     user_answer: StoredUserAnswer
 
 
+class SentCloseoutAlerts(TypedDict):
+    review_list: str
+    row: str
+    messages: list[str]
+
+
 class StoredUserAnswer(TypedDict):
     saved: bool
     source: str
@@ -231,6 +237,25 @@ class DeliveryStatus:
 
     def path(self, page: ReviewPage, row: str) -> Path:
         return change_routing.delivery_path(self.root, page.review_list, row)
+
+    def notify_closeout_failure(self, page: ReviewPage, row: str, message: str,
+                                recipients: tuple[staff.StaffId, ...]) -> None:
+        """Send each row's failure once, including across server restarts."""
+        if not recipients:
+            return
+        name = self.path(page, row).name.removeprefix(DELIVERY_PREFIX)
+        path = self.root / (".review-link-closeout-alert-" + name + ".json")
+        with self.locked():
+            try:
+                sent: SentCloseoutAlerts = cast(SentCloseoutAlerts, json.loads(path.read_text(encoding="utf-8")))
+            except FileNotFoundError:
+                sent = {"review_list": str(page.review_list.resolve()), "row": row, "messages": []}
+            if message in sent["messages"]:
+                return
+            for identity in recipients:
+                send_to_staff(identity, SENDER, message)
+            sent["messages"].append(message)
+            atomic_file.write_bytes_atomic(path, (json.dumps(sent) + "\n").encode("utf-8"), mode=0o600)
 
     def slots(self, page: ReviewPage, row: str) -> DeliverySlots:
         try:
@@ -375,10 +400,13 @@ def document(content: str) -> bytes:
 <title>Changes to review</title><style>
 :root{color-scheme:light dark;font:17px/1.55 system-ui,sans-serif}
 body{margin:0}main{max-width:680px;margin:auto;padding:40px 16px 64px}
-.id{opacity:.7;font-size:14px}.kind{font-weight:600}
 h1{font-size:26px;line-height:1.25;margin:0 0 16px}section h1,h2{font-size:20px;line-height:1.3}
 h2{margin:16px 0}p{white-space:pre-wrap;margin:16px 0}main{overflow-wrap:anywhere}
-section h2{font-size:17px}section details{margin:16px 0}.secondary-actions{margin-top:8px}
+section h2{font-size:17px}section details{margin:16px 0}
+.answer-actions{display:flex;flex-wrap:wrap;gap:8px}.answer-actions button{margin:0}
+@media (max-width:480px){.answer-actions{gap:6px}.answer-actions button{font-size:15px;padding:6px 8px}}
+.change-details{display:grid;grid-template-columns:max-content 1fr;column-gap:1ch;margin:16px 0 0;font:14px/1.45 ui-monospace,monospace;opacity:.8}
+.change-details dd{margin:0}
 ul,ol{margin:16px 0;padding-left:28px;overflow-wrap:anywhere}
 pre{white-space:pre-wrap;overflow-wrap:anywhere;border:1px solid #8886;border-radius:6px;padding:12px;font:14px/1.45 ui-monospace,monospace}
 section+section{border-top:1px solid #8886;margin-top:36px;padding-top:28px}
@@ -416,14 +444,40 @@ def answer_form(page: ReviewPage, notice: AnswerNotice, feedback_rows: int) -> s
 <label for="feedback-{row_id}">Comment, question or feedback</label>
 <textarea id="feedback-{row_id}" name="feedback" rows="{feedback_rows}">
 {html.escape(notice.feedback)}</textarea>
-<div>{"".join(buttons[:2])}</div><div class="secondary-actions"><div>{"".join(buttons[2:3])}</div><div class="feedback-actions">{"".join(buttons[3:])}</div></div></form>'''
+<div class="answer-actions">{"".join(buttons)}</div></form>'''
+
+
+_COMMIT = re.compile(r"^[0-9a-f]{7,40}$")
+_ADDED = re.compile(r"^(\d{4}-\d{2}-\d{2})(?: (\d{2}:\d{2}))?$")
+
+
+@dataclass(frozen=True)
+class ChangeDetails:
+    """The facts shown under a change's buttons; an empty value is unknown."""
+    change: str
+    date: str
+    time: str
+    commit: str
+    kind: str
+
+    @classmethod
+    def read(cls, row: dict[str, str], key: str) -> ChangeDetails:
+        """Split the Merged cell `<date>[ <HH:MM>][ · <commit>]` into its parts."""
+        parts = [part.strip() for part in row.get("Merged", "").split(" · ")]
+        added = _ADDED.match(parts[0])
+        commit = parts[-1] if len(parts) > 1 and _COMMIT.match(parts[-1]) else ""
+        return cls(key, added[1] if added else "", (added[2] or "") if added else "", commit, row.get(change_review.KIND, ""))
+
+    def lines(self) -> list[tuple[str, str]]:
+        return [(label, value) for label, value in (("change", self.change), ("date", self.date), ("time", self.time),
+                                                    ("commit", self.commit), ("kind", self.kind)) if value]
 
 
 def change_details(row: dict[str, str], key: str) -> str:
-    """Keep change metadata inside one closed disclosure."""
-    return ('<details><summary>Details</summary>'
-            + f'<div class="id">{html.escape(key)} · {html.escape(row.get("Merged", ""))}</div>'
-            + f'<p class="kind">{html.escape(row.get(change_review.KIND) or "Kind not recorded")}</p></details>')
+    """Show the change's facts as aligned lines, always open."""
+    return ('<dl class="change-details">'
+            + "".join(f"<dt>{label}:</dt><dd>{html.escape(value)}</dd>" for label, value in ChangeDetails.read(row, key).lines())
+            + "</dl>")
 
 
 def fallback_answer(page: ReviewPage, notice: AnswerNotice) -> bytes:
@@ -555,9 +609,9 @@ def render(page: ReviewPage, delivery: DeliveryStatus, notice: AnswerNotice = NO
         sections.append(f'''<section id="{row_id}">
 {alert}
 <h1>{html.escape(row["Change"])}</h1>
-{change_details(row, row["#"])}
 <h2>{proof_title}</h2>{review_text_html(row[change_review.CHECK], "pre")}
-{question_html(question)}{answer}</section>''')
+{question_html(question)}{answer}
+{change_details(row, change_review.display_id(row, route_owner(page, row).tab))}</section>''')
     if notice.reason and not notice.row:
         sections.insert(0, f'<p role="alert">Not saved: {html.escape(notice.reason)}</p>')
     queue = next_item.change_queue(page.production)
@@ -686,7 +740,7 @@ def close_feature_log(page: ReviewPage, doc: Path, row_id: str, verdict: str) ->
         raise RuntimeError(error.diagnostic) from error
 
 
-def closeout_before_save(page: ReviewPage, doc: Path, row_id: str, verdict: str) -> None:
+def closeout_before_save(page: ReviewPage, doc: Path, row_id: str, verdict: str, status: DeliveryStatus) -> None:
     """Keep the row open and notify its showrunner when feature-log closeout fails."""
     try:
         close_feature_log(page, doc, row_id, verdict)
@@ -695,8 +749,7 @@ def closeout_before_save(page: ReviewPage, doc: Path, row_id: str, verdict: str)
         try:
             row = answer_row(page, row_id)
             owner = route_owner(page, row)
-            for identity in owner.showrunner_recipients:
-                send_to_staff(identity, SENDER, message)
+            status.notify_closeout_failure(page, row_id, message, owner.showrunner_recipients)
         except SEND_ERRORS as delivery_error:
             raise FeatureLogFailed(f"{message}\nNotification failed: {delivery_error}") from delivery_error
         raise FeatureLogFailed(message) from error
@@ -761,7 +814,7 @@ def submit(page: ReviewPage, body: str, status: DeliveryStatus, *,
         return NoMessageDelivery()
     doc = row_production(page, row)
     recipients = verdict_recipients(owner, verdict)
-    closeout_before_save(page, doc, row_id, verdict)
+    closeout_before_save(page, doc, row_id, verdict, status)
     attempt = status.begin(page, row_id, "verdict", recipients=recipients) if recipients else ""
     try:
         production = change_review.production_doc(unit_lookup.doc_owner(page.production, staff.snapshot()).name)
@@ -778,7 +831,8 @@ def submit(page: ReviewPage, body: str, status: DeliveryStatus, *,
 
 
 def review_message(page: ReviewPage, row: dict[str, str], headline: str, *details: str) -> str:
-    return "\n".join((f"Change review {row['#']}: {headline}", f"List: {page.review_list}",
+    shown = change_review.display_id(row, route_owner(page, row).tab)
+    return "\n".join((f"Change review {shown}: {headline}", f"List: {page.review_list}",
                       f"Production: {unit_lookup.doc_owner(page.production, staff.snapshot()).name}", f"Change: {row['Change']}", *details))
 
 
@@ -982,6 +1036,11 @@ def publish_browser(initial: str = "") -> str:
     return url
 
 
+def page_url() -> str:
+    """Publish the Changes page and return its path under the review root."""
+    return urlsplit(publish_browser()).path
+
+
 def main(arguments: list[str]) -> int:
     if arguments and arguments[0] == "answer-question":
         parser = argparse.ArgumentParser(description="Answer an open question about a change.")
@@ -991,15 +1050,17 @@ def main(arguments: list[str]) -> int:
         _ = parser.add_argument("--question", required=True)
         _ = parser.add_argument("--text", required=True)
         args = parser.parse_args(arguments[1:])
-        page = ReviewPage(cast(Path, args.list).expanduser(), change_review.production_doc(cast(str, args.production)),
-                          (cast(str, args.row),), "")
         try:
+            target = change_review.resolve_row(cast(str, args.row), production=cast(str, args.production),
+                                               review_list=cast(Path, args.list))
+            shown = change_review.row_display_id(target.path, target.row)
+            page = ReviewPage(target.path, change_review.production_doc(cast(str, args.production)), (target.row,), "")
             changed = DeliveryStatus(review_link.review_root()).answer_question(
                 page, page.rows[0], cast(str, args.question), cast(str, args.text))
         except (OSError, ValueError, change_review.ChangeReviewError, Refusal, subprocess.SubprocessError) as error:
             print(f"change page: {error}", file=sys.stderr)
             return 1
-        print(f"Answered {page.rows[0]}" if changed else f"{page.rows[0]} already has this answer")
+        print(f"Answered {shown}" if changed else f"{shown} already has this answer")
         return 0
     parser = argparse.ArgumentParser(description=__doc__)
     _ = parser.add_argument("rows", nargs="*")
@@ -1011,13 +1072,17 @@ def main(arguments: list[str]) -> int:
     review_list = cast(Path | None, args.list)
     try:
         if not rows:
-            print(publish_browser())
+            from scripts.review_links import console
+
+            print(console.publish())
             return 0
         if production is None:
             raise ValueError("pass --production for an older selected-row link")
         doc = change_review.production_doc(production)
-        path = review_list.expanduser() if review_list else change_review.production_list(production)
-        print(publish(doc, path, rows))
+        targets = [change_review.resolve_row(row, production=production, review_list=review_list) for row in rows]
+        if any(target.path.resolve() != targets[0].path.resolve() for target in targets):
+            raise ValueError("selected rows must belong to one review list")
+        print(publish(doc, targets[0].path, [target.row for target in targets]))
     except (OSError, ValueError, change_review.ChangeReviewError, subprocess.SubprocessError, Refusal) as error:
         print(f"change page: {error}", file=sys.stderr)
         return 1

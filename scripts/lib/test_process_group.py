@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from scripts.lib.checkout_test_support import copy_startup
+
 import ast
 from collections.abc import Callable
 from contextlib import redirect_stderr
@@ -213,6 +215,7 @@ class ShellProcessGroupTests(PrivateGroupFixture):
             destination = self.root / "scripts" / name
             destination.parent.mkdir(parents=True, exist_ok=True)
             _ = shutil.copy2(scripts / name, destination)
+        copy_startup(self.root)
         home = self.root / "home"
         home.mkdir()
         self.environment = {**os.environ, **config_environment(self.root / "config"),

@@ -41,13 +41,13 @@ from scripts.lib import conf, models_registry, operation_deadline
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.transcripts import open_transcript, transcript_paths
 from scripts.message import session_send
-from scripts.agents import member_account, pane_record
+from scripts.agents import member_account, pane_record, shutdown_record
 from scripts.agents.launch_names import LaunchNames, LaunchNamesNotRead
 from scripts.agents.codex_trust import trust_arguments
 from scripts.herdr import pane_launch
 from scripts.production import staff
 from scripts.lib.resume_message import (
-    AccountMove, NO_ACCOUNT_MOVE, BusyPass, NO_OWN_PASS, launcher_prompt,
+    AccountMove, NO_ACCOUNT_MOVE, BusyPass, NO_OWN_PASS, WorkersHeld, launcher_prompt, worker_mode,
     ResumeWorkers as ResumeWorkers,
     NO_WORKERS as NO_WORKERS,
     resume_message as resume_message,
@@ -1082,6 +1082,18 @@ def _unrecorded_codex_launch(identity: str) -> pane_record.PaneLaunch | SessionN
 def _resume(session: str, *, why: str = "resumed by name", to: str | None = None, requester: str = "",
             client: herdr.Herdr | herdr.LaunchClientSource = herdr.LaunchClientSource.NEW) -> ResumeResult:
     names = LaunchNames.read()
+    result = _resume_from_names(session, names, why=why, to=to, requester=requester, client=client)
+    if isinstance(result, ClaudeUp):
+        members = [row for row in names.tab_record.rows
+                   if row.current_session == result.session_id or row.id == session or row.name == session]
+        if len(members) == 1:
+            with staff.row_operation(str(members[0].id)):
+                shutdown_record.remove_started([str(members[0].id)])
+    return result
+
+
+def _resume_from_names(session: str, names: LaunchNames, *, why: str, to: str | None, requester: str,
+                       client: herdr.Herdr | herdr.LaunchClientSource) -> ResumeResult:
     record = names.tab_record
     member = record.by_member_reference(session)
     matches = [row for row in record.rows if row.name == session or row == member]
@@ -1175,10 +1187,20 @@ def _resume_once(session: str, *, why: str, to: str | None = None, requester: st
         entry = original.entry if original is not None else None
         if original is not None:
             source_client = client if original.path == pane_record.record_path(client.session) else herdr.Herdr(original.path.stem)
-            source_matches = pane_launch.reference_panes(pane_launch.launch_reference(original.entry, names.tab_record),
-                names.tab_record, source_client, {original.entry["pane_id"]: original.entry})
+            locations = [dict(pane) for pane in source_client.panes()]
+            evidence = pane_launch.NativePaneEvidence(locations, source_client.scan_row_panes(names.tab_record, locations))
+            reference = pane_launch.launch_reference(original.entry, names.tab_record)
+            source_matches = pane_launch.reference_panes(reference, names.tab_record, source_client,
+                {original.entry["pane_id"]: original.entry}, evidence=evidence)
             if len(source_matches) == 1:
                 source_pane = pane_launch.ResumeSourcePane(str(source_matches[0]["pane_id"]))
+            elif not any(pane["pane_id"] == original.entry["pane_id"] for pane in locations):
+                source_pane = pane_launch.ResumeSourcePane(original.entry["pane_id"])
+            elif any(pane["pane_id"] == original.entry["pane_id"]
+                     for owner_id, panes in evidence.scan.found.items()
+                     if not isinstance(reference, pane_launch.StaffLaunchReference) or owner_id != reference.id
+                     for pane in panes):
+                source_pane = pane_launch.ResumeSourceAbsent.OTHER_OWNER
         if entry is None and row is None:
             recovered = _unrecorded_codex_launch(identity)
             if isinstance(recovered, SessionNotFound):
@@ -1204,6 +1226,9 @@ def _resume_once(session: str, *, why: str, to: str | None = None, requester: st
             if row is not None and isinstance(running, ClaudeUp) and isinstance(running.pid, int) and running.account != "unknown account":
                 member_account.repair_home(row, kind, running.pid)
             return running
+        mode = worker_mode() if row is not None else NO_WORKERS
+        if isinstance(mode, WorkersHeld) and row is not None and row.kind == "worker" and kind == "codex":
+            return ResumeFailed(identity, "no-worker mode keeps Codex workers stopped")
         if entry is None:
             if row is None:
                 return SessionNotFound(session)
@@ -1254,6 +1279,11 @@ def _resume_once(session: str, *, why: str, to: str | None = None, requester: st
                 destination = client.producer_row_tab(str(row.id), row.name, space, record=names.tab_record)
                 tab = (herdr.TabSession(destination.pane, row.name, "", identity)
                        if isinstance(destination, herdr.ExistingPane) else SessionNotFound(identity))
+        elif row is not None and isinstance(tab, SessionNotFound):
+            own_pane = client.saved_row_tab(str(row.id), row.name, herdr.row_workspace(row, names.tab_record, row.name),
+                                             record=names.tab_record)
+            if isinstance(own_pane, herdr.ExistingPane):
+                tab = herdr.TabSession(own_pane.pane, row.name, "", identity)
         if isinstance(tab, SessionNotFound):
             space = herdr.row_workspace(row or STAFF_ROOT, names.tab_record, entry["name"])
             with herdr.restore_staff(names.tab_record, labels=names.labels):
@@ -1272,7 +1302,7 @@ def _resume_once(session: str, *, why: str, to: str | None = None, requester: st
                     _ = client.retitle(tab.pane_id, entry["name"])
             except (OSError, ValueError, herdr_types.HerdrFailure) as error:
                 print(f"{identity}: title anomaly: {error}", file=sys.stderr)
-        workers = NO_WORKERS
+        workers: ResumeWorkers | WorkersHeld = NO_WORKERS
         own = NO_OWN_PASS
         detached = ""
         from scripts.production import worker
@@ -1284,6 +1314,8 @@ def _resume_once(session: str, *, why: str, to: str | None = None, requester: st
                 run = worker_panes.worker_run(row, record=names.tab_record)
                 own = worker.own_pass(row, names.tab_record, run=worker_panes.DispatchRun(run))
                 detached = detached_runs.resume_context(run / detached_runs.DETACHED_RUNS_DIR, row.name)
+            elif isinstance(mode, WorkersHeld):
+                workers = mode
             elif row is not None:
                 workers = worker.resume_workers(row.id, names.tab_record)
         except (OSError, ValueError) as error:

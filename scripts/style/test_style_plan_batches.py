@@ -230,13 +230,23 @@ class StylePlanTests(StylePlanFixture):
                     self.assertEqual(style_plan.ticket_review_scope(self.repo, ticket, (changed,)),
                                      style_plan.ReviewScope.PRODUCTION)
 
-    def test_verification_refuses_changes_in_another_crate(self) -> None:
+    def test_verification_runs_each_package_the_changes_touch(self) -> None:
         ticket_id = self.verification_ticket()
         _ = (self.unit / self.sources[2]).write_text("pub fn another_crate() {}\n")
-        with mock.patch.object(style_plan, "run_verification_step") as runner:
-            with self.assertRaisesRegex(style_ledger.LedgerError, "crosses crate boundaries"):
-                _ = style_plan.verify_ticket(self.unit, ticket_id)
-            runner.assert_not_called()
+        runner = mock.Mock(return_value=subprocess.CompletedProcess([], 0))
+        with mock.patch.object(style_plan, "run_verification_step", runner):
+            self.assertEqual(style_plan.verify_ticket(self.unit, ticket_id), 0)
+        self.assertEqual(runner.call_args_list, [mock.call(self.unit, stage, package)
+                                               for stage in ("check", "lint", "test") for package in ("alpha", "beta")])
+
+    def test_verification_of_a_root_cargo_change_runs_the_workspace(self) -> None:
+        ticket_id = self.verification_ticket()
+        _ = (self.unit / self.sources[2]).write_text("pub fn another_crate() {}\n")
+        _ = (self.unit / "Cargo.lock").write_text("version = 4\n")
+        runner = mock.Mock(return_value=subprocess.CompletedProcess([], 0))
+        with mock.patch.object(style_plan, "run_verification_step", runner):
+            self.assertEqual(style_plan.verify_ticket(self.unit, ticket_id), 0)
+        self.assertEqual(runner.call_args_list, [mock.call(self.unit, stage, "") for stage in ("check", "lint", "test")])
 
     def test_verification_after_fast_forward_counts_only_the_tickets_own_paths(self) -> None:
         ticket_id = self.verification_ticket()

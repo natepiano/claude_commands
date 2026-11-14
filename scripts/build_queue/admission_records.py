@@ -18,7 +18,7 @@ from pathlib import Path
 from scripts.build_queue import progress_profile as progress
 from scripts.build_queue import placement
 from scripts.build_queue.scope_activity import (EmptyBuildScope, IdleService, LiveBuildRun, NoLiveBuildRun,
-    NotServiceSlice, RunningServiceJob, ScopeProcesses)
+    NotServiceSlice, RunningServiceJob, ScopeProcesses, ServiceJobState)
 
 from scripts.buildlog import parse
 from scripts.lib import conf
@@ -52,7 +52,6 @@ class AdmissionTiming:
 @dataclass(frozen=True)
 class PressurePolicy:
     full_avg10_limit: float
-    swap_used_limit: float
     some_avg10_limit: float
 
 
@@ -75,6 +74,7 @@ class AdmissionPolicy:
     peak_hold: PeakHold
     safety_bytes: int = 3 * GIB
     progress_lookahead_percent: float = field(kw_only=True)
+    agent_swap_share_percent: int = field(default=100, kw_only=True)
 
 
 @dataclass(frozen=True)
@@ -422,13 +422,30 @@ class CompilerServiceMemory(MeasuredMemory):
 
 
 @dataclass(frozen=True)
+class ServiceJobStateNotRecorded:
+    pass
+
+
+@dataclass(frozen=True)
 class UnownedSliceMemory(MeasuredMemory):
     diagnostic: str = ""
     cgroup: str = ""
     owner: str = ""
     activity: ScopeProcesses | EmptyBuildScope = EmptyBuildScope()
     pid: int | PidNotRecorded = field(kw_only=True)
-    job_state: RunningServiceJob | IdleService | NotServiceSlice = NotServiceSlice()
+    # Keep this wire union stable for pinned clients.
+    job_state: RunningServiceJob | IdleService | NotServiceSlice = field(
+        default=NotServiceSlice(), metadata={"acquisition_unused": True})
+    # New service states belong in this optional field.
+    service_job_state: ServiceJobState | ServiceJobStateNotRecorded = field(
+        default_factory=ServiceJobStateNotRecorded, kw_only=True, metadata={"acquisition_unused": True})
+
+
+def recorded_service_state(memory: CompilerServiceMemory | UnownedSliceMemory) -> ServiceJobState:
+    """Read the current state, with the legacy state for older snapshots."""
+    if isinstance(memory, UnownedSliceMemory) and not isinstance(memory.service_job_state, ServiceJobStateNotRecorded):
+        return memory.service_job_state
+    return memory.job_state
 
 
 @dataclass(frozen=True)
@@ -459,7 +476,7 @@ class MemoryPressure:
     some_avg10: float = 0.0
     swap_used_percent: float = 0.0
     next_start_at: float = 0.0
-    condition: Literal["full", "swap"] | PressureConditionNotRecorded = PressureConditionNotRecorded()
+    condition: Literal["full", "some"] | PressureConditionNotRecorded = PressureConditionNotRecorded()
 
 
 @dataclass(frozen=True)
@@ -473,6 +490,7 @@ class HostMemory:
     total: int | UnknownHostTotal
     swap_total: int = 0
     swap_free: int = 0
+    build_and_ci_swap: int | ReadingUnavailable = field(default=0, kw_only=True)
 
 Pressure = NoPressureHold | MemoryPressure | PressureUnavailable
 
@@ -667,6 +685,7 @@ class MemoryRoom:
     runs: tuple[RunKeepAside, ...]
     total: int | UnknownHostTotal = field(default_factory=UnknownHostTotal, kw_only=True)
     ci_use: int = field(default=0, kw_only=True)
+    agent_swap_demand: int = field(default=0, kw_only=True)
 
     @property
     def cap_use(self) -> int:
@@ -1199,7 +1218,7 @@ def read_memory_config(*, report: bool = True) -> MemoryConfig:
             timing = AdmissionTiming(*(whole(key) for key in (
                 "recovery_start_seconds", "estimate_refresh_seconds", "slot_gap_seconds")), fresh_test_seconds=running_interval)
             pressure = PressurePolicy(*(number(key) for key in (
-                "full_pressure_limit", "swap_used_limit", "some_pressure_limit")))
+                "full_pressure_limit", "some_pressure_limit")))
             kinds = {key.removeprefix("peak_hold_seconds."): whole(key)
                      for key in values if key.startswith("peak_hold_seconds.")}
             first_peaks = {key.removeprefix("program_first_peak_gib."): gib(key)
@@ -1208,7 +1227,8 @@ def read_memory_config(*, report: bool = True) -> MemoryConfig:
                 first_peaks["cargo"] = gib("program_first_peak_gib.cargo")
             config = MemoryConfig(
                 policy=AdmissionPolicy(timing, pressure, PeakHold(whole("peak_hold_seconds"), kinds), gib("safety_gib"),
-                                       progress_lookahead_percent=number("progress_lookahead_percent")),
+                                       progress_lookahead_percent=number("progress_lookahead_percent"),
+                                       agent_swap_share_percent=whole("agent_swap_share_percent")),
                 ci_memory_slice=value("ci_memory_slice", _ci_slice_name),
                 ci_label=value("ci_label", _ci_label),
                 test_phase_margin=test_margin(),
@@ -1256,8 +1276,8 @@ def pressure_text(pressure: MemoryPressure) -> str:
     if isinstance(pressure.condition, PressureConditionNotRecorded):
         return (f"memory pressure: condition not recorded by service; full avg10 {pressure.full_avg10:.1f}; "
                 f"some avg10 {pressure.some_avg10:.1f}; swap {format_percent(pressure.swap_used_percent)} used")
-    if pressure.condition == "swap":
-        return f"memory pressure: swap {format_percent(pressure.swap_used_percent)} used; some avg10 {pressure.some_avg10:.1f}"
+    if pressure.condition == "some":
+        return f"memory pressure: some avg10 {pressure.some_avg10:.1f}"
     return f"memory pressure: full avg10 {pressure.full_avg10:.1f}"
 
 

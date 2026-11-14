@@ -192,7 +192,7 @@ name = "change"
 kind = "record"
 defined_in = "commands/change_review.md#add"
 other_names = ["change-review row"]
-other_meaning_files = ["commands/changelog.md", "commands/commit_prep.md"]
+other_meaning_files = ["commands/changelog.md"]
 
 [[terms]]
 name = "checkpoint"

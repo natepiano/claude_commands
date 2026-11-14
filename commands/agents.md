@@ -1,6 +1,6 @@
 ---
 description: Show, pause, exit, retire, rename, move, resume, stop, or restart sessions.
-argument-hint: 'move SESSION_OR_GROUP ACCOUNT [--dry-run] [--why TEXT] | rename OLD NEW [--to-doc PATH] [--to-branch NAME] | retire NAME | pause NAME --why TEXT | exit NAME --why TEXT | help | status [ACCOUNT] [--json] [--here] | resume NAME [--retired] [--why TEXT] [--to ACCOUNT] | restart [ACCOUNT] [--all] [--dry-run] [--only ID[,ID...]] [--here] | stop SESSION [--dry-run] | stop --all [--dry-run] | remove-stray NAME SESSION'
+argument-hint: 'move SESSION_OR_GROUP ACCOUNT [--dry-run] [--why TEXT] | rename OLD NEW [--to-doc PATH] [--to-branch NAME] | retire NAME | pause NAME --why TEXT | exit NAME --why TEXT | help | status [ACCOUNT] [--json] [--here] | resume NAME [--retired] [--why TEXT] [--to ACCOUNT] | restart [ACCOUNT] [--all] [--dry-run] [--only ID[,ID...]] [--here] | stop SESSION [--dry-run] | stop --all [--dry-run] | remove-stray NAME SESSION | transfer NAME [--model MODEL --effort EFFORT]'
 ---
 
 Use the `agents` program.
@@ -22,6 +22,7 @@ Use the `agents` program.
 - `agents stop SESSION [--dry-run]`: stop the session and its workers. Keep their rows, conversations, and panes at the shell.
 - `agents stop --all [--dry-run]`: save the live local staff rows, then stop them without a restart.
 - `agents remove-stray NAME SESSION`: remove a stray producer conversation on this machine.
+- `agents transfer NAME [--model MODEL --effort EFFORT]`: give the producer role NAME to the session that runs the command.
 
 First admission adopts one proved live Claude session or Codex thread with the producer name.
 It also checks live agents in matching tabs and panes in `PRODUCER_WORKSPACE`.
@@ -66,6 +67,9 @@ A running session prints `unchanged` and returns status 0.
 A closed tab uses the existing restore path.
 An empty current pane can resume its own saved session.
 Resume restores retained workers with their native conversations.
+In no-worker mode, resume brings back the director alone and keeps every Codex worker stopped.
+The director's resume message then carries the no-worker notice and no worker lines.
+Resume of a Codex worker row is refused in no-worker mode.
 The short form `resume NAME [--retired] [--why TEXT] [--to ACCOUNT]` stays available from any directory.
 
 Use a staff id, a staff path, or a unique name for rename.
@@ -103,6 +107,13 @@ Each member prints one result line. Show the output unchanged.
 Run the command on the machine that holds the session.
 For stop or resume alone, use `agents stop SESSION` or `agents resume SESSION --why TEXT`.
 See `docs/accounts.md` for account checks and refusals.
+
+Transfer runs in a session that has no staff row, on the producer's machine.
+It stops the old conversation and closes its tab. It keeps the row id, the document, and the message queue.
+It sets the row's session, account home, and launch folder, then restarts the caller as the producer.
+`--model` and `--effort` replace `[producers].NAME`; the caller supplies the family.
+A Claude caller must run on the showrunners account; the refusal names the `agents move` command.
+After a failure, run the same command again.
 
 Before a power-off, run `agents stop --all`.
 After login, run `agents restart`.

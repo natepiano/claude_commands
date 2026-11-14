@@ -1228,6 +1228,31 @@ class WorkerPaneTests(StaffTestCase):
             self.assertIsInstance(opened, worker_panes.OpenWorker)
         self.assertEqual(len(self.world.launches), 1)
 
+    def test_deadline_waits_for_a_held_worker_lock_and_keeps_out_when_the_time_ends(self) -> None:
+        row = self.worker(family="codex")
+        name = staff.WorkerName.parse(row.name)
+        flock = fcntl.flock
+        refusals = 0
+
+        def release_on_third_attempt(handle: int | worker_lifecycle.LockFileDescriptor, operation: int) -> None:
+            nonlocal refusals
+            if Path(str(cast(object, getattr(handle, "name", "")))).stem == row.id and refusals < 2:
+                refusals += 1
+                raise BlockingIOError(11, "Resource temporarily unavailable")
+            flock(handle, operation)
+
+        with patch.object(fcntl, "flock", side_effect=release_on_third_attempt):
+            with worker_panes.worker_lock(self.parent.id, name, deadline=time.monotonic() + TEST_HANG_GUARD_SECS) as waited:
+                assert isinstance(waited, worker_panes.WorkerLockHold)
+                self.assertTrue(waited.owns(row))
+        self.assertEqual(refusals, 2)
+        with worker_panes.worker_lock(self.parent.id, name) as hold:
+            assert isinstance(hold, worker_panes.WorkerLockHold)
+            started = time.monotonic()
+            with worker_panes.worker_lock(self.parent.id, name, deadline=started + 0.1) as competing:
+                self.assertEqual(competing, worker_panes.Kept("dispatch lock is held"))
+            self.assertGreaterEqual(time.monotonic() - started, 0.1)
+
     def test_published_worker_retries_a_fixed_id_flock_that_clears(self) -> None:
         name = staff.WorkerName.parse("brief-lock")
         flock = fcntl.flock
@@ -3192,6 +3217,70 @@ class WorkerPaneTests(StaffTestCase):
                         self.assertNotIn(pane, self.world.locations)
                         self.assertEqual(staff.by_id(row.id), row)
                     self.assertEqual(self.prompts(), prompts)
+
+    def test_account_move_keeps_the_worker_family_when_the_role_family_changes(self) -> None:
+        from scripts.accounts import pane_moves, moves
+        from scripts.agents import stop_results
+
+        run = self.run_state()
+        pairs: tuple[tuple[Literal["claude", "codex"], Literal["claude", "codex"]], ...] = (("codex", "claude"), ("claude", "codex"))
+        for family, other in pairs:
+            with self.subTest(family=family):
+                _ = write_registry(self.root / "conf/models.conf", {"assignments": {"direct": family}})
+                opened = self.start("keep-" + family)
+                assert isinstance(opened, worker_panes.OpenWorker)
+                row, pane = opened.row, opened.pane
+                self.world.record(row, pane, family)
+                self.world.locations[pane]["agent_status"] = "working"
+                _ = write_registry(self.root / "conf/models.conf", {"assignments": {"direct": other}})
+                target = self.root / (family + "2")
+                common = moves.MoveCommon(at="2026-11-13T21:21:24+00:00", tool=family, subject=row.id, move_id=row.name)
+                with (patch.object(pane_moves, "_request", return_value=common),
+                      patch.object(pane_moves, "_confirm"),
+                      patch.object(stop_resume, "running_on_account",
+                                   return_value=stop_results.ClaudeUp(row.id, pane, family + "1")),
+                      patch.object(agent_accounts, "codex_account_home",
+                                   return_value=agent_accounts.CodexHomeHoldingLogin("codex2", target, "fixture-login")),
+                      patch.object(accounts, "account_directory_readiness", return_value=accounts.AccountDirectoryReady("fixture-login")),
+                      patch.object(accounts, "prepare_claude_launch",
+                                   return_value=accounts.PreparedAccount({"CLAUDE_CONFIG_DIR": str(target)}, frozenset()))):
+                    result = pane_moves.move_worker(row, staff.snapshot(), family + "2", "", run)
+                self.assertIsInstance(result, stop_results.ClaudeUp)
+                arguments, environment = self.world.requests[-1][1:]
+                self.assertIn(str(row.current_session), arguments)
+                self.assertIn("--sandbox" if family == "codex" else "--permission-mode", arguments)
+                self.assertEqual(arguments[arguments.index("--model") + 1],
+                                 models_registry.launch_settings("direct", "impl", family).model)
+                self.assertEqual(environment["CODEX_HOME" if family == "codex" else "CLAUDE_CONFIG_DIR"], str(target))
+
+    def test_account_move_to_the_current_account_does_nothing(self) -> None:
+        from scripts.accounts import pane_moves
+
+        run = self.run_state()
+        for family in ("codex", "claude"):
+            with self.subTest(family=family):
+                row = self.worker("same-" + family, family=family)
+                pane = "w1:p-same-" + family
+                self.world.add(row, pane, live=False, family=family)
+                row = staff.set_worker_role(row.id, staff.KnownWorkerRole("impl"))
+                launches, closed, stops = list(self.world.launches), list(self.world.closed), list(self.world.stops)
+                with patch.object(pane_moves, "_source_account", return_value=family + "2"):
+                    result = pane_moves.move_worker(row, staff.snapshot(), family + "2", "", run)
+                self.assertEqual(result, accounts.SessionMoveRefused(row.id, f"already on {family}2", 0))
+                self.assertEqual((self.world.launches, self.world.closed, self.world.stops), (launches, closed, stops))
+                self.assertIn(pane, self.world.locations)
+
+    def test_kept_settings_read_the_model_a_saved_launch_passed(self) -> None:
+        configured = models_registry.LaunchSettings("codex", "configured", "low", "fast")
+        for arguments, expected in (
+                (["resume", "id", "--model", "gpt-6.1-sol", "--sandbox", "danger-full-access", "-c", 'model_reasoning_effort="high"'],
+                 models_registry.LaunchSettings("codex", "gpt-6.1-sol", "high", "")),
+                (["resume", "id", "--model", "gpt-6.1-sol", "-c", 'model_reasoning_effort="xhigh"', "-c", 'service_tier="flex"'],
+                 models_registry.LaunchSettings("codex", "gpt-6.1-sol", "xhigh", "flex")),
+                (["--resume", "id", "--model", "opus", "--effort", "max"], models_registry.LaunchSettings("codex", "opus", "max", "")),
+                (["resume", "id"], configured)):
+            with self.subTest(arguments=arguments):
+                self.assertEqual(worker_panes.kept_settings(configured, arguments), expected)
 
     def test_account_readiness_failure_keeps_the_stopped_terminal(self) -> None:
         row = self.worker(family="codex")

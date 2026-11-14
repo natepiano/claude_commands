@@ -20,6 +20,7 @@ from unittest import mock
 from scripts.production.rename_test_support import FolderMoveBackend, FolderMoveFixture
 from scripts.herdr import herdr_types
 from scripts.production.cli_fixture import invoke_cli
+from scripts.lib.state_home_test_support import isolate_state_home
 from scripts.accounts import accounts
 from scripts.whoami import agent_accounts
 from scripts.agents import restart
@@ -83,6 +84,10 @@ def mac_process_commands(root: Path, responses: Mapping[str, object]) -> Generat
               "HERDR_PLATFORM": "darwin", "FAKE_HERDR_RESPONSES": str(response_path),
               "FAKE_HERDR_LOG": str(root / "mac-process-log")})):
         yield
+
+
+def setUpModule() -> None:
+    isolate_state_home()
 
 
 @final
@@ -230,6 +235,8 @@ class PaneRestoreTests(unittest.TestCase):
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)
         self.root = Path(directory.name)
+        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
+            "STAFF_FILE": str(self.root / "staff.json")})))
         self.config = self.root / ".claude3"
         self.row = replace(type(self).row, home=staff.SessionHome(self.config))
         _ = self.enterContext(mock.patch.object(staff, "local_snapshot", side_effect=lambda: staff.StaffSnapshot((self.row,))))
@@ -455,7 +462,7 @@ class PaneRestoreTests(unittest.TestCase):
                 self.assertEqual(client.closed, [])
                 self.assertIn("pane close anomaly:", output)
                 self.assertEqual(output.count("pane close anomaly:"), 1)
-                self.assertEqual(list(pane_record.read("agents")), ["w1:p3"])
+                self.assertEqual(list(pane_record.read("agents")), ["w1:p2", "w1:p3"])
                 self.assertIn("w1:p2", [row["pane_id"] for row in client.rows])
 
     def test_unknown_staff_home_reports_once_and_keeps_normal_account_selection(self) -> None:

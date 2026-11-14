@@ -21,6 +21,7 @@ import time
 from typing import Literal, TypedDict, cast
 
 from scripts.lib.terminal_cells import print_table, seconds
+from scripts.production.merge_gate import test_module_environment
 
 
 @dataclass(frozen=True)
@@ -94,9 +95,9 @@ def runner_command(tree: Path, module: str) -> list[str]:
 
 def measure(tree: Path, module: str, strace: str) -> ModuleCost:
     command = runner_command(tree, module)
-    environment = dict(os.environ, HERDR_BIN="/nonexistent/herdr", PYTHONDONTWRITEBYTECODE="1")
     with tempfile.TemporaryDirectory(prefix="module-cost-") as temporary:
         root = Path(temporary)
+        environment = test_module_environment(root, dict(os.environ, PYTHONDONTWRITEBYTECODE="1"))
         report = root / "times.json"
         environment["TEST_TIMES_OUT"] = str(report)
         with (root / "time.log").open("w+") as output:
@@ -164,11 +165,12 @@ def main(argv: list[str] | None = None) -> int:
     if request.commands:
         from scripts.test_times import task_cpu
 
-        environment = dict(os.environ, HERDR_BIN="/nonexistent/herdr", PYTHONDONTWRITEBYTECODE="1")
-        _ = environment.pop("TEST_TIMES_OUT", None)
         for cost in costs:
             command = runner_command(request.tree.resolve(), cost.module)
-            tasks = task_cpu.measure(command, cwd=request.tree.resolve(), environment=environment)
+            with tempfile.TemporaryDirectory(prefix="module-cost-commands-") as temporary:
+                environment = test_module_environment(Path(temporary), dict(os.environ, PYTHONDONTWRITEBYTECODE="1"))
+                _ = environment.pop("TEST_TIMES_OUT", None)
+                tasks = task_cpu.measure(command, cwd=request.tree.resolve(), environment=environment)
             print_table([cost.module + " command", "starts", "CPU s"],
                         [[row.command, str(row.starts), seconds(row.cpu_s)]
                          for row in tasks.commands[:request.commands]])

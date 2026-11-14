@@ -34,7 +34,7 @@ from scripts.herdr import herdr  # noqa: E402
 from scripts.agents import pane_record, detached_run_process  # noqa: E402
 from scripts.lib.process_failure import failure_detail  # noqa: E402
 from scripts.lib.atomic_file import write_text_atomic
-from scripts.lib import conf, unit_runs  # noqa: E402
+from scripts.lib import conf, git_files, unit_runs  # noqa: E402
 from scripts.agents import worker_lifecycle  # noqa: E402
 from scripts.message import sessions  # noqa: E402
 from scripts.production import staff  # noqa: E402
@@ -84,6 +84,22 @@ def git(checkout: Path, *arguments: str) -> str:
     if result.returncode:
         raise RenameRefused(f"git {' '.join(arguments)}: {failure_detail(result)}")
     return result.stdout.rstrip("\n")
+
+
+def checkout_folders(folder: Path) -> git_files.Checkout:
+    """Read the checkout's Git folders from its files, with no Git start."""
+    try:
+        return git_files.locate(folder)
+    except git_files.GitFilesError as error:
+        raise RenameRefused(str(error)) from error
+
+
+def checked_out_branch(folder: Path) -> str:
+    """Read the checked-out branch from Git's files; "" for a detached HEAD."""
+    try:
+        return git_files.current_branch(folder)
+    except git_files.GitFilesError as error:
+        raise RenameRefused(str(error)) from error
 
 
 def exists(path: Path) -> bool:
@@ -177,7 +193,7 @@ def move_worktree(checkout: Path, old_branch: str, new_branch: str, old: Path, n
     if not (new / ".git").is_file():
         raise RenameRefused(f"unit worktree missing: {new}")
     _ = git(checkout, "worktree", "repair", str(new))
-    current = git(new, "branch", "--show-current")
+    current = checked_out_branch(new)
     if current not in (old_branch, new_branch):
         raise RenameRefused(f"{new} switched to {current}")
     check_tip(checkout, old_branch, tip)
@@ -282,7 +298,7 @@ def processes_inside(worktree: Path) -> list[int]:
         return _darwin_processes_inside(worktree)
     found: list[int] = []
     root = str(worktree)
-    for entry in Path("/proc").iterdir():
+    for entry in herdr.proc_root().iterdir():
         if not entry.name.isdigit():
             continue
         try:
@@ -423,7 +439,7 @@ def prepare_rename(row: staff.StaffRow, destination: Path, branch: str | KeepBra
     source = row.worktree.path.expanduser().resolve()
     destination = destination.expanduser().resolve()
     checkout = move_checkout(staff.snapshot(), row)
-    source_branch = git(checkout, "branch", "--show-current") if checkout.exists() else ""
+    source_branch = checked_out_branch(checkout) if checkout.exists() else ""
     target_branch = branch if isinstance(branch, str) else source_branch
     branch_change = isinstance(branch, str) and branch != source_branch
     pending = PendingRename(source, destination, source_branch, target_branch, name, branch_change)
@@ -444,7 +460,7 @@ def rename_observation(record: staff.StaffSnapshot, row: staff.StaffRow,
     checkout = move_checkout(record, row)
     if checkout not in (pending.source, pending.destination):
         raise RenameRefused(f"{row.name}: pending rename to {pending.name} found folder {checkout}")
-    branch = git(checkout, "branch", "--show-current") if checkout.exists() else ""
+    branch = checked_out_branch(checkout) if checkout.exists() else ""
     # Records made without a checkout leave both branch values empty.
     if (not checkout.exists() and isinstance(row.worktree, staff.RemovedWorktree)
             and isinstance(row.worktree.branch, staff.ParkedBranch) and (pending.source_branch or pending.branch)):
@@ -547,8 +563,7 @@ def _wait_folder_rows(observe: Callable[[], set[staff.StaffId]], wanted: set[sta
 
 def _worktree_lock(folder: Path) -> Path:
     """Locate the native Git lock without copying a worktree path."""
-    admin = Path(git(folder, "rev-parse", "--absolute-git-dir"))
-    return admin / "locked"
+    return checkout_folders(folder).git_dir / "locked"
 
 
 def _recoverable_folder(record: staff.StaffSnapshot, row: staff.StaffRow, destination: Path) -> bool:
@@ -558,12 +573,11 @@ def _recoverable_folder(record: staff.StaffSnapshot, row: staff.StaffRow, destin
             or owner.doc.machine != remote.local_machine() or not (destination / ".git").is_file()):
         return False
     try:
-        repository = Path(git(owner.doc.path.parent, "rev-parse", "--path-format=absolute", "--git-common-dir")).resolve()
-        target = Path(git(destination, "rev-parse", "--path-format=absolute", "--git-common-dir")).resolve()
-        identity = _worktree_lock(destination)
-        return (repository == target and identity.parent.parent == repository / "worktrees"
-                and identity.read_text().strip() == f"staff:{row.id}"
-                and Path(git(destination, "rev-parse", "--show-toplevel")).resolve() == destination)
+        repository = checkout_folders(owner.doc.path.parent).common_dir
+        target = checkout_folders(destination)
+        identity = target.git_dir / "locked"
+        return (repository == target.common_dir and identity.parent.parent == repository / "worktrees"
+                and identity.read_text().strip() == f"staff:{row.id}" and target.toplevel == destination)
     except (RenameRefused, OSError):
         return False
 
@@ -726,9 +740,9 @@ def move_processes_inside(row: staff.StaffRow, folder: Path, *,
         try:
             observed = herdr.read_conversation(str(member.current_session))
         except (OSError, ValueError, herdr_types.HerdrFailure, subprocess.SubprocessError):
-            return processes
+            continue
         if isinstance(observed, herdr.UnknownConversation):
-            return processes
+            continue
         if isinstance(observed, herdr.LiveConversation):
             for pid in observed.pids:
                 try:
@@ -824,7 +838,7 @@ def move_idle_folder(unit: staff.StaffId, destination: Path, *, branch: str | Ke
             missing = destination if isinstance(location, staff.RemovedWorktree) else old
             print(f"anomaly: folder is absent: {missing}", file=sys.stderr)
             return changed
-        current_branch = git(folder, "branch", "--show-current")
+        current_branch = checked_out_branch(folder)
         complete = old == destination and (isinstance(branch, KeepBranch) or current_branch == branch)
         if complete and not move_locked(unit, folder):
             if pending is not None:
@@ -849,7 +863,7 @@ def move_idle_folder(unit: staff.StaffId, destination: Path, *, branch: str | Ke
                 _ = git(folder, "worktree", "move", "--force", "--force", str(folder), str(destination))
                 folder = destination
                 changed = True
-            current_branch = git(folder, "branch", "--show-current")
+            current_branch = checked_out_branch(folder)
             if pending is not None and current_branch not in (pending.source_branch, pending.branch):
                 raise RenameRefused(f"{row.name}: pending rename to {pending.name} found branch {current_branch!r} at {folder}")
             if isinstance(branch, str) and current_branch != branch:
@@ -866,7 +880,7 @@ def move_idle_folder(unit: staff.StaffId, destination: Path, *, branch: str | Ke
             if folder == destination:
                 updated = replace(location, path=destination)
                 if isinstance(updated, staff.RemovedWorktree) and isinstance(branch, str) and branch and push_finished:
-                    updated = replace(updated, branch=staff.ParkedBranch(git(folder, "branch", "--show-current")))
+                    updated = replace(updated, branch=staff.ParkedBranch(checked_out_branch(folder)))
                 if updated != location:
                     _check_move_deadline()
                     _ = staff.set_worktree(unit, updated, expected=location)
@@ -915,7 +929,7 @@ def _move_folder(unit: staff.StaffId, destination: Path, *, branch: str | KeepBr
             missing = destination if isinstance(location, staff.RemovedWorktree) else old
             print(f"anomaly: folder is absent: {missing}", file=sys.stderr)
             return changed
-        current_branch = git(folder, "branch", "--show-current")
+        current_branch = checked_out_branch(folder)
         move_complete = old == destination and (isinstance(branch, KeepBranch) or current_branch == branch)
         if move_complete:
             if not move_locked(unit, folder):
@@ -1000,7 +1014,7 @@ def _move_folder(unit: staff.StaffId, destination: Path, *, branch: str | KeepBr
                 _ = git(folder, "worktree", "move", "--force", "--force", str(folder), str(destination))
                 folder = destination
                 changed = True
-            if isinstance(branch, str) and git(folder, "branch", "--show-current") != branch:
+            if isinstance(branch, str) and checked_out_branch(folder) != branch:
                 _ = git(folder, "branch", "-m", branch)
                 changed = True
             if isinstance(branch, str):
@@ -1018,7 +1032,7 @@ def _move_folder(unit: staff.StaffId, destination: Path, *, branch: str | KeepBr
                 latest_unit = current.by_id(unit)
                 updated = replace(location, path=destination)
                 if folder == destination and isinstance(updated, staff.RemovedWorktree) and isinstance(branch, str):
-                    updated = replace(updated, branch=staff.ParkedBranch(git(folder, "branch", "--show-current")))
+                    updated = replace(updated, branch=staff.ParkedBranch(checked_out_branch(folder)))
                 if folder == destination and latest_unit is not None and latest_unit.worktree != updated:
                     latest_unit = replace(latest_unit, worktree=updated)
                     current = staff.StaffSnapshot(tuple(latest_unit if item.id == unit else item for item in current.rows))

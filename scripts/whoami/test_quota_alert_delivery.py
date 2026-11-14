@@ -70,7 +70,7 @@ class QuotaAlertTests(support.SeededQuotaReminderFixture):
             _ = sends.pop(title)
         self.assertEqual(sends, {
             "quota_alert: codex1 now uses paid credits": ("decision", ActionRequired(
-                f"To stop it, set use_credits: off in ~/rust/hanadocs/agents/codex1.md on {remote.local_machine()}")),
+                f"To stop it, remove codex1 from codex_credit_accounts in ~/.claude/config/accounts.conf on {remote.local_machine()}")),
             "Codex work stopped for lack of usage": ("decision", ActionRequired(REFUSAL_ACTION)),
         })
 

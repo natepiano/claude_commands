@@ -340,7 +340,7 @@ class NativeRuntimeIdentityTests(StaffCommandTestCase):
                         with self.subTest(compressed=compressed):
                             if compressed:
                                 _ = compressed_copy(transcript)
-                            with mock.patch.object(transcripts, "transcript_paths", wraps=transcripts.transcript_paths) as listed:
+                            with mock.patch.object(transcripts, "transcript_stems", wraps=transcripts.transcript_stems) as listed:
                                 self.assertEqual(staff.backend(row), expected)
                                 backends = staff.local_snapshot().backends
                                 self.assertEqual(backends.get(row.id, staff.BACKEND_UNAVAILABLE), expected)
@@ -1567,6 +1567,48 @@ class StaffTests(StaffCommandTestCase):
         self.assertIsNone(record.by_doc("natedev", path / "other.md"))
         _ = staff.set_worktree(unit.id, staff.RemovedWorktree("natedev", path), expected=staff.PresentWorktree("natedev", path))
         self.assertIsNone(staff.snapshot().by_worktree("natedev", path))
+
+    def test_a_producer_transfer_sets_the_session_home_and_launch_folder_in_one_write(self) -> None:
+        _, unit, _ = self.tree()
+        morty = fixture_member("producer", name="morty", doc=staff.LiveDoc("natedev", self.root / "morty/current.md"))
+        brain = fixture_member("producer", name="brain")
+        session = staff.native_id(fixture_runtime_id("morty-claude"))
+        home, folder = staff.SessionHome(self.root / ".claude5"), staff.PresentWorktree("natedev", self.root / "launch")
+        moved = staff.transfer_producer(morty.id, session, home, folder)
+        self.assertEqual(moved, replace(morty, current_session=session, home=home, worktree=folder))
+        self.assertEqual(staff.by_id(morty.id), moved)
+        payload = self.assert_rerun("transfer-producer", morty.id, session, "--home", str(home.path),
+                                    "--machine", "natedev", "--path", str(folder.path))
+        self.assertEqual(staff.StaffRow.from_json(payload), moved)
+        for wrong in (brain.id, brain.current_session, unit.id):
+            self.assert_refused(lambda: staff.transfer_producer(morty.id, wrong, home, folder))
+        self.assert_refused(lambda: staff.transfer_producer(unit.id, session, home, folder))
+        with self.assertRaises(staff.StaffNotFound):
+            _ = staff.transfer_producer(staff.native_id(fixture_runtime_id("absent")), session, home, folder)
+        back = staff.transfer_producer(morty.id, morty.id, staff.SessionHome(self.root / ".codex2"), folder)
+        self.assertEqual(back, replace(morty, home=staff.SessionHome(self.root / ".codex2"), worktree=folder))
+
+    def test_a_remote_producer_transfer_uses_one_owner_write(self) -> None:
+        morty = fixture_member("producer", name="morty")
+        session = staff.native_id(fixture_runtime_id("morty-claude"))
+        home, folder = staff.SessionHome(self.root / "mac/.claude5"), staff.PresentWorktree("mac", self.root / "mac/launch")
+        with self.machine("mac"):
+            moved = staff.transfer_producer(morty.id, session, home, folder)
+        self.assertEqual([command[0] for command in self.ssh_commands()], ["transfer-producer"])
+        self.assertEqual(moved, replace(morty, current_session=session, home=home, worktree=folder))
+        self.assertEqual(staff.by_id(morty.id), moved)
+
+    def test_a_producer_launch_folder_owns_no_path_and_two_producers_share_it(self) -> None:
+        _, unit, _ = self.tree()
+        folder = staff.PresentWorktree("natedev", self.root)
+        morty = fixture_member("producer", name="morty", worktree=folder)
+        brain = fixture_member("producer", name="brain", worktree=folder)
+        checkout = self.root / "checkout"
+        unit = staff.set_worktree(unit.id, staff.PresentWorktree("natedev", checkout), expected=unit.worktree)
+        record = staff.snapshot()
+        self.assertEqual((morty.worktree, brain.worktree), (folder, folder))
+        self.assertIsNone(record.by_worktree("natedev", self.root / "unowned"))
+        self.assertEqual(record.by_worktree("natedev", checkout / "src"), unit)
 
     def test_remote_setters_use_one_owner_write_and_preserve_the_other_field(self) -> None:
         runner, unit, _ = self.tree()

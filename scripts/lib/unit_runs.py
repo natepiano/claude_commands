@@ -18,7 +18,7 @@ import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from enum import Enum
-from functools import cache
+from functools import cache, lru_cache
 from pathlib import Path
 from importlib import import_module
 from typing import TYPE_CHECKING, cast
@@ -268,6 +268,12 @@ def held_by_session(root_override: str | Path | None = None, *,
     return found
 
 
+@lru_cache(maxsize=4096)
+def _real_path(folder: str) -> Path:
+    """Resolve a scanned run folder once per process; one board read compares each folder many times."""
+    return Path(folder).resolve()
+
+
 def held(session_id: str, root_override: str | Path | None = None,
          *,
          scanned: dict[str, list[str]] | None = None,
@@ -281,16 +287,16 @@ def held(session_id: str, root_override: str | Path | None = None,
     if target is not None:
         resolved = target.resolve()
         owner = next((session for session, paths in folders.items()
-                      if any(Path(path).resolve() == resolved for path in paths)), None)
+                      if any(_real_path(path) == resolved for path in paths)), None)
         if owner is None:
             owner = director(target, record=record)
             if owner == session_id:
                 folders.setdefault(owner, []).append(str(target))
         if owner == session_id:
             runs.append(str(target))
-    seen = {Path(run).resolve() for run in runs}
+    seen = {_real_path(run) for run in runs}
     for folder in folders.get(session_id, ()):
-        resolved = Path(folder).resolve()
+        resolved = _real_path(folder)
         if resolved not in seen:
             seen.add(resolved)
             runs.append(folder)

@@ -7,7 +7,9 @@ from enum import Enum
 from pathlib import Path
 from typing import NamedTuple, cast
 
+from scripts.herdr import herdr
 from scripts.lib import conf
+from scripts.production import claude_table_layout
 from scripts.lib.terminal_cells import terminal_width
 
 NONE = "—"
@@ -18,6 +20,26 @@ class CutOrder(Enum):
 
     LISTED = "listed"
     WIDEST_FIRST = "widest_first"
+
+
+def pane_columns() -> int | None:
+    """Read the calling herdr pane's width once, within the configured time."""
+    milliseconds = conf.read_or_repository("production").whole("units_table_width_read_milliseconds")
+    return herdr.own_pane_columns(milliseconds / 1000)
+
+
+def wrapped(headers: Sequence[str], rows: Sequence[Sequence[str]],
+            columns: int | None = None) -> tuple[tuple[str, ...], list[tuple[str, ...]]]:
+    """Remove empty columns and split cells for the terminal width, or for the configured floor without one."""
+    kept = [index for index in range(len(headers)) if not rows or any(row[index] != NONE for row in rows)]
+    titles = tuple(headers[index] for index in kept)
+    table_rows = [tuple(row[index] for index in kept) for row in rows]
+    settings = conf.read_or_repository("production")
+    width = settings.whole("units_table_floor_columns") if columns is None else columns
+    render_width = width - claude_table_layout.REPLY_INDENT
+    return titles, claude_table_layout.continued(titles, table_rows, render_width,
+                                               settings.whole("units_table_cell_lines"),
+                                               settings.whole("units_table_break_columns"))
 
 
 def fitted(headers: Sequence[str], rows: Sequence[Sequence[str]], *,

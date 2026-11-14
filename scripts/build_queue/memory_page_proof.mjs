@@ -1,5 +1,8 @@
 // Run with node scripts/build_queue/memory_page_proof.mjs [temporary-output-folder].
 // The optional third argument names the previous page for comparison images.
+// Add --queued as the fourth argument for the queued-section comparison.
+// Add --console as the fourth argument for the Builds title comparison.
+// Add --step-names as the fourth argument for owner-based step names.
 import assert from 'node:assert/strict';
 import {readFile, writeFile, mkdtemp, rm, mkdir} from 'node:fs/promises';
 import {createServer} from 'node:http';
@@ -21,6 +24,9 @@ try {
   const page = await readFile(join(folder, 'memory_live.html'));
   const beforePage = process.argv[3] ? (await readFile(process.argv[3], 'utf8'))
     .replace('__MEMORY_FEED_INTERVAL_SECONDS__', '0.125') : null;
+  const queuedComparison = process.argv[4] === '--queued';
+  const consoleComparison = process.argv[4] === '--console';
+  const stepNamesComparison = process.argv[4] === '--step-names';
   const readings = JSON.parse(await readFile(join(folder, 'fixtures.json'), 'utf8'));
   const now = Date.now() / 1000;
   for (const reading of Object.values(readings)) {
@@ -205,6 +211,13 @@ try {
           for (const width of [1400,900,390]) {
             await call('Emulation.setDeviceMetricsOverride', {width,height:1200,deviceScaleFactor:1,mobile:false});
             await show(base);
+            const timeCells = await evaluate(`({
+              short:ago(latest.read_at-15,latest.read_at),
+              waiting:[...document.querySelectorAll('tr[data-tip^="wait:"] .duration')].map(cell=>cell.textContent)
+            })`);
+            assert.equal(timeCells.short,'<1 min');
+            assert.ok(timeCells.waiting.length>0);
+            assert.ok(timeCells.waiting.every(text=>!text.startsWith('waits ')));
             const proof = await evaluate(`(() => {
               const rect = element => {
                 const r = element.getBoundingClientRect();
@@ -290,9 +303,9 @@ try {
               };
               return metrics;
             })()`);
-            assert.deepEqual(proof.headings, ['Stage','Step','Duration','Unit','Pid','Machine','vCPU']);
+            assert.deepEqual(proof.headings, ['Stage','Done','Step','Duration','Unit','Pid','Machine','vCPU']);
             assert.equal(proof.answer,'Next step room');
-            assert.deepEqual(proof.queueHeaders,['#','Step','Waiting','Unit','Pid','Machine','vCPU']);
+            assert.deepEqual(proof.queueHeaders,['#','Done','Step','Waiting','Unit','Pid','Machine','vCPU']);
             assert.equal(proof.queueHeaderHeight,proof.queueSpacerHeight);
             assert.ok(proof.stages.includes('testing'));
             assert.ok(proof.stages.every(stage => ['building','testing','—'].includes(stage)));
@@ -504,7 +517,7 @@ try {
                 slots:tipText('wait:'+latest.waiters.findIndex(row=>row.head_text),latest).join(' '),
                 scroll:document.documentElement.scrollWidth,client:document.documentElement.clientWidth};
             })()`);
-            assert.deepEqual(cloudProof.headings,['Stage','Step','Duration','Unit','Pid','Machine','vCPU']);
+            assert.deepEqual(cloudProof.headings,['Stage','Done','Step','Duration','Unit','Pid','Machine','vCPU']);
             assert.ok(cloudProof.statusInTable,'Cloud work is absent from the main table.');
             assert.equal(cloudProof.machine,'aws');
             assert.equal(cloudProof.vcpus,'32');
@@ -595,11 +608,11 @@ try {
             }
             await show(base);
 
-            for (const state of ['idle','busy']) {
+            for (const state of ['idle','waiting','unmatched','busy']) {
               const ciReading=structuredClone(base);
-              ciReading.walk.push({name:'hana CI',ci:true,queued:false,used:0.125,reserved:0,
+              ciReading.walk.push({name:'hana CI',ci:true,admitted:state==='busy',queued:false,used:0.125,reserved:0,
                 counted:0,started_at:now-60,unit:'hana-ci.slice',machine:'fixture',pid:701,vcpus:4,
-                progress:{kind:'NoProgress',reason:'no admission counter'},ci_runners:[{state}]});
+                progress:{kind:'NoProgress',reason:'no admission counter'},ci_runners:[{state:state==='waiting'||state==='unmatched'?'busy':state}]});
               ciReading.ci_ram=0.125;
               ciReading.taken=ciReading.used+ciReading.ci_ram+ciReading.reserved;
               await show(ciReading);
@@ -626,8 +639,10 @@ try {
                 const chart=document.querySelector('.wrow[data-run="'+index+'"]');
                 const table=document.querySelector('.walk-table tr[data-tip="row:'+index+'"]');
                 return {name:row.name,stage:table.querySelector('.place').textContent,
-                  unit:table.querySelector('.unit').textContent,percent:chart.querySelector('.progress-amount').textContent,
-                  used:chart.querySelector('.seg-used').getBoundingClientRect().width,
+                  unit:table.querySelector('.unit').textContent,percent:table.querySelector('.done').textContent,
+                  underBar:!!chart.querySelector('.progress-amount'),
+                  used:chart.querySelector('.seg-remote').getBoundingClientRect().width,
+                  color:getComputedStyle(chart.querySelector('.seg-remote')).backgroundColor,
                   expected:row.used*unit,hatched:!!chart.querySelector('.hatch'),
                   tip:tooltipHtml('row:'+index,latest),
                   chartTop:chart.getBoundingClientRect().top-document.querySelector('.walk-chart-head').getBoundingClientRect().bottom,
@@ -636,7 +651,7 @@ try {
             })()`);
             assert.equal(macProof.length,3);
             assert.deepEqual(macProof.map(row=>row.name),['hana build','hana nextest','cargo-liner nextest']);
-            assert.deepEqual(macProof.map(row=>row.percent),['60.4% done','64.7% done','98.3% done']);
+            assert.deepEqual(macProof.map(row=>row.percent),['60.4%','64.7%','98.3%']);
             assert.deepEqual(macProof.map(row=>row.unit),['—','trunk','—']);
             const macLabels=await evaluate(`latest.walk.map((row,index)=>({row,index})).filter(({row})=>row.kind==='mac-build').map(({index})=>({
               repository:document.querySelector('.wrow[data-run="'+index+'"] .owner').textContent,
@@ -647,6 +662,7 @@ try {
               assert.equal(row.stage,'building');
               assert.ok(Math.abs(row.used-row.expected)<1);
               assert.equal(row.hatched,false);
+              assert.equal(row.underBar,false);
               assert.ok(Math.abs(row.chartTop-row.tableTop)<1);
               assert.ok(row.tip.includes('Mac memory does not count against natedev.'));
             }
@@ -800,47 +816,263 @@ try {
           assert.match(states[name].status,/^Live · read at /);
           assert.ok(!states[name].stale && !states[name].unavailable);
         }
+        const capture = async (name, selector) => {
+          const clip=await evaluate(`(() => {
+            const r=document.querySelector(${JSON.stringify(selector)}).getBoundingClientRect();
+            return {x:Math.max(0,r.left+scrollX),y:r.top+scrollY,width:r.width,height:r.height,scale:1};
+          })()`);
+          const shot=await call('Page.captureScreenshot',{format:'png',captureBeyondViewport:true,clip});
+          await writeFile(join(folder,`${name}.png`),Buffer.from(shot.data,'base64'));
+        };
         const comparisons = [];
-        if (beforePage) {
-          const review = structuredClone(readings.spacing);
-          review.priority_text = "queue priority: port (the user's bump)";
-          review.head_text = 'Head: free 8.5 GiB; reserve 3.0 GiB; need 1.9 GiB · cloud 2 of 9 slots';
-          const head = review.waiters[0];
-          Object.assign(head, {name:'port nextest',unit:'port',need:1.9,reason:'free memory',
-            head_text:review.head_text,priority_text:review.priority_text});
-          review.waiters.push({...head,name:'trunk nextest',unit:'trunk',pid:201,
-            reason:'head protection · behind #1',head_text:'',priority_text:''});
-          review.waiters.push({...head,name:'fps nextest',unit:'fps',pid:202,
-            reason:'estimate expired',head_text:'',priority_text:''});
+        if (stepNamesComparison) {
           await call('Emulation.setEmulatedMedia', {features:[{name:'prefers-color-scheme',value:'dark'}]});
-          for (const version of ['after','before']) {
-            await call('Emulation.setDeviceMetricsOverride', {width:1400,height:1200,deviceScaleFactor:1,mobile:false});
-            await navigate(version === 'before' ? 'before.html' : 'memory_live.html');
-            for (const width of [1400,390]) {
+          await call('Emulation.setDeviceMetricsOverride', {width:1400,height:1200,deviceScaleFactor:1,mobile:false});
+          await navigate('memory_live.html');
+          for (const version of ['before','after']) {
+            await show(readings['owner_names_'+version]);
+            const names = await evaluate(`(() => {
+              const rows = [...document.querySelectorAll('.walk-table tbody tr')];
+              return {running:rows.filter(row=>row.dataset.tip?.startsWith('row:')).map(row=>row.querySelector('.step').textContent),
+                waiting:rows.filter(row=>row.dataset.tip?.startsWith('wait:')).map(row=>row.querySelector('.step').textContent)};
+            })()`);
+            const expected = version === 'before' ? ['targeted test','merge gate'] : ['panes targeted','showrunner merge'];
+            assert.deepEqual(names.running,expected);
+            assert.deepEqual(names.waiting,expected);
+            await capture(version+'-running-step-names','#walk');
+            comparisons.push({version,...names});
+          }
+        }
+        if (consoleComparison) {
+          assert.ok(beforePage,'The console comparison needs the previous page.');
+          await call('Emulation.setEmulatedMedia', {features:[{name:'prefers-color-scheme',value:'dark'}]});
+          await call('Emulation.setDeviceMetricsOverride', {width:1400,height:1200,deviceScaleFactor:1,mobile:false});
+          for (const version of ['before','after']) {
+            await navigate(version==='before'?'before.html':'memory_live.html');
+            await show(base);
+            const state=await evaluate(`(() => ({
+              title:document.title,heading:document.querySelector('h1').textContent,
+              navigation:document.querySelectorAll('nav').length,
+              outbound:[...document.querySelectorAll('a[href]')].filter(a=>!a.getAttribute('href').startsWith('#'))
+                .map(a=>({href:a.getAttribute('href'),target:a.target}))
+            }))()`);
+            if(version==='after') {
+              assert.equal(state.title,'Builds');
+              assert.equal(state.heading,'Builds');
+              assert.equal(state.navigation,0);
+              for(const link of state.outbound) assert.equal(link.target,'_top');
+            } else {
+              assert.equal(state.heading,'Build memory on natedev');
+            }
+            const clip=await evaluate(`(() => {
+              const status=document.querySelector('.status').getBoundingClientRect();
+              return {x:0,y:0,width:innerWidth,height:Math.ceil(status.bottom+16),scale:1};
+            })()`);
+            const shot=await call('Page.captureScreenshot',{format:'png',captureBeyondViewport:true,clip});
+            await writeFile(join(folder,`${version}-dark-title.png`),Buffer.from(shot.data,'base64'));
+            comparisons.push({version,...state});
+          }
+        }
+        if (queuedComparison) {
+          assert.ok(beforePage, 'The queued comparison needs the previous page.');
+          const cases = [
+            ['queued_none','Queued, in order of submission'],
+            ['queued_one','Queued, research first, then in submission order'],
+            ['queued_two','Queued, research followed by cables and then in submission order'],
+          ];
+          readings.queued_long = structuredClone(readings.queued_two);
+          readings.queued_long.queued_priority_units = ['research-with-a-long-unit-name'.repeat(4),'cables'.repeat(8)];
+          cases.push(['queued_long',`Queued, ${readings.queued_long.queued_priority_units.join(' followed by ')} and then in submission order`]);
+          for (const theme of ['light','dark']) {
+            await call('Emulation.setEmulatedMedia', {features:[{name:'prefers-color-scheme',value:theme}]});
+            for (const width of [1400,900,390]) {
               await call('Emulation.setDeviceMetricsOverride', {width,height:1200,deviceScaleFactor:1,mobile:false});
-              await show(review);
-              const comparison = await evaluate(`(() => {
-                const walk=document.querySelector('#walk'),card=walk.closest('.card');
-                const r=card.getBoundingClientRect();
-                return {tables:walk.querySelectorAll('table').length,
-                  lists:card.querySelectorAll('#priority-line,#head-line,#wait-reasons').length,
-                  layout:walk.classList.contains('beside')?'beside':'stacked',
-                  head:tipText('wait:0',latest).join(' '),
-                  clip:{x:r.left+scrollX,y:r.top+scrollY,width:r.width,height:r.height,scale:1}};
-              })()`);
-              assert.equal(comparison.tables, version === 'after' ? 1 : 0);
-              assert.equal(comparison.lists, version === 'after' ? 0 : 3);
-              if(version === 'after') {
-                assert.equal(comparison.layout,width===1400?'beside':'stacked');
-                for(const value of [review.head_text,review.priority_text,'free memory'])
-                  assert.equal(comparison.head.split(value).length-1,1);
+              await navigate('memory_live.html');
+              for (const [name,title] of cases) {
+                await show(readings[name]);
+                const state=await evaluate(`(() => {
+                  const walk=document.querySelector('#walk');
+                  const heading=walk.querySelector('.walk-chart .queue-title');
+                  const header=heading.parentElement;
+                  const columns=walk.querySelector('.walk-table tr.queue-head');
+                  const room=walk.querySelector('.wrow.room');
+                  const after=getComputedStyle(room,'::after'),before=getComputedStyle(room,'::before');
+                  const running=getComputedStyle(document.querySelector('.section-head'));
+                  const rows=[...walk.querySelectorAll('.walk-table tr[data-tip]')];
+                  const textBottom=element=>{
+                    const range=document.createRange();range.selectNodeContents(element);
+                    return range.getBoundingClientRect().bottom;
+                  };
+                  return {title:heading.textContent,font:getComputedStyle(heading).font,
+                    hover:heading.title,truncated:heading.scrollWidth>heading.clientWidth,
+                    clipped:getComputedStyle(heading).textOverflow==='ellipsis' && getComputedStyle(heading).overflow==='hidden',
+                    withinChart:heading.getBoundingClientRect().right<=header.getBoundingClientRect().right+1,
+                    headerHeight:header.getBoundingClientRect().height,
+                    headerOffset:header.getBoundingClientRect().top-columns.getBoundingClientRect().top,
+                    bottomOffset:textBottom(heading)-textBottom(columns.querySelector('th')),
+                    nextGap:header.nextElementSibling.getBoundingClientRect().top-header.getBoundingClientRect().bottom,
+                    noEmptyRow:!walk.querySelector('tr.queue-title'),
+                    noOverlap:heading.getBoundingClientRect().right<=columns.getBoundingClientRect().left ||
+                      heading.getBoundingClientRect().bottom<=columns.getBoundingClientRect().top,
+                    runningFont:running.font,afterWidth:after.borderTopWidth,beforeWidth:before.borderTopWidth,
+                    afterColor:after.borderTopColor,beforeColor:before.borderTopColor,
+                    roomTop:room.getBoundingClientRect().top,headingTop:heading.getBoundingClientRect().top,
+                    roomBottom:room.getBoundingClientRect().bottom,
+                    pageOverflow:document.documentElement.scrollWidth>document.documentElement.clientWidth,
+                    aligned:walk.classList.contains('beside') && rows.every(row=>{
+                      const chart=walk.querySelector('.wrow[data-tip="'+row.dataset.tip+'"]') || room;
+                      return Math.abs(row.getBoundingClientRect().top-chart.getBoundingClientRect().top)<=1;
+                    }),beside:walk.classList.contains('beside')};
+                })()`);
+                assert.equal(state.title,title);
+                assert.equal(state.hover,title);
+                assert.equal(state.font,state.runningFont);
+                assert.equal(state.headerHeight,30);
+                assert.equal(state.nextGap,0);
+                assert.equal(state.noEmptyRow,true);
+                assert.equal(state.withinChart,true);
+                assert.equal(state.noOverlap,true,JSON.stringify({theme,width,name,...state}));
+                if(name==='queued_long') {
+                  assert.equal(state.truncated,true);
+                  assert.equal(state.clipped,true);
+                }
+                assert.equal(state.afterWidth,'1px');
+                assert.equal(state.afterWidth,state.beforeWidth);
+                assert.equal(state.afterColor,state.beforeColor);
+                assert.ok(state.headingTop>=state.roomBottom);
+                assert.equal(state.pageOverflow,false);
+                if(state.beside) {
+                  assert.equal(state.aligned,true);
+                  assert.ok(Math.abs(state.headerOffset)<=1,'The title and columns use different rows.');
+                  assert.ok(Math.abs(state.bottomOffset)<=2,'The title and columns have different text bottoms.');
+                }
+                comparisons.push({theme,width,name,...state});
               }
-              const shot = await call('Page.captureScreenshot', {format:'png',captureBeyondViewport:true,clip:comparison.clip});
-              await writeFile(join(folder,`${version}-${width}.png`),Buffer.from(shot.data,'base64'));
-              comparisons.push({version,width,...comparison});
+            }
+            await call('Emulation.setDeviceMetricsOverride', {width:1400,height:1200,deviceScaleFactor:1,mobile:false});
+            let beforeRoomTop, beforeWaitTop;
+            for (const version of ['before','after']) {
+              await navigate(version==='before'?'before.html':'memory_live.html');
+              await show(readings.queued_two);
+              const state=await evaluate(`(() => {
+                const walk=document.querySelector('#walk');
+                return {roomTop:walk.querySelector('.wrow.room').getBoundingClientRect().top,
+                  waitTop:walk.querySelector('.wrow.wait').getBoundingClientRect().top,
+                  title:walk.querySelector('.walk-chart .queue-title')?.textContent || ''};
+              })()`);
+              if(version==='before') {
+                beforeRoomTop=state.roomTop;
+                beforeWaitTop=state.waitTop;
+                assert.equal(state.title,cases[2][1]);
+              } else {
+                assert.ok(Math.abs(state.roomTop-beforeRoomTop)<=1,'The room row moved.');
+                assert.equal(state.title,cases[2][1]);
+                assert.ok(state.waitTop<beforeWaitTop,'The separate title row remains.');
+              }
+              await capture(`${version}-${theme}-queued`,'#walk');
             }
           }
         }
+        if (beforePage && !queuedComparison && !consoleComparison) {
+          const review = structuredClone(readings.spacing);
+          review.priority_text = "queue priority: port (the user's bump)";
+          review.head_text = 'Head: free 8.5 GiB; reserve 3.0 GiB; need 1.9 GiB · cloud 2 of 9 slots';
+          const local = review.walk.find(row => row.queued);
+          local.machine = 'natedev';
+          const mac = structuredClone(readings.mac_three.walk.find(row => row.kind === 'mac-build'));
+          Object.assign(mac, {name:'hana nextest',used:3.5,unit:'trunk',stage:{kind:'MacTestingCounter'},
+            progress:{kind:'RowProgress',phase:'testing',unit:'units',done:722,total:727,percent:100*722/727}});
+          const aws = structuredClone(readings.cloud.walk.find(row => row.kind === 'cloud'));
+          Object.assign(aws, {machine:'aws',used:1.5});
+          const ci = {name:'hana CI',ci:true,admitted:false,queued:false,used:0.125,reserved:0,counted:0,
+            started_at:now-60,unit:'hana CI',machine:'natedev',pid:701,vcpus:32,
+            progress:{kind:'NoProgress',reason:'no counter'},ci_runners:[{state:'busy',job:'doctests'}]};
+          review.walk = [local, mac, aws, ci];
+          review.waiters = [{...review.waiters[0],name:'hana CI doctests',unit:'hana CI',detail:'hana CI',reason:'free memory',
+            head_text:review.head_text,priority_text:review.priority_text}];
+          review.ci_ram = 0.125;
+          review.taken = review.used + review.ci_ram + review.reserved;
+          for (const theme of ['light','dark']) {
+            await call('Emulation.setEmulatedMedia', {features:[{name:'prefers-color-scheme',value:theme}]});
+            for (const version of ['before','after']) {
+              await call('Emulation.setDeviceMetricsOverride', {width:1800,height:1200,deviceScaleFactor:1,mobile:false});
+              await navigate(version === 'before' ? 'before.html' : 'memory_live.html');
+              await show(review);
+              const comparison = await evaluate(`(() => {
+                const table=document.querySelector('.walk-table');
+                const mac=document.querySelector('.wrow[data-run="1"]');
+                const macBar=mac.querySelector('.seg-remote,.seg-used');
+                const awsBar=document.querySelector('.wrow[data-run="2"] .seg-remote');
+                return {headers:[...table.querySelectorAll('thead th')].map(cell=>cell.textContent),
+                  done:table.querySelector('tr[data-tip="row:1"] .done')?.textContent,
+                  underBar:!!mac.querySelector('.progress-amount'),
+                  remoteColor:getComputedStyle(macBar).backgroundColor,
+                  awsColor:awsBar?getComputedStyle(awsBar).backgroundColor:null,
+                  localColor:getComputedStyle(document.querySelector('.wrow[data-run="0"] .seg-used')).backgroundColor,
+                  machineColors:[...table.querySelectorAll('tr[data-tip^="row:"] .machine')].map(cell=>getComputedStyle(cell).color),
+                  ciVisible:!!table.querySelector('tr[data-tip="row:3"]'),
+                  waiting:table.querySelector('tr[data-tip="wait:0"] .unit').textContent,
+                  pageOverflow:document.documentElement.scrollWidth>document.documentElement.clientWidth};
+              })()`);
+              if(version==='after') {
+                assert.deepEqual(comparison.headers.slice(0,2),['Stage','Done']);
+                assert.equal(comparison.done,'99.3%');
+                assert.equal(comparison.underBar,false);
+                assert.notEqual(comparison.remoteColor,comparison.localColor);
+                assert.equal(comparison.remoteColor,comparison.awsColor);
+                const rgb = hex => 'rgb('+hex.slice(1).match(/../g).map(part=>parseInt(part,16)).join(', ')+')';
+                assert.equal(comparison.remoteColor,rgb(review.colors[theme].remote_memory));
+                assert.deepEqual(comparison.machineColors,['natedev','mac','aws'].map(machine=>rgb(review.colors[theme].machines[machine])));
+                assert.equal(new Set(comparison.machineColors).size,3);
+                assert.equal(comparison.ciVisible,false);
+                assert.equal(comparison.waiting,'hana CI');
+                assert.equal(comparison.pageOverflow,false);
+              } else {
+                assert.equal(comparison.ciVisible,true);
+                assert.equal(comparison.underBar,true);
+                assert.equal(comparison.remoteColor,comparison.localColor);
+              }
+              await capture(`${version}-${theme}-c1507-b`,'#walk');
+              await capture(`${version}-${theme}-hanaci-row`,'#walk');
+              await evaluate(`showTip('row:1',180,160)`);
+              const note = await evaluate(`(() => {
+                const tip=document.querySelector('#tip');
+                const note=tip.querySelector('span');
+                const fields=tip.querySelector('dl');
+                return {last:tip.lastElementChild===note,nowrap:getComputedStyle(note).whiteSpace,
+                  note:note.textContent,fieldsBottom:fields.getBoundingClientRect().bottom,noteTop:note.getBoundingClientRect().top};
+              })()`);
+              if(version==='after') {
+                assert.equal(note.last,true);
+                assert.equal(note.nowrap,'nowrap');
+                assert.ok(note.noteTop>=note.fieldsBottom);
+              }
+              await capture(`${version}-${theme}-c1507-a`,'#tip');
+              const responsive = [];
+              if(version==='after') {
+                for(const width of [1400,390]) {
+                  await call('Emulation.setDeviceMetricsOverride', {width,height:1200,deviceScaleFactor:1,mobile:false});
+                  await show(review);
+                  const layout = await evaluate(`(() => {
+                    const walk=document.querySelector('#walk'),card=walk.closest('.card');
+                    return {tables:walk.querySelectorAll('table').length,
+                      lists:card.querySelectorAll('#priority-line,#head-line,#wait-reasons').length,
+                      layout:walk.classList.contains('beside')?'beside':'stacked',
+                      head:tipText('wait:0',latest).join(' ')};
+                  })()`);
+                  assert.equal(layout.tables,1);
+                  assert.equal(layout.lists,0);
+                  assert.equal(layout.layout,width===1400?'beside':'stacked');
+                  for(const value of [review.head_text,review.priority_text,'free memory'])
+                    assert.equal(layout.head.split(value).length-1,1);
+                  responsive.push({width,...layout});
+                }
+              }
+              comparisons.push({version,theme,...comparison,note,responsive});
+            }
+          }
+        }
+
         await writeFile(join(folder,'proof.json'),JSON.stringify({proofs,comparisons,
           failures:failures.map(({cards,...state})=>state)},null,2)+'\n');
         console.log(JSON.stringify({pass:true,views:proofs.length,...(callerFolder ? {output:folder} : {})}));

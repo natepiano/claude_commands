@@ -46,6 +46,7 @@ class RefusalDemoTests(unittest.TestCase):
                 r'''#!/bin/sh
 if [ "$1" != "-d" ]; then exec "$DEMO_TEST_MKTEMP" "$@"; fi
 created=$("$DEMO_TEST_MKTEMP" -d "$DEMO_TEST_SCRATCH/run.XXXXXXXX") || exit $?
+"$DEMO_TEST_PYTHON" -c 'import sys; from pathlib import Path; sys.path.insert(0, sys.argv[1]); from scripts.agents.test_support import write_machine_config; write_machine_config(Path(sys.argv[2]))' "$DEMO_TEST_REPO" "$created" || exit $?
 printf "%s\n" "$created" >> "$DEMO_TEST_ALLOCATIONS"
 printf "%s\n" "$created"
 ''',
@@ -78,6 +79,8 @@ printf "%s\n" "$created"
                     "DEMO_TEST_SCRATCH": str(scratch),
                     "DEMO_TEST_ALLOCATIONS": str(allocations),
                     "DEMO_TEST_MKTEMP": real_allocator,
+                    "DEMO_TEST_PYTHON": sys.executable,
+                    "DEMO_TEST_REPO": str(DEMO.parents[2]),
                 },
                 capture_output=True,
                 text=True,

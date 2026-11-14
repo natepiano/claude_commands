@@ -38,6 +38,10 @@ Usage reports compare checkpointed phases through the usage store.
 ## Pane submission and completion
 
 `assign.sh` returns after successful prompt delivery or an accepted detached compaction. Both return exit 0.
+`assign.sh` and `assign.py` accept `--reply-file <absolute path>` for the reply output.
+Text, relative paths, and empty values exit 2 before dispatch.
+The old `--summary` option exits 2 and names `--reply-file`.
+Both reply writes and dispatch reply paths use the checked `Arguments.reply_file` value.
 The early return prints `compaction runs detached; the prompt follows` with the worker name.
 The pass stays active while the child completes delivery.
 An assignment with no compaction due keeps its attached delivery path.
@@ -78,6 +82,13 @@ That notice names its own pass and says it is a late result. The pane stays for 
 The late step does not retire the worker, and it keeps a hold that the new assign also owns.
 If the late notice fails, the assign continues and prints an anomaly line that names the saved result file.
 
+A dispatch retry matches the slot, phase, role, prompt path, launcher arguments, and saved prompt content digest.
+The pass records the digest before submission.
+Changed content at the same prompt path starts a new pass after completion.
+With an active pass, changed content returns busy and names that pass without printing `submitted`.
+This refusal applies when the launcher arguments change.
+The recorder repeats the content check under its lock before it changes the pass.
+The intentional second review stage keeps its existing pass across its separate prompt path.
 An identical rerun of a completed dispatch sends one completion message through the hook's notice code.
 It saves the reply without typing another prompt.
 This rule also applies to a completed managed Astra review.
@@ -110,6 +121,12 @@ The turn hook sends that reply to the director.
 An unexpected screen prompt ends no turn, and the director finds it only when it reads the pane.
 A turn without DONE reports `no DONE` when no pending work explains it.
 The notice includes the worker's last reply and leaves the pass active.
+A turn without an assistant reply reports `no DONE` when the transcript records compaction after the accepted dispatch prompt.
+An empty turn without that compaction evidence stays ignored.
+Resubmit that work with `worker.py answer <name> --text "Read the assigned prompt and do the work."`.
+For an active pass, `answer` adds the saved completion id to the normal DONE instruction.
+The pass and saved delivery stay unchanged, and the normal hook handles the matching DONE reply.
+A blocked Codex question receives only the supplied answer text.
 The completion hook saves the reply, records the exact pass, runs completion actions, and closes the pane.
 The completion rule accepts the saved DONE hook completion for the same dispatch.
 Live detached work prevents completion before pane closure.
@@ -571,6 +588,10 @@ Detached command results use `detached_runs.deliver` and `send.deliver_worker_te
 After the command ends, the supervisor starts `detached_runs.py deliver <record>` in a new Python process.
 This process imports the current delivery code and saves the delivery outcome in the run record.
 The supervisor waits for this process before it marks the run finished.
+The command shares the supervisor's process group, including through a systemd scope prefix.
+The supervisor installs no signal handler.
+After a group stop, the existing orphan reaper finishes the record and delivers the result.
+The next start, worker restore, or explicit `detached_runs.py reap` invokes this recovery.
 The result carries `Detached run: <run_id>` as its stable marker.
 Under a per-run delivery lock, `detached_runs.deliver` checks the worker transcript for that marker.
 It skips delivery when a user entry already contains the marker.

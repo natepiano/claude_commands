@@ -25,6 +25,15 @@ on approval, with the user's words. `/tune` publishes the config file and pulls
 the Mac without a test or release cycle. Moving an unchanged value from code
 to config needs no approval and does not use `/tune`.
 
+## machines.conf
+
+`aliases` lists the workstation SSH aliases.
+Each alias has a `<alias>.platform` value and a `<alias>.hosts` list.
+The platform selects the local workstation.
+`send.py --machine` accepts an alias or a listed host name without regard to case.
+The command uses the alias for SSH.
+`build_targets.conf` keeps its separate `sync.hosts.*` settings.
+
 ## bake_textures_example.json
 
 Example configuration for the `/blender:bake_textures` command. Copy and modify this template to specify blend files, objects, texture maps, and export settings for texture baking.
@@ -584,6 +593,13 @@ Rsync replaces complete files and preserves this host's append files.
 | `history_days` | `7` | Show this many days of build history and top costs; at least `TOP_COST_RECENT_DAYS`. |
 | `swap_rows` | `6` | Show this many of the largest swap users; one line sums the rest. |
 | `report_refresh_seconds` | `300` | Read the history charts and top costs again after this many seconds. |
+| `remote_memory_light` / `remote_memory_dark` | `#626a78` / `#a0a8b6` | Color memory bars that do not count against natedev. |
+| `machine_natedev_light` / `machine_natedev_dark` | `#6243a6` / `#bba0ef` | Color the natedev name in the Machine column. |
+| `machine_mac_light` / `machine_mac_dark` | `#526b13` / `#b5ca72` | Color the mac name in the Machine column. |
+| `machine_aws_light` / `machine_aws_dark` | `#855126` / `#dbaa7d` | Color the aws name in the Machine column. |
+
+Configuration values use six hexadecimal digits without `#`.
+The text colors exceed 4.5:1 contrast against both backgrounds in their theme.
 
 The service publishes the repository page with an atomic write at each start.
 The service retains the last successful reading when the admission service does not answer.

@@ -1,15 +1,17 @@
-"""Run a Claude implementation pass inside assign."""
+"""Run a Claude implementation pass inside assign.
+
+Stop the launcher's process group to stop its child commands.
+Status readers recover claims after a launcher dies.
+"""
 from __future__ import annotations
 
 import json
 import os
 import re
-import signal
 import subprocess
 import sys
 from dataclasses import dataclass, replace
 from pathlib import Path
-from types import FrameType
 from typing import NoReturn, TypedDict, cast
 
 from scripts.agents import worker_lifecycle
@@ -102,11 +104,11 @@ def _record(launch: ClaudeLaunch, name: str) -> bool:
 
 
 def _claim(launch: ClaudeLaunch, name: str, env: dict[str, str]) -> None:
+    status = worker_state.worker_status_path(launch.run, launch.slot)
     with worker_state.worker_claim_lock(launch.run):
         path, expected, session = _identity(launch, name)
         if not _read(path) and expected["staff_id"]:
             _ = path.write_text(json.dumps(expected))
-        status = worker_state.worker_status_path(launch.run, launch.slot)
         claim = launch.run / f"impl_claim_{launch.slot}.json"
         owner = worker_state.read_worker_claim(claim)
         if isinstance(owner, worker_state.HeldWorkerClaim):
@@ -147,23 +149,14 @@ def _switch(launch: ClaudeLaunch, name: str) -> NewClaudeWorker | ClaudeDelivery
         return ClaudeFollowUp(name)
 
 
-def _interrupted(signum: int, frame: FrameType | None) -> NoReturn:
-    del frame
-    raise SystemExit(128 + signum)
-
-
 def run(launch: ClaudeLaunch) -> int:
-    """Keep the shell launch order and release the claim on exit."""
-    handlers = {sig: signal.signal(sig, _interrupted) for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP)}
+    """Release the claim on return; status readers recover a killed launcher."""
     try:
-        return _run(launch)
+        code = _run(launch)
     except subprocess.CalledProcessError as error:
         return error.returncode
-    finally:
-        if isinstance(launch.worker, ClaudeFollowUp):
-            _release(launch)
-        for sig, handler in handlers.items():
-            _ = signal.signal(sig, handler)
+    _release(launch)
+    return code
 
 
 def claim_phase(run: Path, phase: str, cwd: Path, log: Path, status: Path,
@@ -236,6 +229,13 @@ def _run(launch: ClaudeLaunch) -> int:
             slot = worker_admission.NewWorkerSlot()
     if isinstance(worker, ClaudeFollowUp):
         _claim(launch, name, env)
+    else:
+        with worker_state.worker_claim_lock(launch.run):
+            claim = launch.run / f"impl_claim_{launch.slot}.json"
+            owner = worker_state.read_worker_claim(claim)
+            if isinstance(owner, worker_state.HeldWorkerClaim):
+                _fail(f"{name} is claimed by launcher {owner.pid}")
+            worker_state.publish_worker_claim(claim, name)
     if not claim_phase(launch.run, launch.phase, launch.cwd, log, status, launch.slot, env):
         return 1
     env["UNIT_RUN_DIR"] = str(launch.run)

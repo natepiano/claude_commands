@@ -22,11 +22,9 @@ from scripts.accounts import accounts
 from scripts.agents import worker_lifecycle
 from scripts.lib import conf, models_registry, nix_env
 from scripts.lib.transcripts import open_transcript
-from scripts.message import sessions
+from scripts.message import session_send, sessions
 from scripts.production import staff, worker_admission
 from scripts.usage import agents_log
-
-SCRIPTS = Path(__file__).resolve().parents[1]
 
 
 @dataclass(frozen=True)
@@ -271,9 +269,10 @@ def _deliver(turn: ClaudeTurn, native_id: str, environment: Mapping[str, str]) -
             agents_log.append(native_id, cast(agents_log.Role, turn.role), None, datetime.now(timezone.utc))
         except Exception as error:
             print("agents_log: " + " ".join(str(error).splitlines()), file=sys.stderr)
-    script = environment.get("CLAUDE_WORKER_SEND_SCRIPT") or str(SCRIPTS / "message/send.py")
-    result = subprocess.run([str(SCRIPTS / "lib/py"), script, "--to", f"session:{native_id}", "--from", "launcher",
-                             "--file", str(turn.prompt)], env=environment, text=True, stdout=subprocess.PIPE, check=False)
+    script = environment.get("CLAUDE_WORKER_SEND_SCRIPT") or str(session_send.SEND_SCRIPT)
+    result = subprocess.run(session_send.send_argv("--to", f"session:{native_id}", "--from", "launcher",
+                             "--file", str(turn.prompt), send_script=Path(script), python_interpreter=session_send.PYTHON_LAUNCHER),
+                            env=environment, text=True, stdout=subprocess.PIPE, check=False)
     if result.returncode:
         raise _LaunchFailed(2)
     if not result.stdout.startswith(("SENT:", "SKIPPED:")):

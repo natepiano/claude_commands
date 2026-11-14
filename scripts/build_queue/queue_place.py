@@ -21,7 +21,7 @@ import threading
 import time
 from typing import BinaryIO, TypedDict, Unpack
 
-from scripts.lib import build_folders, atomic_file, conf
+from scripts.lib import build_folders, atomic_file, cancellation, conf
 from scripts.buildlog import store
 from scripts.build_queue import admission_records
 from scripts.build_queue import step_estimator
@@ -75,16 +75,6 @@ class QueuePlaceRefused(Exception):
 
 def no_hold_wait() -> None:
     pass
-
-
-@contextmanager
-def defer_cleanup_signals() -> Generator[None]:
-    """Keep ownership changes atomic with respect to runner cancellation."""
-    previous = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGTERM, signal.SIGHUP, signal.SIGINT})
-    try:
-        yield
-    finally:
-        _ = signal.pthread_sigmask(signal.SIG_SETMASK, previous)
 
 
 def in_builds_slice() -> bool:
@@ -217,23 +207,13 @@ def program_start(record: Path, holder: wire.Owner, argv: Sequence[str], *, scop
     os.execvp(argv[0], list(argv))
 
 
-def remove_queue_place_folder(path: Path, allocated: os.stat_result) -> None:
-    with defer_cleanup_signals():
-        try:
-            current = path.stat(follow_symlinks=False)
-        except FileNotFoundError:
-            return
-        if os.path.samestat(current, allocated):
-            shutil.rmtree(path)
-
-
 @contextmanager
 def queue_place_folder(prefix: str) -> Generator[Path]:
     """Allocate and remove the folder without installing a signal handler."""
     with ExitStack() as cleanup:
-        with defer_cleanup_signals():
-            path = build_folders.create_build_folder(build_folders.UniqueBuildFolder(prefix=prefix))
-            _ = cleanup.callback(remove_queue_place_folder, path, path.stat(follow_symlinks=False))
+        with cancellation.defer_cleanup_signals():
+            path = cleanup.enter_context(build_folders.temporary_build_folder(
+                build_folders.UniqueBuildFolder(prefix=prefix)))
         yield path
 
 
@@ -247,8 +227,8 @@ def cleanup_queue_place_folders() -> None:
         if admission_records.process_start_time(int(fields[0])) == fields[1]:
             continue
         try:
-            if not path.is_symlink() and path.stat().st_uid == os.getuid():
-                shutil.rmtree(path)
+            if not path.is_symlink() and path.is_dir() and path.stat().st_uid == os.getuid():
+                _ = build_folders.remove_build_folder(path, lambda: shutil.rmtree(path))
         except FileNotFoundError:
             pass
 
@@ -395,7 +375,7 @@ class QueuePlace:
         wrapper = [sys.executable, str(Path(__file__).resolve())]
         command = ([*prefix, *wrapper, "--scope-start", str(self.sidecar), str(holder_pid), holder_start, str(record), *argv]
                    if prefix else [*wrapper, "--program-start", str(record), str(holder_pid), holder_start, *argv])
-        with defer_cleanup_signals():
+        with cancellation.defer_cleanup_signals():
             process = subprocess.Popen(command, **popen_arguments)
             stopped = threading.Event()
             tracking: ScopedProgram | ProgramTree = ScopedProgram()
@@ -410,7 +390,7 @@ class QueuePlace:
                        threading.Thread(target=self._sample, args=(tracking, stopped), daemon=True))
             self.program = StartedProgram(process, stopped, sampler, tracking, record)
             if isinstance(sampler, threading.Thread):
-                sampler.start()
+                cancellation.start_masked_thread(sampler)
             while not record.exists():
                 if process.poll() is not None and not record.exists():
                     raise QueuePlaceRefused("the program exited before it published its ownership")
@@ -477,7 +457,7 @@ class QueuePlace:
             program.record.unlink(missing_ok=True)
         finally:
             program.stopped.set()
-            if isinstance(program.sampler, threading.Thread):
+            if isinstance(program.sampler, threading.Thread) and program.sampler.ident is not None:
                 program.sampler.join()
 
 
@@ -542,7 +522,7 @@ def queue_place(program: str | Sequence[str], repo: Path, *, batch: bool = False
                             error.code if isinstance(error, SystemExit) and isinstance(error.code, int) else 1)
             raise
         finally:
-            with defer_cleanup_signals():
+            with cancellation.defer_cleanup_signals():
                 place.finish(failed=failed)
                 if isinstance(grant, wire.Admitted):
                     _ = admission_client.release(grant.reservation, place.status, grant.cleanup_timing)

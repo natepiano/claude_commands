@@ -8,26 +8,20 @@ import os
 from pathlib import Path
 from datetime import datetime, timezone
 from dataclasses import replace
-from typing import cast, override
+from typing import cast
 from unittest.mock import patch
 from scripts.accounts import accounts
-from scripts.production.cli_fixture import process_boundary, process_boundary_for_case
+from scripts.production.cli_fixture import process_boundary
 from scripts.usage import agents_log
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.test_models_registry import claude_catalog_environment
 from scripts.direct.assign_claude_native_test_support import ClaudeLauncherFixture
+from scripts.direct.assign_claude_test_support import InProcessAssignClaudeLauncherFixture
 from scripts.production import staff, worker_admission
 from scripts.production.staff_test_support import CHECKOUT, fixture_runtime_id, fixture_session, isolated_staff_file, stopped_worker_module, transcript_fixture
 
 
-class AssignClaudeLauncherWorkerTests(ClaudeLauncherFixture):
-    @override
-    def setUp(self) -> None:
-        super().setUp()
-        _ = cast(object, self.enterContext(patch.dict(os.environ, {"MODELS_CONFIG_TIER_ONLY": "1"})))
-        # Keep the fixture entry unchanged for startup hooks and child observations.
-        _ = self.enterContext(patch.object(self, "direct_cli_calls", not process_boundary_for_case(self)))
-
+class AssignClaudeLauncherWorkerTests(InProcessAssignClaudeLauncherFixture, ClaudeLauncherFixture):
     @process_boundary
     def test_failed_switch_delivery_retries_the_saved_handoff_before_the_assignment(self) -> None:
         session_dir = self.start_phase("claude-switch-retry")
@@ -81,7 +75,7 @@ class AssignClaudeLauncherWorkerTests(ClaudeLauncherFixture):
                 environment.update(claude_catalog_environment(account, {"opus": first_model}))
                 modules = stopped_worker_module(self.root / "catalog-retry-modules")
                 environment.update({
-                    "PYTHONPATH": os.pathsep.join((str(modules), str(CHECKOUT))),
+                    "PYTHONPATH": os.pathsep.join((str(CHECKOUT / "scripts/lib/python_startup"), str(modules))),
                     "CLAUDE_WORKER_SEND_SCRIPT": str(self.root / "send"),
                     "STUB_TRANSCRIPT": str(transcript),
                     "STUB_SEND_BEHAVIOR": "queued",
@@ -144,7 +138,7 @@ class AssignClaudeLauncherWorkerTests(ClaudeLauncherFixture):
             "Path.read_text = read",
         )))
         environment = self.environment()
-        environment["PYTHONPATH"] = os.pathsep.join((str(modules), str(CHECKOUT)))
+        environment["PYTHONPATH"] = os.pathsep.join((str(CHECKOUT / "scripts/lib/python_startup"), str(modules)))
         with patch.object(self, "environment", return_value=environment):
             result = self.worker_launch(run, to="fixture-impl", behavior="complete")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
@@ -168,7 +162,7 @@ class AssignClaudeLauncherWorkerTests(ClaudeLauncherFixture):
         _ = record_path.write_text(json.dumps({"dispatch_state": "invalid"}))
         modules = stopped_worker_module(self.root / "switch-modules")
         environment = self.environment()
-        environment["PYTHONPATH"] = os.pathsep.join((str(modules), str(CHECKOUT)))
+        environment["PYTHONPATH"] = os.pathsep.join((str(CHECKOUT / "scripts/lib/python_startup"), str(modules)))
         with patch.object(self, "environment", return_value=environment):
             result = self.worker_launch(run, to="fixture-impl", behavior="complete")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
