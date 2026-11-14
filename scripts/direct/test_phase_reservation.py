@@ -145,6 +145,44 @@ class WorktreeAttributionTests(unittest.TestCase):
         check.assert_called_once_with(self.first, ["changed.txt"], mock.ANY)
         self.assertEqual(phase_reservation.read_state(directory)["kind"], phase_reservation.ACTIVE)
 
+    def test_record_active_claims_only_the_paths_a_merge_resolved_by_hand(self) -> None:
+        def git(*command: str) -> None:
+            _ = subprocess.run(["git", "-C", str(self.first), "-c", "user.name=Test",
+                                "-c", "user.email=test@example.invalid", *command],
+                               check=True, capture_output=True, timeout=TEST_HANG_GUARD_SECS)
+
+        _ = (self.first / "base.txt").write_text("base\n")
+        git("add", "base.txt")
+        git("commit", "-q", "-m", "tracked")
+        directory = phase_reservation.phase_directory(self.session, "1")
+        _ = phase_reservation.enroll(directory, "1", "board_ready")
+        self.assertEqual(self.claim("1", self.first), (0, ""))
+        git("switch", "-q", "-c", "upstream")
+        for name in ("plain.txt", "resolved.txt"):
+            _ = (self.first / name).write_text("from main\n")
+        git("add", "plain.txt", "resolved.txt")
+        git("commit", "-q", "-m", "upstream work")
+        git("switch", "-q", "main")
+        _ = (self.first / "own.txt").write_text("phase work\n")
+        git("add", "own.txt")
+        git("commit", "-q", "-m", "phase work")
+        git("merge", "-q", "--no-ff", "--no-commit", "upstream")
+        _ = (self.first / "resolved.txt").write_text("resolved by hand\n")
+        git("add", "resolved.txt")
+        git("commit", "-q", "-m", "phase-start merge")
+        _ = (self.first / "base.txt").write_text("edited\n")
+        _ = (self.first / "untracked.txt").write_text("new\n")
+        answer = phase_reservation.CheckAnswer(phase_reservation.CLEAR, "",
+                                              phase_reservation.Acquisition("r1", "c1",
+                                                                           phase_reservation.commit_id(self.first, "HEAD")))
+        with mock.patch.object(phase_reservation, "check", return_value=answer) as check, \
+                contextlib.redirect_stdout(io.StringIO()):
+            code = phase_reservation.main(["record-active", "--session-dir", str(self.session),
+                                           "--phase", "1", "--repo", str(self.first)])
+        self.assertEqual(code, 0)
+        check.assert_called_once_with(self.first, ["resolved.txt", "own.txt", "base.txt", "untracked.txt"],
+                                      mock.ANY)
+
     def test_claim_refuses_a_missing_head_without_publishing_a_baseline(self) -> None:
         _ = subprocess.run(["git", "-C", str(self.first), "checkout", "-q", "--orphan", "unborn"],
                            check=True, capture_output=True, timeout=TEST_HANG_GUARD_SECS)
