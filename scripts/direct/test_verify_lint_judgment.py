@@ -18,6 +18,7 @@ from scripts.direct.verify_lint_diagnostics_test_support import (
     RUSTC_DENY_ATTRIBUTE,
 )
 from scripts.direct.verify_lint_scope_test_support import CARGO_STUB, SCRIPTS, VERIFY
+from scripts.lib.checkout_test_support import write_stdlib_tool
 from scripts.lib.shell_test_support import shell_functions
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
@@ -104,7 +105,7 @@ class VerifyLintJudgmentFixture(VerifyLintCacheFixture):
     @override
     def build_fixture(self) -> None:
         super().build_fixture()
-        self.write_executable(self.root / "bin" / "cargo", FIRST_JUDGMENT + CARGO_STUB)
+        write_stdlib_tool(self.root / "bin" / "cargo", FIRST_JUDGMENT + CARGO_STUB)
         self.environment["TEST_CLIPPY_FIRST_DIAGNOSTIC"] = LINT_FINDING
 
     @override
