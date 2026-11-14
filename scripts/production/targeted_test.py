@@ -11,13 +11,15 @@ from collections.abc import Sequence
 from typing import cast
 
 from scripts.production import merge_gate
+from scripts.lib.testing_folders import test_run_folder
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     merge_gate.add_suite_arguments(parser)
     args = cast(merge_gate.GateArguments, parser.parse_args(argv))
-    return merge_gate.run_tests_only(args, merge_gate.SuiteMode.TARGETED_TEST)
+    with test_run_folder():
+        return merge_gate.run_tests_only(args, merge_gate.SuiteMode.TARGETED_TEST)
 
 
 if __name__ == "__main__":

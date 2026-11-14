@@ -116,7 +116,7 @@ Coordinate shared files through sdlc; phase ownership does not transfer file own
 
 | Phase | Deliverable | Owner unit | Hours | Depends on |
 | --- | --- | --- | ---: | --- |
-| bf1 | Maker and process lock; in progress | devtools; queue reviews B files | 6 | None |
+| bf1 | Maker and process lock; landed | devtools; queue reviews B files | 6 | None |
 | 2 | Rescue and legacy collector protection | queue; resources and devtools own collector edits | 8 | bf1 |
 | 3 | Slots, limits, affinity, and queue fields | queue; resources wires capacity | 10 | 2; values approved 2026-11-12 |
 | 4 | Gate caches become slots | queue and aws | 8 | 3 |
@@ -171,7 +171,7 @@ All builds-owned adjacent tests carry the same B owner as their implementation.
 
 ## Phase bf1 — Maker and process lock
 
-**Status:** in progress at a devtools worker.
+**Status:** landed on main.
 **Goal:** Implement D1 and D5 without moving callers.
 **Owner unit:** devtools implements the current dispatch; builds queue reviews and retains ownership of the B files.
 **Estimate:** 6 worker hours.
@@ -209,6 +209,10 @@ Do not add slots, rescue refs, or size limits during bf1.
 
 **Goal:** Preserve Git work and protect every held lease from old deletion rules.
 **Owner units:** queue owns rescue; resources owns `tmp_sweep.py`; devtools owns `folder_audit.py` and scratch integration.
+**Devtools part (bf2d):** `build_folders.collector_lease` holds a managed folder's lease lock without waiting.
+`scratch.removal_lock` and `scratch.judgment_lock` take it first and hold it through judgment and deletion; a held lease is busy.
+The folder audit, the tmp sweep, scratch end, the floor sweep and copy removal get the guard through these locks.
+`tmp_sweep.py` still reports the old busy reason; resources can use `scratch.BUSY_REASON`.
 **Estimate:** 8 worker hours.
 **Depends on:** bf1.
 **Files:** Maker files, `scripts/lib/scratch.py`, and the Phase 2 collector inventory rows with their tests.
@@ -377,6 +381,16 @@ Run stall watch, process group, sweep, folder audit, and source enforcement test
 Run the existing complete gate after the final migration.
 
 ## Phase 9 — Test run folders
+
+**Status:** built in bf9 (609b743ff).
+**Implementation:** Direct unittest and timed runs allocate through the shared Python bootstrap.
+`targeted_test.py` uses the same maker context.
+Each run holds its lock and sets TMPDIR for itself and its children.
+Normal exit removes the complete allocation.
+The next run sweeps free residue in the same test-runs parent before allocation.
+The sweep retains held allocations and removes unfinished temporary lease files under the allocation lock.
+`run_build` keeps its command in the caller's process group and installs no signal handler.
+Stopped commands leave recorded residue for the sweep after their locks become free.
 
 **Goal:** Give each test run outside the merge gate its own TMPDIR, so a killed run leaves no folder behind.
 **Owner unit:** devtools.
