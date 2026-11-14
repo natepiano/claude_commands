@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
+from scripts.build_queue.admission_test_support import caller_admission, caller_provider_controls, private_provider_evidence
+from scripts.build_queue import admission_protocol as wire, admission_service as service, placement
+from scripts.mac_test import claim_state, eligibility
 from scripts.lib.checkout_test_support import copy_runtime, python_tool_source, write_python_tool
-
-from scripts.build_queue.admission_test_support import caller_admission
-from scripts.build_queue import admission_protocol as wire
 from scripts.lib.py_floor_test_support import seed_interpreter_cache
 
 from scripts.copies.copies_test_support import copies_environment
@@ -30,7 +30,7 @@ from collections.abc import Callable, Generator, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import ClassVar, TypedDict, cast, override
+from typing import ClassVar, NotRequired, TypedDict, cast, override
 from unittest import mock
 
 from scripts.build_hold import build_hold
@@ -233,12 +233,15 @@ def hold_recorder_exits(timeout: float = TEST_HANG_GUARD_SECS) -> Generator[None
 class CargoEvent(TypedDict):
     args: list[str]
     token_held: bool
+    token_holder: NotRequired[str]
+    coordinator: NotRequired[str]
 
 
 class RunnerEvent(TypedDict):
     args: list[str]
     token_held: bool
     at: float
+    clock: NotRequired[str]
 
 
 class RoutingEvent(TypedDict):
@@ -320,7 +323,10 @@ if tuple(arguments) in (("mend", "--version"), ("+nightly", "fmt", "--version"),
     raise SystemExit(0)
 event = {
     "args": arguments,
-    "token_held": Path(os.environ["TEST_TOKEN_RECORD"]).exists(),
+    "token_holder": Path(os.environ["TEST_TOKEN_RECORD"]).read_text().strip() if Path(os.environ["TEST_TOKEN_RECORD"]).exists() else "",
+    "coordinator": os.environ.get("BUILDLOG_HOLD_PID", ""),
+    "token_held": (Path(os.environ["TEST_TOKEN_RECORD"]).exists()
+                   and Path(os.environ["TEST_TOKEN_RECORD"]).read_text().strip() == os.environ.get("BUILDLOG_HOLD_PID", "")),
 }
 with Path(os.environ["TEST_CARGO_EVENTS"]).open("a", encoding="utf-8") as output:
     output.write(json.dumps(event) + "\n")
@@ -380,10 +386,17 @@ fi
 if [ "${1:-}:${2:-}" = nextest:run ] && [ "${TEST_CARGO_HOLD:-}" = 1 ]; then
     python_reply "$@"
 fi
+token_exists=0
+token_holder=''
+if [ -e "$TEST_TOKEN_RECORD" ]; then
+    token_exists=1
+    read -r token_holder < "$TEST_TOKEN_RECORD" || true
+fi
+coordinator=${BUILDLOG_HOLD_PID-}
 original_locale=${LC_ALL-}
 locale_was_set=${LC_ALL+x}
 LC_ALL=C
-for argument do
+for argument in "$@" "$token_holder" "$coordinator"; do
     case "$argument" in
         *[!\ -~]*)
             if [ "$locale_was_set" = x ]; then LC_ALL=$original_locale; else unset LC_ALL; fi
@@ -391,9 +404,8 @@ for argument do
             ;;
     esac
 done
-arguments=''
-separator=''
-for argument do
+json_quote() {
+    argument=$1
     quoted=''
     while [ -n "$argument" ]; do
         remaining=${argument#?}
@@ -404,12 +416,22 @@ for argument do
         esac
         argument=$remaining
     done
+}
+arguments=''
+separator=''
+for argument do
+    json_quote "$argument"
     arguments=$arguments$separator\"$quoted\"
     separator=', '
 done
+json_quote "$token_holder"
+token_json=$quoted
+json_quote "$coordinator"
+coordinator_json=$quoted
 token_held=false
-if [ -e "$TEST_TOKEN_RECORD" ]; then token_held=true; fi
-printf '{"args": [%s], "token_held": %s}\n' "$arguments" "$token_held" >> "$TEST_CARGO_EVENTS" || exit 1
+if [ "$token_exists" = 1 ] && [ "$token_holder" = "$coordinator" ]; then token_held=true; fi
+printf '{"args": [%s], "token_holder": "%s", "coordinator": "%s", "token_held": %s}\n' \
+    "$arguments" "$token_json" "$coordinator_json" "$token_held" >> "$TEST_CARGO_EVENTS" || exit 1
 if [ "${1:-}" = metadata ]; then
     printf '%s\n' "$TEST_METADATA"
     exit 0
@@ -469,6 +491,81 @@ fi
 '''
 
 
+ASSIGNED_RUNNER_SETUP = r'''
+if "--assignment-file" in arguments:
+    import atexit
+    import io
+    import uuid
+    from contextlib import redirect_stdout
+
+    with open(Path(os.environ["TEST_REAL_RECORD"]).resolve().parents[2] / "scripts/lib/package_root.py") as package_root:
+        exec(package_root.read(), {"__file__": package_root.name})
+    from scripts.build_queue import admission_client, admission_protocol as wire, placement
+    from scripts.mac_test import mac_test as assigned_mac_test, claim_state
+    from scripts.lib import process_start
+
+    assignment = admission_client.read_assignment(Path(arguments[arguments.index("--assignment-file") + 1])).assignment
+    claim_args = assigned_mac_test.CliArguments()
+    claim_args.pid, claim_args.worktree = os.getpid(), arguments[arguments.index("--repo-root") + 1]
+    claim_args.target, claim_args.remote = assignment.destination.target, assignment.destination.host
+    claim_args.what, claim_args.copy = "nextest sample", "--copy" in arguments
+    if "--claim-owner-pid" in arguments:
+        claim_args.from_pid = int(arguments[arguments.index("--claim-owner-pid") + 1])
+    for field in ("claim_id", "episode", "attempt"):
+        flag = "--" + field.replace("_", "-")
+        if flag in arguments:
+            setattr(claim_args, field, arguments[arguments.index(flag) + 1])
+    paths = claim_state.state_paths(claim_args.target)
+    with redirect_stdout(io.StringIO()):
+        claim_status = assigned_mac_test.command_claim(claim_args, paths, watch_claim=False,
+            session=assignment.session, assignment=assignment)
+    if claim_status != 0:
+        raise SystemExit(75)
+    held, = [held for held in claim_state.read_claims(paths) if held.record["pid"] == os.getpid()]
+    identity = claim_state.claim_identity(held.record)
+    reference = placement.ProviderClaimReference(assignment.destination.provider, assignment.destination.target,
+        assignment.destination.scope, identity.claim_id, identity.episode, identity.attempt)
+    start = process_start.process_start(os.getpid())
+    assert isinstance(start, process_start.Started)
+    holder = placement.ClaimHolderIdentity(assignment.owner.host, os.getpid(), start.start)
+    permission_deadline = time.monotonic() + 10
+    while True:
+        permission = admission_client.consume_permission(wire.ConsumePermission(uuid.uuid4().hex, assignment, reference, holder))
+        if isinstance(permission, wire.FirstAuthorization):
+            break
+        if not isinstance(permission.permission, placement.PermissionAvailable):
+            print("fixture authorization refused: " + permission.reason, file=sys.stderr, flush=True)
+            raise SystemExit(75)
+        if time.monotonic() >= permission_deadline:
+            print("fixture authorization timed out: " + permission.reason, file=sys.stderr, flush=True)
+            raise SystemExit(75)
+        time.sleep(0.05)
+    with (root / "authorized-executions").open("a") as output:
+        output.write(assignment.attempt + "\n")
+
+    fixture_outcome = placement.AttemptOutcomeUnavailable("the execution has not settled")
+    fixture_evidence = placement.ExecutionEvidenceUnavailable("the execution has not settled", time.time())
+    fixture_cleanup_confirmed = False
+
+    def finish_assigned() -> None:
+        settled = fixture_cleanup_confirmed
+        if settled:
+            release = assigned_mac_test.CliArguments()
+            release.pid, release.target = os.getpid(), assignment.destination.target
+            release.claim_id, release.episode, release.attempt = identity.claim_id, identity.episode, identity.attempt
+            with redirect_stdout(io.StringIO()):
+                status = assigned_mac_test.command_release(release, paths)
+            settled = status == 0 and not any(claim_state.claim_identity(held.record) == identity
+                                             for held in claim_state.read_claims(paths))
+        admission_client.report_execution(wire.ExecutionReport(uuid.uuid4().hex, assignment, reference,
+            fixture_evidence, fixture_outcome,
+            placement.DispatchPathSettled() if settled else placement.DispatchPathPending("the private runner has unresolved work")))
+
+    atexit.register(finish_assigned)
+
+'''
+
+
 RUNNER_STUB = r'''
 from __future__ import annotations
 
@@ -484,6 +581,11 @@ arguments = sys.argv[1:]
 root = Path(os.environ["TEST_RUNNER_STATE"])
 result = Path(arguments[arguments.index("--result") + 1])
 
+''' + ASSIGNED_RUNNER_SETUP + r'''
+if "--assignment-file" in arguments:
+    fixture_outcome = placement.PrelaunchRefused("runner")
+    fixture_evidence = placement.ExecutionNotStarted()
+    fixture_cleanup_confirmed = True
 if "--copy" in arguments:
     # A Mac copy started by copy_watch.py. With TEST_COPY_CLAIM (mac_test.py)
     # it holds a real copy claim; with TEST_COPY_WAIT=1 it waits for
@@ -491,7 +593,7 @@ if "--copy" in arguments:
     # TEST_COPY_STATUS. SIGTERM releases the claim and exits 143.
     import subprocess
 
-    mac_test = os.environ.get("TEST_COPY_CLAIM", "")
+    mac_test = "" if "--assignment-file" in arguments else os.environ.get("TEST_COPY_CLAIM", "")
     claimed = False
     claim_identity = ["--claim-id", f"copy-claim-{os.getpid()}", "--episode", f"copy-episode-{os.getpid()}",
                       "--attempt", f"copy-attempt-{os.getpid()}"]
@@ -502,6 +604,9 @@ if "--copy" in arguments:
                            check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
     def stop_copy(signal_number: int, _frame: object) -> None:
+        global fixture_outcome
+        if "--assignment-file" in arguments:
+            fixture_outcome = placement.AttemptDeclined("busy")
         release_copy_claim()
         # Renamed into place, so the test never reads it half written.
         (root / "copy-signal.tmp").write_text(str(signal_number), encoding="utf-8")
@@ -527,6 +632,9 @@ if "--copy" in arguments:
         with open(Path(os.environ["TEST_WAIT_HELPER"]).resolve().parents[2] / "scripts/lib/package_root.py") as package_root: exec(package_root.read(), {"__file__": package_root.name})
         from scripts.direct.wait_for_test_state import wait_for_file
         wait_for_file(root / "copy-release")
+    if "--assignment-file" in arguments:
+        fixture_outcome = placement.AttemptCompleted(int(os.environ.get("TEST_COPY_STATUS", "1")))
+        fixture_evidence = placement.ExecutionEvidenceUnavailable("the private command has ended", time.time())
     result.write_text("mac=" + os.environ.get("TEST_COPY_MAC", "failed") + "\nreason=\nseconds="
                       + os.environ.get("TEST_COPY_SECONDS", "2.5") + "\n", encoding="utf-8")
     release_copy_claim()
@@ -534,8 +642,12 @@ if "--copy" in arguments:
 
 event = {
     "args": arguments,
-    "token_held": Path(os.environ["TEST_TOKEN_RECORD"]).exists(),
+    "token_holder": Path(os.environ["TEST_TOKEN_RECORD"]).read_text().strip() if Path(os.environ["TEST_TOKEN_RECORD"]).exists() else "",
+    "coordinator": os.environ.get("BUILDLOG_HOLD_PID", ""),
+    "token_held": (Path(os.environ["TEST_TOKEN_RECORD"]).exists()
+                   and Path(os.environ["TEST_TOKEN_RECORD"]).read_text().strip() == os.environ.get("BUILDLOG_HOLD_PID", "")),
     "at": time.monotonic(),
+    "clock": Path(os.environ["TEST_ROUTING_CLOCK"]).read_text() if os.environ.get("TEST_ROUTING_CLOCK") else "",
 }
 with (root / "runner-events.jsonl").open("a", encoding="utf-8") as output:
     output.write(json.dumps(event) + "\n")
@@ -547,6 +659,16 @@ attempt = len((root / "runner-events.jsonl").read_text().splitlines())
 last_decline = arguments[arguments.index("--last-decline") + 1] if "--last-decline" in arguments else ""
 
 def decline(reason: str, seconds: str) -> None:
+    global fixture_outcome, fixture_evidence
+    if "--assignment-file" in arguments:
+        fixture_outcome = (placement.AttemptDeclined(reason) if reason in ("no_tests", "lost")
+                           else placement.PrelaunchRefused(reason))
+        fixture_evidence = placement.ExecutionNotStarted()
+    refusal = root / "placement-refusal.json"
+    ready = refusal.with_suffix(".ready")
+    ready.write_text(json.dumps({"reason": reason or "runner", "attempt": attempt,
+                                "target": assignment.destination.target if "--assignment-file" in arguments else "mac"}))
+    os.replace(ready, refusal)
     holder = "holder=" + os.environ.get("TEST_RUNNER_HOLDER", "other tests") + "\n" if reason == "busy" else ""
     result.write_text("mac=declined\nreason=" + reason + "\nseconds=" + seconds + "\n" + holder)
     if reason not in ("busy", "blocked") or reason != last_decline:
@@ -566,6 +688,9 @@ if attempt > 1 and os.environ.get("TEST_RUNNER_PAUSE_RETRY") == "1":
 
 if os.environ.get("TEST_RUNNER_HOLD") == "1":
     def stop(signum: int, _frame: object) -> None:
+        global fixture_outcome
+        if "--assignment-file" in arguments:
+            fixture_outcome = placement.AttemptCancelled("the private runner stopped")
         (root / "runner-signal").write_text(str(signum), encoding="utf-8")
         raise SystemExit(128 + signum)
 
@@ -583,6 +708,13 @@ answer = root / "runner-answer"
 if answer.exists():
     mode, reason, status_text = answer.read_text().splitlines()
     runner_status = int(status_text)
+if "--assignment-file" in arguments:
+    if (mode == "passed" and runner_status == 0) or (mode == "failed" and runner_status not in (0, 75)):
+        fixture_outcome = placement.AttemptCompleted(runner_status)
+        fixture_evidence = placement.ExecutionEvidenceUnavailable("the private command has ended", time.time())
+    elif mode == "lost":
+        fixture_outcome = placement.AttemptDeclined("lost")
+        fixture_evidence = placement.ExecutionEvidenceUnavailable("the private command has ended", time.time())
 if mode in ("passed", "failed", "lost"):
     print("mac_test: running on the Mac (macOS, host Mac); tree copied in 0.0 s", flush=True)
 if mode == "none":
@@ -646,6 +778,19 @@ raise SystemExit(status)
 SLEEP_STUB = r'''#!/bin/sh
 # Record the requested interval; only explicit routing gates block this fixture.
 root=$TEST_RUNNER_STATE
+if [ "${TEST_PROVIDER_ROUTE_POLL_GATES:-0}" = 1 ]; then
+    if [ "$1" != "${BUILD_TARGETS_POLL_S:-15}" ]; then
+        exec "$TEST_REAL_SLEEP" "$@"
+    fi
+    attempts=0
+    previous=0
+    if [ -s "$root/runner-events.jsonl" ]; then attempts=$(wc -l < "$root/runner-events.jsonl"); fi
+    if [ -s "$root/sleep-events" ]; then previous=$(wc -l < "$root/sleep-events"); fi
+    if [ "$attempts" -le "$previous" ]; then exit 0; fi
+fi
+if [ "${TEST_ROUTE_SLEEP_AFTER_RUNNER:-0}" = 1 ] && [ ! -s "$root/runner-events.jsonl" ]; then
+    exit 0
+fi
 printf '%s\n' "$1" >> "$root/sleep-events"
 gate=""
 if [ "${TEST_STEP_ROUTING_SLEEP:-0}" = 1 ]; then
@@ -764,6 +909,8 @@ class VerifyMacOffloadFixture(unittest.TestCase):
         self.cargo_events_path: Path = Path()
         self.environment: dict[str, str] = {}
         self.verify_script: Path = VERIFY
+        self.placement_policy: dict[str, str] = {}
+        self.provider_observations: list[placement.HostEvidenceKey] = []
 
     fixture_root: ClassVar[Path]
     fixture_seed: ClassVar[Path]
@@ -786,6 +933,7 @@ class VerifyMacOffloadFixture(unittest.TestCase):
 
     @override
     def setUp(self) -> None:
+        self.provider_observations = []
         if "fixture_seed" in type(self).__dict__:
             self.root = self.fixture_root
             self.addCleanup(shutil.rmtree, self.root)
@@ -797,7 +945,99 @@ class VerifyMacOffloadFixture(unittest.TestCase):
             self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
             self.build_fixture()
         self.addCleanup(self.assert_nothing_outlives)
-        _ = caller_admission(self, self.root, self.environment)
+        admission = caller_admission(self, self.root, self.environment)
+        admission.configure(waiting_pass_seconds=0.05)
+
+        def provider(key: placement.HostEvidenceKey) -> placement.HostEvidence:
+            self.provider_observations.append(key)
+            with (self.runner_state / "provider-observations").open("a") as output:
+                _ = output.write(key.destination.target + "\n")
+            destination = key.destination
+            eligibility: placement.HostEligibility = placement.AllowedHost()
+            if destination.provider == "local":
+                from scripts.build_targets import build_targets
+
+                directory = Path(self.environment["BUILD_HOLD_DIR"])
+                owner = key.local_hold_owner
+                lineage = (build_targets.read_caller_lineage(admission.proc.path, owner.pid, owner.start_time)
+                           if isinstance(owner, placement.SubmittingOwner)
+                           else build_targets.UnavailableCallerLineage("the local caller identity is unavailable"))
+                blocking = build_targets.hold_waited_on(build_hold.natedev_holds(directory), key.session, directory, lineage)
+                if not isinstance(blocking, build_targets.NoBlockingHold):
+                    eligibility = placement.TemporaryExclusion("blocked")
+            else:
+                provider_directory = (Path(self.environment["MAC_TEST_STATE_DIR"]) if destination.target == "mac" else
+                                      self.home / ".local/state/build-targets" / destination.target)
+                available = self.runner_state / "available-gib"
+                until = self.placement_policy.get("TEST_RUNNER_BUSY_UNTIL", "")
+                allow_runner_refusal = self.placement_policy.get("TEST_PROVIDER_ALLOW_RUNNER_REFUSALS") == "1"
+                refusal = self.runner_state / "placement-refusal.json"
+                outcome = self.runner_state / f"provider-outcome-{destination.target}.json"
+                if outcome.exists():
+                    refusal = outcome
+                if self.placement_policy.get("TEST_PROVIDER_ROUTE_POLL_GATES") == "1" and refusal.exists():
+                    from scripts.build_targets import build_targets
+
+                    recorded = cast(dict[str, object], json.loads(refusal.read_text()))
+                    attempt = cast(int, recorded["attempt"])
+                    gate = (f"continue-sleep-{attempt}" if self.placement_policy.get("TEST_STEP_ROUTING_SLEEP") == "1"
+                            else "continue-sleep")
+                    directory = Path(self.environment["BUILD_HOLD_DIR"])
+                    request = admission.server.host_requests[key]
+                    lineage = build_targets.read_caller_lineage(admission.proc.path, request.owner.pid, request.owner.start_time)
+                    holding = build_targets.hold_waited_on(build_hold.natedev_holds(directory), key.session, directory, lineage)
+                    allow_runner_refusal = ((self.runner_state / gate).exists()
+                        and not isinstance(holding, build_targets.NoBlockingHold)
+                        and self.placement_policy.get("TEST_RUNNER_BUSY_REASON") != "blocked")
+                if self.placement_policy.get("TEST_FREE_NOW_ONCE"):
+                    allow_runner_refusal = len(self.runner_events()) < 2
+                if refusal.exists() and not allow_runner_refusal:
+                    recorded = cast(dict[str, object], json.loads(refusal.read_text()))
+                    if (recorded.get("target", "mac") == destination.target
+                            and (not until or recorded["reason"] != "busy")):
+                        eligibility = placement.TemporaryExclusion(cast(str, recorded["reason"]))
+                configured = dict(line.split("=", 1) for line in (self.root / "build_targets.conf").read_text().splitlines()
+                                  if "=" in line and not line.lstrip().startswith("#"))
+                settings = self.root / configured.get("settings." + destination.target, "mac_test.conf")
+                values = dict(line.split("=", 1) for line in settings.read_text().splitlines()
+                              if "=" in line and not line.lstrip().startswith("#"))
+                if values.get("offload") == "off":
+                    eligibility = placement.TemporaryExclusion("off")
+                elif ((backoff := provider_directory / "unreachable_until").exists()
+                      and float(backoff.read_text()) > time.time()):
+                    eligibility = placement.TemporaryExclusion("backoff")
+                elif available.exists() and float(available.read_text()) == 0:
+                    eligibility = placement.TemporaryExclusion("disk")
+                elif (until and not Path(until).exists()
+                      and not allow_runner_refusal):
+                    reason_file = self.runner_state / "busy-reason"
+                    reason = (reason_file.read_text().strip() if reason_file.exists()
+                              else self.placement_policy.get("TEST_RUNNER_BUSY_REASON", "busy"))
+                    eligibility = placement.TemporaryExclusion(reason)
+                else:
+                    try:
+                        probe = subprocess.run(
+                            [str(self.bin_directory / "ssh"), values.get("host", destination.host), "true"],
+                            env=self.environment, stdin=subprocess.DEVNULL, capture_output=True,
+                            check=False, timeout=1)
+                        unreachable = probe.returncode != 0
+                    except (OSError, subprocess.TimeoutExpired):
+                        unreachable = True
+                    if unreachable:
+                        eligibility = placement.TemporaryExclusion("unreachable")
+            directory = (Path(self.environment["MAC_TEST_STATE_DIR"]) if destination.target == "mac" else
+                         self.home / ".local/state/build-targets" / destination.target)
+            controller = directory / "controller.json"
+            if destination.provider == "ssh" and controller.exists():
+                control = cast(dict[str, object], json.loads(controller.read_text()))
+                if control.get("state") in ("stopped", "starting", "pending", "stopping"):
+                    eligibility = placement.TemporaryExclusion("starting")
+            paths = claim_state.StatePaths(directory, destination.target,
+                platform="macos" if destination.provider == "mac" else "linux")
+            return private_provider_evidence(admission, key, paths, eligibility)
+
+        admission.server.host_probe = provider
+        _ = caller_provider_controls(self, admission)
 
     def fixture_paths(self) -> None:
         self.home = self.root / "home"
@@ -955,7 +1195,7 @@ class VerifyMacOffloadFixture(unittest.TestCase):
             "TEST_ROUTING_SLEEP_SCRIPT": str(self.bin_directory / "sleep"),
             "TEST_WAIT_HELPER": str(VERIFY.with_name("wait_for_test_state.py")),
             "TEST_CARGO_EVENTS": str(self.cargo_events_path),
-            "TEST_TOKEN_RECORD": str(self.board / "locks" / "cargo.d" / "owned"),
+            "TEST_TOKEN_RECORD": str(self.board / "locks" / "cargo.d" / "holder_pid"),
             "TEST_METADATA": json.dumps(metadata),
             "TEST_RUNNER_SECONDS": "3.25",
             "TEST_REAL_RECORD": str(VERIFY.parent.parent / "buildlog" / "record.py"),
@@ -975,8 +1215,31 @@ class VerifyMacOffloadFixture(unittest.TestCase):
         else:
             write_python_tool(path, source)
 
+    def assigned_remote(self, target: str, verb: str, kind: str = "test") -> Path:
+        """Request a real assignment for a private runner boundary."""
+        from scripts.build_queue import admission_client, admission_protocol
+        from scripts.mac_test import offload
+
+        path = self.runner_state / f"direct-{target}-{verb}.assignment"
+        settings = self.root / ("linux.conf" if target == "peer" else "mac settings.conf")
+        with mock.patch.dict(os.environ, self.environment):
+            args = offload.parser().parse_args(["run", "--repo-root", str(self.root),
+                "--package", "sample", "--settings", str(settings), "--target", target,
+                "--verb", verb, "--kind", kind, "--call-id", f"fixture-{os.getpid()}-{target}-{verb}",
+                "--result", str(path.with_suffix(".result"))],
+                namespace=offload.CliArguments())
+            request = offload.submit_direct_placement(offload.request_from_arguments(args), time.time(),
+                                                       eligibility.read_config(settings))
+            assert isinstance(request.placement, offload.AssignedOffloadRequest)
+            admission_client.write_assignment(path, admission_protocol.Assignment(request.placement.assignment))
+        return path
+
     def call_mac_functions(self, body: str, *, extra: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
         """Call the real result and retry functions with private tools and records."""
+        return self.finish_verify(self.start_mac_functions(body, extra=extra))
+
+    def start_mac_functions(self, body: str, *, extra: dict[str, str] | None = None) -> subprocess.Popen[str]:
+        """Start the real result and retry functions with private tools and records."""
         install_fixed_cargo(self.bin_directory / "cargo")
         direct = self.root / "direct-functions"
         direct.mkdir(exist_ok=True)
@@ -990,11 +1253,14 @@ class VerifyMacOffloadFixture(unittest.TestCase):
             "step_state", "publish_step_state", "tree_key", "set_verdict_keys", "after_tree_change",
             "start_tree_watch", "finish_tree_watch", "stop_tree_watch", "cancel_tree_run",
             "record_mac_pass", "cache_record", "user_clock", "finish_mac_pass", "note_event",
-            "collect_hold_wait", "collect_routing_wait", "phase_wait_finish", "phase_wait_finish_all",
-            "finish_hold_wait", "release_wait_claim", "step_can_retry", "register_mac_wait",
-            "remember_mac_retry", "mac_retry_hook", "ssh_retry_hook", "remote_step_kind", "ssh_reserve_hook",
-            "try_reserved_target", "check_mac_only_result", "mac_only_refuse",
+            "collect_hold_wait", "collect_routing_wait", "phase_wait_start", "phase_wait_holder_flags", "phase_wait_finish", "phase_wait_finish_all",
+            "finish_hold_wait", "release_wait_claim", "step_can_retry", "remote_step_kind",
+            "placement_once", "start_routing_wait", "wait_for_placement", "buildlog_memory_event",
+            "route_compiling_step", "sync_token_state",
+            "pinned_target_refuse", "record_token_wait", "renew_token", "start_token_renewer",
+            "try_reserved_target", "mac_only_refuse",
             "route_test", "check_routing_hold")
+        functions += shell_functions(VERIFY.parent.parent / "lint/invoke.sh", "buildlog_now")
         functions += shell_functions(VERIFY.parent.parent / "lint/memory_gate.sh",
                                      "build_hold_nothing_held", "build_hold_check_result",
                                      "build_check_stop", "build_check_record_failure")
@@ -1013,8 +1279,11 @@ BUILDLOG_CALL_ID=direct-$$
 export BUILDLOG_CALL_ID BUILDLOG_CALLER=verify
 HOLD_WAIT_DIR=$TEST_RUNNER_STATE/hold
 mkdir -p "$HOLD_WAIT_DIR"
+: > "$HOLD_WAIT_DIR/remote-step-kinds"
 BUILDLOG_HOLD_WAIT_FILE=$HOLD_WAIT_DIR/seconds
-ROUTING_WAIT_STARTED="" PHASE_WAIT_SESSION=""
+ROUTING_WAIT_STARTED="" PHASE_WAIT_SESSION="" PHASE_RESOURCE_WAIT=""
+PHASE_TOKEN_OBSERVATION="" PHASE_TOKEN_HOLDER=""
+PLACEMENT_WAIT_MEMORY=0 PLACEMENT_RETRY_NOTICE_SHOWN=0 STEP_DEFER_LOCAL=0
 CACHE_DIR=$UNIT_RUN_DIR/verify_cache
 MAC_RUNNER=$VERIFY_MAC_RUNNER MAC_TEST_SCRIPT=$VERIFY_MAC_TEST_SCRIPT
 MAC_IDLE_SCRIPT=$TEST_REAL_DIRECT/../buildlog/mac_idle.py
@@ -1029,6 +1298,10 @@ MAC_ENV_NAMES=() VERIFY_MAC_ENVIRONMENT=() MAC_FETCH_GIVEN=0
 MAC_RESULT_FILE="" MAC_LOG_FILE="" MAC_RUNNER_PID="" MAC_ONLY=0 LOCAL_ONLY=0
 MAC_RUNNER_LAUNCHING=0 MAC_RUNNER_PRIOR_JOB=""
 PINNED_TARGET="" STEP_FORCE_MAC=0
+PLACEMENT_STEP_NUMBER=0 PLACEMENT_EPISODE="" PLACEMENT_COMMAND=()
+PLACEMENT_ASSIGNMENT_FILE="" PLACEMENT_GRANT_FILE="" PLACEMENT_PROVIDER=""
+PLACEMENT_SINCE="" PLACEMENT_SOURCE_KEY="" PLACEMENT_SESSION=""
+LOCAL_RELEASE_WAIT_SCRIPT=${VERIFY_LOCAL_RELEASE_WAIT_SCRIPT:-$TEST_REAL_DIRECT/local_release_wait.py}
 STEP_RECORD_ACTIVE=0 STEP_WRITES_TREE=0 STEP_RUNS_ON=any_target
 STEP_TARGET_TABLE=$(printf 'mac\teligible\t-\t%s\tmacos' "$MAC_TEST_CONFIG")
 TREE_WATCH_PID="" TREE_WATCH_DIR="" RUN_STEP_PID="" RUN_LOG=""
@@ -1037,58 +1310,50 @@ BUILDLOG_MAC="" BUILDLOG_MAC_REASON="" BUILDLOG_MAC_HOLDER="" BUILDLOG_MAC_S=""
 BUILDLOG_MAC_COPY="" BUILDLOG_MAC_COPY_S="" BUILDLOG_MAC_COPY_COUNT="" BUILDLOG_MAC_COPY_NATEDEV_S=""
 DOC_REPO_TOP=$PACKAGE_ROOT
 BOARD_HELPER=$TEST_REAL_DIRECT/board.sh BOARD_DIR=$UNIT_RUN_DIR BOARD_SLOT=direct
-TOKEN_HELD=0 TOKEN_RENEWER_PID=""
+TOKEN_USED=0 TOKEN_HELD=0 TOKEN_RENEWER_PID="" TOKEN_WAITED=0
 VERIFY_MONOTONIC_OFFSET_US=0
 trap 'finish_tree_watch; finish_hold_wait; release_token' EXIT
 '''
-        _ = script.write_text(functions + setup + '\neval "$1"\n', encoding="utf-8")
-        return subprocess.run(["bash", str(script), body], cwd=self.root,
-                              env={**self.environment, "TEST_REAL_DIRECT": str(VERIFY.parent),
-                                   "TEST_TOKEN_RECORD": str(self.board / "locks/cargo.d/holder_pid"),
-                                   **(extra or {})},
-                              capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS)
-
-    def check_routing_idle_hook(self) -> None:
-        """Consume a real retry hook before and after the idle marker."""
-        self.set_mac_answer("lost", "", 75)
-        result = self.call_mac_functions(r'''
-unset EPOCHREALTIME
-EPOCHREALTIME=100.000000
-try_reserved_target
-wc -l < "$TEST_RUNNER_STATE/runner-events.jsonl" > "$TEST_RUNNER_STATE/first-attempt-count"
-hook=$(mac_retry_hook "$MAC_TEST_CONFIG" "$MAC_RETRY_AFTER" reserve)
-if eval "$hook"; then exit 98; fi
-printf '%s\n' "$MAC_IDLE_MARKER" > "$TEST_RUNNER_STATE/idle-marker"
-find "$MAC_IDLE_STATE_DIR/calls" -name '*.json' > "$TEST_RUNNER_STATE/idle-calls"
-printf 'passed\n\n0\n' > "$TEST_RUNNER_STATE/runner-answer"
-printf 'retry_delayed\n' > "$MAC_IDLE_MARKER"
-if eval "$hook"; then try_reserved_target; fi
-exit 99
-''', extra={"TEST_FREE_NOW_FREE": "1"})
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertEqual(int((self.runner_state / "first-attempt-count").read_text()), 1)
-        self.assertEqual(len((self.runner_state / "idle-calls").read_text().splitlines()), 1)
-        self.assertEqual(len(self.runner_events()), 2)
-        self.assertEqual(self.local_runs(), [])
-        self.assertEqual(self.last_call()["mac"], "passed_full")
-        marker = Path((self.runner_state / "idle-marker").read_text().strip())
-        self.assertFalse(marker.exists())
-        self.assertEqual(list((self.board / "token_waiters").glob("*")), [])
+        invoke = 'source "$TEST_REAL_DIRECT/../lint/invoke.sh"\n'
+        _ = script.write_text(invoke + functions + setup + '\neval "$1"\n', encoding="utf-8")
+        return subprocess.Popen(["bash", str(script), body], cwd=self.root,
+                                   env={**self.environment, "TEST_REAL_DIRECT": str(VERIFY.parent),
+                                        "TEST_TOKEN_RECORD": str(self.board / "locks/cargo.d/holder_pid"),
+                                        **(extra or {})},
+                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                                   start_new_session=True, preexec_fn=restore_sigint)
 
     def verify(
         self, *arguments: str, extra: dict[str, str] | None = None
     ) -> subprocess.CompletedProcess[str]:
-        process = self.start_verify(*arguments, extra=extra)
+        return self.finish_verify(self.start_verify(*arguments, extra=extra))
+
+    def finish_verify(self, process: subprocess.Popen[str]) -> subprocess.CompletedProcess[str]:
+        """Stop owned processes before an exceptional exit reaches the next case."""
         try:
             output, errors = process.communicate(timeout=TEST_HANG_GUARD_SECS)
-        except subprocess.TimeoutExpired:
-            self.stop_verify(process)
+            return subprocess.CompletedProcess(process.args, process.wait(timeout=TEST_HANG_GUARD_SECS), output, errors)
+        except BaseException:
+            try:
+                self.capture_queue_state()
+            finally:
+                self.stop_verify(process)
             raise
-        return subprocess.CompletedProcess(process.args, process.wait(timeout=TEST_HANG_GUARD_SECS), output, errors)
+
+    def capture_queue_state(self) -> None:
+        """Keep the private queue state before process cleanup changes it."""
+        admission = caller_admission(self, self.root, self.environment)
+        with admission.loop_turn():
+            state = dict(requests=admission.server.placement_requests,
+                         assignments=admission.server.assignments,
+                         current=admission.server.current_assignments)
+            _ = (self.runner_state / "failed-queue-state.txt").write_text(repr(state))
 
     def start_verify(
         self, *arguments: str, extra: dict[str, str] | None = None
     ) -> subprocess.Popen[str]:
+        self.placement_policy = {**self.environment, **(extra or {})}
+
         install_fixed_cargo(self.bin_directory / "cargo")
         return subprocess.Popen(
             ["bash", str(self.verify_script), *arguments],
@@ -1144,7 +1409,9 @@ exit 99
 
     def clear_observations(self) -> None:
         self.cargo_events_path.unlink(missing_ok=True)
-        for name in ("runner-events.jsonl", "runner-started", "runner-signal", "runner-signals-ready"):
+        for outcome in self.runner_state.glob("provider-outcome-*.json"):
+            outcome.unlink()
+        for name in ("runner-events.jsonl", "runner-started", "runner-signal", "runner-signals-ready", "placement-refusal.json"):
             (self.runner_state / name).unlink(missing_ok=True)
 
     def wait_for_path(self, path: Path, processes: Sequence[subprocess.Popen[str]] = ()) -> None:
@@ -1182,6 +1449,7 @@ exit 99
         source = VERIFY.read_text()
         source = source.replace("local now=$EPOCHREALTIME", "local now=$(fixture_routing_clock)")
         source = source.replace("ROUTING_WAIT_STARTED=$EPOCHREALTIME", "ROUTING_WAIT_STARTED=$(fixture_routing_clock)")
+        source = source.replace("buildlog_now\n", "BUILDLOG_NOW=$(fixture_routing_clock)\n")
         source = source.replace("${EPOCHREALTIME/./}", "$(fixture_routing_probe)")
         # Fixture time uses monotonic seconds. Its offset is zero.
         source = source.replace(" - VERIFY_MONOTONIC_OFFSET_US", "")
@@ -1242,10 +1510,14 @@ exit 99
 
     def start_routing(self, reason: str = "busy", *, pause_retry: bool = False,
                       step_sleep: bool = False, once: Path | None = None) -> subprocess.Popen[str]:
+        real_sleep = shutil.which("sleep")
+        assert real_sleep is not None
         process = self.start_verify("test", "sample", "--filter", "alpha", "--no-cache", extra={
             **({"TEST_FREE_NOW_ONCE": str(once)} if once else {}),
+            "TEST_PROVIDER_ROUTE_POLL_GATES": "1", "TEST_REAL_SLEEP": real_sleep,
             "TEST_RUNNER_BUSY_UNTIL": str(self.runner_state / "mac-free"),
             "TEST_RUNNER_BUSY_REASON": reason, "TEST_PAUSE_ROUTING_SLEEP": "1",
+            "TEST_PROVIDER_ALLOW_RUNNER_REFUSALS": "1", "TEST_ROUTE_SLEEP_AFTER_RUNNER": "1",
             "TEST_RUNNER_PAUSE_RETRY": "1" if pause_retry else "0",
             "TEST_STEP_ROUTING_SLEEP": "1" if step_sleep else "0",
             "TEST_RUNNER_MAC": "passed", "TEST_RUNNER_STATUS": "0",
@@ -1302,10 +1574,19 @@ exit 99
 
     def wait_for_memory_wait(self, process: subprocess.Popen[str]) -> None:
         """Wait for a held reply from this fixture's service."""
-        admission = caller_admission(self, self.root, self.environment)
-        self.wait_until(lambda: any(isinstance(waiting.last_reply, wire.Wait)
-                                   for waiting in admission.server.waiters.values()),
-                        "the admission wait", (process,))
+        from scripts.build_queue import admission_client
+
+        def delivered() -> bool:
+            for path in (self.root / "tmp").glob(f"verify-hold.{process.pid}.*/placement-*.json.wait"):
+                try:
+                    notice = wire.parse_record(path.read_text(), admission_client.PlacementWaitNotice)
+                except (OSError, ValueError):
+                    continue
+                if isinstance(notice.last_reply, wire.Wait):
+                    return True
+            return False
+
+        self.wait_until(delivered, "the delivered admission wait", (process,))
 
     def hold_memory(self) -> Path:
         """Hold admission through its private memory reading. Preserve unrelated sleep commands."""
@@ -1320,12 +1601,14 @@ exit 99
         return {"TEST_FREE_NOW_ONCE": str(once)}
 
     def free_now_settings(self) -> list[str]:
-        path = self.runner_state / "free-now-events"
-        return path.read_text().splitlines() if path.exists() else []
+        settings = self.root / "build_targets.conf"
+        values = dict(line.split("=", 1) for line in settings.read_text().splitlines() if "=" in line)
+        return [str((settings.parent / values["settings." + key.destination.target]).resolve())
+                for key in self.provider_observations if key.destination.provider != "local"]
 
     def free_now_roots(self) -> list[str]:
-        path = self.runner_state / "free-now-roots"
-        return path.read_text().splitlines() if path.exists() else []
+        return ["--repo-root " + key.repository for key in self.provider_observations
+                if key.destination.provider != "local"]
 
     def set_mac_answer(self, mode: str, reason: str, status: int) -> None:
         answer = self.runner_state / "runner-answer"
@@ -1333,10 +1616,46 @@ exit 99
         _ = temporary.write_text(f"{mode}\n{reason}\n{status}\n")
         _ = temporary.replace(answer)
 
+    def runner_episode(self) -> str:
+        """Read the episode from the actual runner assignment."""
+        from scripts.build_queue import admission_client
+
+        words = self.runner_events()[-1]["args"]
+        saved = admission_client.read_assignment(Path(words[words.index("--assignment-file") + 1]))
+        return saved.assignment.episode
+
     def wait_for_retry_probe(self, clock: int, process: subprocess.Popen[str]) -> None:
-        probes = self.runner_state / "retry-probes"
-        self.wait_until(lambda: probes.exists() and str(clock) in probes.read_text().splitlines(),
-                        f"retry probe at {clock}", (process,))
+        """Advance the queue to the requested retry observation."""
+        from scripts.build_queue import admission_client
+
+        admission = caller_admission(self, self.root, self.environment)
+        controls = caller_provider_controls(self, admission)
+        self.wait_until(lambda: any(isinstance(saved.state, placement.ClosedAssignment)
+                                  for saved in admission.server.assignments.values()),
+                        "a settled remote attempt", (process,))
+        def delivered_retry_wait() -> bool:
+            for path in (self.root / "tmp").glob(f"verify-hold.{process.pid}.*/placement-*.json.queued"):
+                try:
+                    queued = wire.parse_record(path.read_text(), admission_client.QueuedPlacementEpisode)
+                except (OSError, ValueError):
+                    continue
+                if queued.episode == self.runner_episode():
+                    return True
+            return False
+
+        self.wait_until(delivered_retry_wait, "the delivered retry wait", (process,))
+        with admission.loop_turn():
+            saved = [saved for saved in admission.server.assignments.values()
+                     if isinstance(saved.state, placement.ClosedAssignment)][-1]
+            assert isinstance(saved.retry, placement.RetryAt)
+            event = self.runner_events()[-1]
+            assert "clock" in event
+            reported_clock = int(event["clock"])
+            target = saved.retry.deadline - 180 + clock - reported_clock
+            delta = max(0.0, target - admission.clock.now())
+        controls.advance(delta)
+        with admission.loop_turn():
+            _ = admission.server.run_pass()
 
     def check_temporary_mac_decline(self, wait_kind: str, mode: str, reason: str,
                                     *, repeat_decline: bool = True) -> None:
@@ -1348,19 +1667,20 @@ exit 99
             _ = self.routing_fixture()
             record = self.root / "hold-after-routing.json"
             _ = (Path(self.environment["BUILD_HOLD_DIR"]) / "hana").replace(record)
-            shell = self.root / "hold-after-routing.sh"
-            _ = shell.write_text('''
-hold_after_routing() {
-    if [[ "$BASH_COMMAND" == route_test ]]; then
-        test_routed=1
-    elif [[ "${test_routed:-0}" == 1 ]]; then
-        test_routed=0
-        cp "$TEST_HOLD_RECORD" "$BUILD_HOLD_DIR/hana"
-    fi
-}
-trap hold_after_routing DEBUG
-''')
-            self.environment.update({"BASH_ENV": str(shell), "TEST_HOLD_RECORD": str(record)})
+            admission = caller_admission(self, self.root, self.environment)
+            previous = admission.server.handle_request
+            published = False
+
+            def hold_after_routing(request: wire.Request,
+                                   connection: service.Connection | service.NoConnection = service.NO_CONNECTION) -> list[wire.Reply]:
+                nonlocal published
+                if isinstance(request, wire.ExecutionReport) and not published:
+                    _ = shutil.copyfile(record, Path(self.environment["BUILD_HOLD_DIR"]) / "hana")
+                    published = True
+                return previous(request, connection)
+
+            _ = self.enterContext(mock.patch.object(admission.server, "handle_request", side_effect=hold_after_routing))
+
         else:
             meminfo = self.hold_memory()
         self.set_mac_answer(mode, reason, 75)
@@ -1379,12 +1699,16 @@ trap hold_after_routing DEBUG
                     build_hold.HolderIdentity("hana", "hana"), "render checks",
                     build_hold.NoReleaseEta(), datetime.now().astimezone())
             _ = meminfo.write_text("MemAvailable: 67108864 kB\n")
-            self.wait_for_path(self.runner_state / "local-wait-args", (process,))
-            arguments = cast(list[str], json.loads((self.runner_state / "local-wait-args").read_text()))
-            self.assertIn("--leave-hook", arguments)
-        elif wait_kind == "first_hold":
-            arguments = cast(list[str], json.loads((self.runner_state / "local-wait-args").read_text()))
-            self.assertIn("--leave-hook", arguments)
+        admission = caller_admission(self, self.root, self.environment)
+        episode = self.runner_episode()
+        if wait_kind in ("hold", "first_hold"):
+            self.wait_until(lambda: any(candidate.destination.provider == "local"
+                    and isinstance(candidate.eligibility, placement.TemporaryExclusion)
+                    and candidate.eligibility.reason == "blocked"
+                    for candidate in admission.server.placement_eligibility.get(episode, ())),
+                "the same episode blocked by the local hold", (process,))
+            self.assertIn(episode, admission.server.placement_requests)
+            self.assertNotIn(episode, admission.server.current_assignments)
 
         _ = clock.write_text("279")
         self.wait_for_retry_probe(279, process)
@@ -1392,64 +1716,80 @@ trap hold_after_routing DEBUG
         if not repeat_decline:
             self.set_mac_answer("passed", "", 0)
         _ = clock.write_text("280")
+        self.wait_for_retry_probe(280, process)
         if repeat_decline:
             self.wait_until(lambda: len(self.runner_events()) == 2, "second Mac attempt", (process,))
-            probes = self.runner_state / "retry-probes"
-            self.wait_until(lambda: probes.read_text().splitlines().count("280") >= 2,
-                            "wait after the second Mac attempt", (process,))
+            self.wait_until(lambda: sum(isinstance(saved.state, placement.ClosedAssignment)
+                    for saved in admission.server.assignments.values()) >= 2,
+                "the settled second attempt", (process,))
             _ = clock.write_text("459")
             self.wait_for_retry_probe(459, process)
             self.assertEqual(len(self.runner_events()), 2)
             self.set_mac_answer("passed", "", 0)
             _ = clock.write_text("460")
+            self.wait_for_retry_probe(460, process)
         output, errors = process.communicate(timeout=TEST_HANG_GUARD_SECS)
         self.assertEqual(process.returncode, 0, output + errors)
         self.assertEqual(len(self.runner_events()), 3 if repeat_decline else 2)
         self.assertEqual(self.local_runs(), [])
         self.assertEqual(errors.count("waiting 180 s before each retry"), 1)
         self.assertEqual(self.last_call()["mac"], "passed_full")
+        if wait_kind in ("hold", "first_hold"):
+            authorized = [saved.assignment.episode for saved in admission.server.assignments.values()
+                          if isinstance(saved.permission, placement.PermissionConsumed)]
+            self.assertEqual(set(authorized), {episode})
         for event in self.runner_events()[1:]:
             self.assertNotIn("--last-decline", event["args"])
-
-    def check_idle_marker(self, wait_kind: str) -> None:
-        _ = self.control_routing_clock()
-        self.environment["MAC_IDLE_STATE_DIR"] = str(self.root / "idle-watch")
-        self.environment["TEST_FREE_NOW_FREE"] = "1"
-        if wait_kind == "memory":
-            _ = self.hold_memory()
-        else:
-            board = VERIFY.with_name("board.sh")
-            acquired = subprocess.run(["bash", str(board), "acquire", str(self.board), "peer", "cargo",
-                "--pid", str(os.getpid())], env=self.environment, capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS)
-            self.assertEqual(acquired.returncode, 0, acquired.stderr)
-        self.set_mac_answer("lost", "", 75)
-        process = self.start_verify("test", "sample", "--no-cache")
-        self.addCleanup(self.stop_verify, process)
-        self.wait_for_retry_probe(100, process)
-        self.assertEqual(len(self.runner_events()), 1)
-        paths = list((self.root / "idle-watch/calls").glob("*.json"))
-        self.assertEqual(len(paths), 1)
-        self.set_mac_answer("passed", "", 0)
-        _ = paths[0].with_suffix(".retry").write_text("retry_delayed\n")
-        output, errors = process.communicate(timeout=TEST_HANG_GUARD_SECS)
-        self.assertEqual(process.returncode, 0, output + errors)
-        self.assertEqual(len(self.runner_events()), 2)
-        self.assertEqual(self.local_runs(), [])
-        self.assertEqual(self.last_call()["mac"], "passed_full")
-        self.assertFalse(paths[0].with_suffix(".retry").exists())
-        self.assertEqual(list((self.board / "token_waiters").glob("*")), [])
 
     def start_copy_call(self, *words: str, copy: dict[str, str]) -> tuple[subprocess.Popen[str], int]:
         """Start a call the busy Mac sends to natedev, where its step compiles
         until cargo-release; return it with the pid of the Mac copy it starts."""
+        admission = caller_admission(self, self.root, self.environment)
+        identity = ["--claim-id", "fixture-busy-claim", "--episode", "fixture-busy-episode",
+                    "--attempt", "fixture-busy-attempt"]
+        with admission.loop_turn():
+            busy = invoke_mac_claim(["claim", "--pid", str(os.getpid()), "--what", "other tests",
+                                     "--worktree", str(self.root), *identity], self.environment, self.root)
+        self.assertEqual(busy.returncode, 0, busy.stdout + busy.stderr)
+        busy_released = False
+
+        def release_busy() -> None:
+            nonlocal busy_released
+            if busy_released:
+                return
+            from scripts.mac_test import mac_test
+
+            args = mac_test.CliArguments()
+            args.pid, args.target = os.getpid(), "mac"
+            args.claim_id, args.episode, args.attempt = "fixture-busy-claim", "fixture-busy-episode", "fixture-busy-attempt"
+            with admission.loop_turn():
+                status = mac_test.command_release(args, claim_state.StatePaths(Path(self.environment["MAC_TEST_STATE_DIR"])))
+            self.assertEqual(status, 0)
+            busy_released = True
+
+        self.addCleanup(release_busy)
+        previous = admission.server.handle_request
+
+        def release_after_local_grant(request: wire.Request,
+                connection: service.Connection | service.NoConnection = service.NO_CONNECTION) -> list[wire.Reply]:
+            replies = previous(request, connection)
+            if any(isinstance(reply, wire.LocalPlacementGranted) for reply in replies):
+                release_busy()
+                _ = (self.runner_state / "mac-free").write_text("free\n")
+            return replies
+
+        _ = self.enterContext(mock.patch.object(admission.server, "handle_request", side_effect=release_after_local_grant))
         process = self.start_verify("test", "sample", *words, "--no-cache", extra={
             "TEST_RUNNER_BUSY_UNTIL": str(self.runner_state / "mac-free"),
             "TEST_CARGO_HOLD": "1", **copy})
         self.addCleanup(self.stop_verify, process)
         started = self.runner_state / "copy-started"
+        self.wait_for_path(self.runner_state / "cargo-compiling", (process,))
+        release_busy()
+        _ = (self.runner_state / "mac-free").write_text("free\n")
         self.wait_for_path(started, (process,))
         self.assertTrue((self.runner_state / "cargo-compiling").exists())
-        self.assertEqual(len(self.runner_events()), 1)
+        self.assertEqual(len(self.runner_events()), 0)
         return process, int(started.read_text(encoding="utf-8"))
 
     def wait_for_reaped(self, pid: int, processes: Sequence[subprocess.Popen[str]]) -> None:

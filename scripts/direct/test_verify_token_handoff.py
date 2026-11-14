@@ -6,6 +6,7 @@ import unittest
 from pathlib import Path
 from scripts.direct.verify_token_wait_test_support import VerifyTokenWaitFixture, VERIFY, BOARD
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.production.staff_test_support import fixture_runtime_id
 
 
 class VerifyTokenHandoffTests(VerifyTokenWaitFixture):
@@ -78,7 +79,9 @@ class VerifyTokenHandoffTests(VerifyTokenWaitFixture):
             peer_holds.mkdir()
             peer = subprocess.Popen(["bash", str(VERIFY), "check", "sample", "--no-cache"],
                                     cwd=self.root,
-                                    env={**environment, "BUILD_HOLD_DIR": str(peer_holds), "TEST_BLOCK": "1"},
+                                    env={**environment, "BUILD_HOLD_DIR": str(peer_holds), "TEST_BLOCK": "1",
+                                         "CLAUDE_CODE_SESSION_ID": fixture_runtime_id("fixture-hold-owner"),
+                                         "CODEX_THREAD_ID": fixture_runtime_id("fixture-hold-owner")},
                                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                                     start_new_session=True)
             self.started_groups.add(peer.pid)

@@ -39,16 +39,17 @@ class VerifyPythonStartsTests(VerifyLintCacheFixture):
         print("lint helper starts:", dict(sorted(counts.items())), "total:", len(rows), flush=True)
         self.assertNotIn("INLINE_PY", counts, rows)
         self.assertNotIn("STDIN_PY", counts, rows)
-        # The builds signal-status guard removes one stopped-step query.
-        self.assertEqual(counts["tree_watch.py"], 11, rows)
+        # The trace counts interpreter starts, not calls inside the helper.
+        self.assertEqual(counts["tree_watch.py"], 2, rows)
         self.assertEqual(counts["memory_kill.py"], 1, rows)
-        self.assertEqual(counts["step_context.py"], 1, rows)
-        # Maker cleanup adds three recorded calls for the two temporary folders.
-        self.assertEqual(counts["build_folders.py"], 6, rows)
-        self.assertEqual(len(rows), 27, counts)
+        self.assertEqual(counts["step_context.py"], 0, rows)
+        # The live helper serves context and folder calls without new interpreters.
+        self.assertEqual(counts["build_folders.py"], 0, rows)
+        # The dev features read also runs in the helper, so no inline Python starts for it.
+        self.assertEqual(len(rows), 6, counts)
         # The per-run helper reads the dev features; no Python process of its own starts.
         in_helper = Counter(line.split("\t")[0] for line in Path(str(trace) + ".calls").read_text().splitlines())
-        self.assertEqual((counts["dev_features.py"], in_helper["dev_features.py"]), (1, 1), rows)
+        self.assertEqual((counts["dev_features.py"], in_helper["dev_features.py"]), (0, 1), rows)
         for target, mode in (("unknown", "passed"), ("linux", "disk")):
             with self.subTest(target=target, mode=mode):
                 routing = VerifySshTargetsFixture()
@@ -70,7 +71,7 @@ class VerifyPythonStartsTests(VerifyLintCacheFixture):
                                     for line in Path(str(routing_trace) + ".calls").read_text().splitlines())
                     for program in ("build_targets.py", "build_folders.py", "detached_runs.py"):
                         self.assertGreater(calls[program], 0, (target, program, entries, calls))
-                        self.assertEqual(entries[program] - calls[program], 0, (target, program, entries, calls))
+                        self.assertEqual(entries[program], 0, (target, program, entries, calls))
                 finally:
                     routing.doCleanups()
 

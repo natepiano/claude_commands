@@ -239,15 +239,15 @@ with Path(os.environ["TEST_RUNNER_STATE"], "remote-commands").open("a") as outpu
             with self.subTest(target=target):
                 (self.runner_state / "remote-commands").unlink(missing_ok=True)
                 # Unpinned final stays local. Call its remote boundary without changing that rule.
-                result = self.call_mac_functions('CMD=final MAC_FINISH_CALL=0 CACHE_DIR=""\n'
-                    + f'VERIFY_TEST_ENVIRONMENT=({entries})\n'
-                    + '"$PY" "$BUILD_TARGETS_SCRIPT" eligible --kind final --repo-root "$PACKAGE_ROOT" '
-                    + '--remote-kinds-file "$HOLD_WAIT_DIR/remote-step-kinds" >/dev/null\n'
-                    + f'STEP_TARGET_TABLE=$(printf "{target}\\teligible\\t-\\t%s\\t{platform}" "$MAC_TEST_CONFIG")\n'
-                    + 'MAC_VERB=check\ntry_mac_test "$MAC_TEST_CONFIG"\n'
-                    + 'MAC_VERB=nextest\ntry_mac_test "$MAC_TEST_CONFIG"\n',
-                    extra={"MAC_TEST_CONFIG": settings})
-                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                for verb in ("check", "nextest"):
+                    assigned = self.assigned_remote(target, verb, "final")
+                    result = self.call_mac_functions('CMD=final MAC_FINISH_CALL=0 CACHE_DIR=""\n'
+                        + f'VERIFY_TEST_ENVIRONMENT=({entries})\n'
+                        + 'PLACEMENT_ASSIGNMENT_FILE="$TEST_DIRECT_ASSIGNMENT"\n'
+                        + f'STEP_ASSIGNED_TARGET={shlex.quote(target)} STEP_ASSIGNED_PLATFORM={platform}\n'
+                        + f'MAC_VERB={verb}\ntry_mac_test "$MAC_TEST_CONFIG"\n',
+                        extra={"MAC_TEST_CONFIG": settings, "TEST_DIRECT_ASSIGNMENT": str(assigned)})
+                    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                 self.assert_remote_environment(copied=False)
 
     def test_final_exports_the_test_environment_to_a_copy_runner(self) -> None:
@@ -261,7 +261,7 @@ with Path(os.environ["TEST_RUNNER_STATE"], "remote-commands").open("a") as outpu
         repo_root=Path(os.environ["PACKAGE_ROOT"]), package="sample",
         call_id=os.environ["BUILDLOG_CALL_ID"], call_started=0,
         filter_run=False, nextest_words=tuple(arguments[2:]))
-    running = copy_watch.start_copy(request, root / "copy-result")
+    running = copy_watch.start_copy(request, root / "copy-result", Path(os.environ["TEST_COPY_ASSIGNMENT"]))
     raise SystemExit(running.process.wait())
 '''
         source = CARGO_STUB.replace('if arguments[:1] == ["metadata"]:',
@@ -275,8 +275,9 @@ with Path(os.environ["TEST_RUNNER_STATE"], "remote-commands").open("a") as outpu
         for flags in ((), ("--target", "natedev")):
             with self.subTest(flags=flags):
                 (self.runner_state / "remote-commands").unlink(missing_ok=True)
+                assigned = self.assigned_remote("mac", "nextest")
                 result = self.verify("final", "sample", *flags,
-                                     extra={"TEST_COPY_MAC": "passed", "TEST_COPY_STATUS": "0"})
+                    extra={"TEST_COPY_MAC": "passed", "TEST_COPY_STATUS": "0", "TEST_COPY_ASSIGNMENT": str(assigned)})
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                 self.assert_remote_environment(copied=True)
                 checked = cast(dict[str, str], json.loads((self.runner_state / "check-environment").read_text()))
@@ -286,12 +287,12 @@ with Path(os.environ["TEST_RUNNER_STATE"], "remote-commands").open("a") as outpu
 
 class PinnedLintTests(VerifyStepRoutesFixture):
     def test_natedev_pin_waits_for_a_hold_and_runs_only_locally(self) -> None:
-        self.fixture.environment["TEST_MAC_ALLOWED"] = "0"
+        self.fixture.environment.update({"TEST_MAC_ALLOWED": "0", "TEST_ASSERT_LOCAL_HELD": "1"})
         result = self.run_verify("test", "sample", "--target", "natedev")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         commands = [cast(dict[str, object], json.loads(line))["command"]
                     for line in self.events.read_text().splitlines()]
-        self.assertIn("wait-local", commands)
+        self.assertNotIn("wait-local", commands)
         self.assertEqual(len(self.fixture.local_runs()), 1)
         self.assertEqual(self.mac_rows(), [])
 

@@ -74,6 +74,419 @@ class ImportTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
 
+class LocalHoldPlacementTests(unittest.TestCase):
+    def test_close_between_the_loop_check_and_clear_does_not_lose_its_wake(self) -> None:
+        from queue import Queue
+        from scripts.build_queue import placement
+        from scripts.build_queue.test_placement import placement_request
+
+        with AdmissionFixture() as fixture:
+            entered, release, clearing, allow_clear = (threading.Event() for _ in range(4))
+            outcomes: Queue[str] = Queue()
+
+            class ObservedWorker(service.HostEvidenceWorker):
+                @override
+                def _read(self) -> None:
+                    try:
+                        super()._read()
+                    finally:
+                        outcomes.put("ended")
+
+            def probe(key: placement.HostEvidenceKey) -> placement.HostEvidence:
+                entered.set()
+                if not release.wait(test_hang_guard.TEST_HANG_GUARD_SECS):
+                    raise AssertionError("the test did not release the probe")
+                return placement.HostEvidenceUnavailable(key, fixture.clock.now(), "private probe")
+
+            request = placement_request(fixture)
+            key = fixture.server.host_evidence_key(request, request.constraints.candidates[0].destination)
+            worker = ObservedWorker(key, probe, fixture.clock, fixture.server.reading_events, 60)
+            try:
+                self.assertTrue(entered.wait(test_hang_guard.TEST_HANG_GUARD_SECS))
+                original_clear = worker.requested.clear
+                original_wait = worker.requested.wait
+
+                def clear() -> None:
+                    clearing.set()
+                    if not allow_clear.wait(test_hang_guard.TEST_HANG_GUARD_SECS):
+                        raise AssertionError("the test did not permit the event clear")
+                    original_clear()
+
+                def wait(timeout: float | None = None) -> bool:
+                    if worker.stopped.is_set():
+                        outcomes.put("waited after close")
+                        return True
+                    return original_wait(timeout)
+
+                with mock.patch.object(worker.requested, "clear", side_effect=clear), \
+                     mock.patch.object(worker.requested, "wait", side_effect=wait):
+                    worker.remove(key)
+                    release.set()
+                    self.assertTrue(clearing.wait(test_hang_guard.TEST_HANG_GUARD_SECS))
+                    worker.close()
+                    allow_clear.set()
+                    self.assertEqual(outcomes.get(timeout=test_hang_guard.TEST_HANG_GUARD_SECS), "ended")
+                    worker.thread.join(timeout=test_hang_guard.TEST_HANG_GUARD_SECS)
+                    self.assertFalse(worker.thread.is_alive())
+            finally:
+                worker.close()
+                release.set()
+                allow_clear.set()
+                worker.thread.join(timeout=test_hang_guard.TEST_HANG_GUARD_SECS)
+
+    def test_an_empty_probe_schedule_reuses_its_live_worker_for_a_new_request(self) -> None:
+        from scripts.build_queue import placement
+        from scripts.build_queue.test_placement import placement_request
+
+        with AdmissionFixture() as fixture:
+            entered, release, empty_wait, published = (threading.Event() for _ in range(4))
+            delays: list[float | None] = []
+
+            def probe(key: placement.HostEvidenceKey) -> placement.HostEvidence:
+                entered.set()
+                if not release.wait(test_hang_guard.TEST_HANG_GUARD_SECS):
+                    raise AssertionError("the test did not release the probe")
+                return placement.FreshHostEvidence(key, fixture.clock.now(), "", placement.AllowedHost())
+
+            fixture.server.host_probe = probe
+            request = placement_request(fixture)
+            try:
+                _ = fixture.server.handle_request(request)
+                self.assertTrue(entered.wait(test_hang_guard.TEST_HANG_GUARD_SECS))
+                key, = fixture.server.host_readers
+                worker = fixture.server.host_readers[key].worker
+                original_wait = worker.requested.wait
+                original_write = os.eventfd_write
+
+                def wait(timeout: float | None = None) -> bool:
+                    delays.append(timeout)
+                    empty_wait.set()
+                    return original_wait(timeout)
+
+                def notify(fd: int, value: int) -> None:
+                    original_write(fd, value)
+                    if threading.current_thread() is worker.thread:
+                        published.set()
+
+                with mock.patch.object(worker.requested, "wait", side_effect=wait), \
+                     mock.patch.object(os, "eventfd_write", side_effect=notify):
+                    _ = fixture.server.handle_request(wire.CancelPlacement(
+                        "cancel", request.episode, request.owner, "ended"))
+                    with worker.lock:
+                        self.assertEqual(worker.due, {})
+                    release.set()
+                    self.assertTrue(empty_wait.wait(test_hang_guard.TEST_HANG_GUARD_SECS))
+                    self.assertIsNone(delays[0])
+                    self.assertTrue(worker.thread.is_alive())
+                    next_request = replace(request, episode="later", constraints=replace(
+                        request.constraints, command=("cargo", "check")))
+                    _ = fixture.server.handle_request(next_request)
+                    next_key = fixture.server.host_evidence_key(next_request, key.destination)
+                    self.assertIs(fixture.server.host_readers[next_key].worker, worker)
+                    self.assertTrue(published.wait(test_hang_guard.TEST_HANG_GUARD_SECS))
+                    self.assertIsInstance(fixture.server.host_evidence(next_key), placement.FreshHostEvidence)
+                    self.assertTrue(worker.thread.is_alive())
+            finally:
+                for worker in fixture.server.host_targets.values():
+                    worker.close()
+                release.set()
+                for worker in fixture.server.host_targets.values():
+                    worker.thread.join(timeout=test_hang_guard.TEST_HANG_GUARD_SECS)
+
+    def test_ended_requests_remove_their_probe_schedule_keys(self) -> None:
+        from scripts.build_queue import placement
+        from scripts.build_queue.test_placement import (
+            PlacementFixture, placement_request, publish_candidate, assignment_for,
+            adopt_assignment, consume_permission,
+        )
+
+        for ending in ("cancelled", "completed"):
+            with self.subTest(ending=ending), PlacementFixture() as fixture:
+                entered, release = threading.Event(), threading.Event()
+
+                def probe(key: placement.HostEvidenceKey) -> placement.HostEvidence:
+                    entered.set()
+                    if not release.wait(test_hang_guard.TEST_HANG_GUARD_SECS):
+                        raise AssertionError("the test did not release the probe")
+                    return placement.FreshHostEvidence(key, fixture.clock.now(), "", placement.AllowedHost())
+
+                fixture.server.host_probe = probe
+                request = placement_request(fixture)
+                try:
+                    reply, = fixture.server.handle_request(request)
+                    self.assertIsInstance(reply, wire.PlacementWait)
+                    self.assertTrue(entered.wait(test_hang_guard.TEST_HANG_GUARD_SECS))
+                    key, = fixture.server.host_readers
+                    worker = fixture.server.host_readers[key].worker
+                    if ending == "completed":
+                        _ = publish_candidate(fixture, request)
+                        assignment = assignment_for(fixture, request)
+                        claim = adopt_assignment(fixture, request, assignment)
+                        authorized, = fixture.server.handle_request(consume_permission("launch", assignment, claim))
+                        self.assertIsInstance(authorized, wire.FirstAuthorization)
+                        _ = fixture.server.handle_request(wire.ExecutionReport("done", assignment, claim,
+                            placement.ExecutionNotStarted(), placement.AttemptCompleted(0), placement.DispatchPathSettled()))
+                    else:
+                        _ = fixture.server.handle_request(wire.CancelPlacement("cancel", request.episode, request.owner, "ended"))
+                    self.assertNotIn(key, fixture.server.host_readers)
+                    self.assertNotIn(key, fixture.server.host_requests)
+                    with worker.lock:
+                        self.assertNotIn(key, worker.due)
+                    worker.close()
+                    release.set()
+                    worker.thread.join(timeout=test_hang_guard.TEST_HANG_GUARD_SECS)
+                    self.assertFalse(worker.thread.is_alive())
+                    with worker.lock:
+                        self.assertNotIn(key, worker.due)
+                        self.assertNotIn(key, worker.observations)
+                finally:
+                    for worker in fixture.server.host_targets.values():
+                        worker.close()
+                    release.set()
+                    for worker in fixture.server.host_targets.values():
+                        worker.thread.join(timeout=test_hang_guard.TEST_HANG_GUARD_SECS)
+
+    def test_each_settings_file_controls_its_evidence_age(self) -> None:
+        from scripts.build_queue import placement
+        from scripts.build_queue.test_placement import placement_request
+
+        with AdmissionFixture() as fixture:
+            entered, release = threading.Event(), threading.Event()
+
+            def probe(key: placement.HostEvidenceKey) -> placement.HostEvidence:
+                entered.set()
+                if not release.wait(test_hang_guard.TEST_HANG_GUARD_SECS):
+                    raise AssertionError("the test did not release the probe")
+                return placement.HostEvidenceUnavailable(key, fixture.clock.now(), "private probe")
+
+            fixture.server.host_probe = probe
+            keys: list[placement.HostEvidenceKey] = []
+            try:
+                for name, timeout in (("long", 10), ("short", 1)):
+                    path = fixture.root / (name + ".conf")
+                    _ = write_config_fixture(path, f"probe_timeout_s={timeout}\n", template="mac_test")
+                    request = placement_request(fixture)
+                    candidate = request.constraints.candidates[0]
+                    request = replace(request, episode=name, constraints=replace(request.constraints,
+                        candidates=(replace(candidate, settings=placement.ExplicitProviderSettings(path)),)))
+                    _ = fixture.server.handle_request(request)
+                    keys.append(fixture.server.host_evidence_key(request, candidate.destination))
+                self.assertTrue(entered.wait(test_hang_guard.TEST_HANG_GUARD_SECS))
+                self.assertIs(fixture.server.host_readers[keys[0]].worker, fixture.server.host_readers[keys[1]].worker)
+                for key in keys:
+                    fixture.server.publish_host_evidence(placement.FreshHostEvidence(
+                        key, fixture.clock.now(), "", placement.AllowedHost()))
+                config = fixture.server.last_usable_configuration
+                assert isinstance(config, records.MemoryConfig)
+                fixture.clock.advance(config.waiting_pass_seconds + 2)
+                self.assertIsInstance(fixture.server.host_evidence(keys[0]), placement.FreshHostEvidence)
+                self.assertIsInstance(fixture.server.host_evidence(keys[1]), placement.StaleHostEvidence)
+            finally:
+                for worker in fixture.server.host_targets.values():
+                    worker.close()
+                release.set()
+                for worker in fixture.server.host_targets.values():
+                    worker.thread.join(timeout=test_hang_guard.TEST_HANG_GUARD_SECS)
+
+    def test_failed_execution_probes_start_the_provider_backoff(self) -> None:
+        from scripts.build_queue import placement
+        from scripts.build_queue.test_placement import placement_request
+        from scripts.build_targets import build_targets, target_config
+        from scripts.mac_test import claim_state, eligibility, mac_test
+
+        for failure in (OSError("ssh missing"), subprocess.TimeoutExpired("ssh", 1),
+                        subprocess.CompletedProcess(["ssh"], 255, "", "unreachable")):
+            with self.subTest(failure=failure), AdmissionFixture() as fixture:
+                settings = fixture.root / "linux.conf"
+                _ = write_config_fixture(settings, "probe_timeout_s=1\nunreachable_backoff_s=30\n", template="mac_test")
+                target = target_config.SshTarget("linux", "linux", settings)
+                request = placement_request(fixture)
+                destination = replace(request.constraints.candidates[0].destination,
+                                      provider="ssh", target="linux", host="private-linux")
+                request = replace(request, constraints=replace(request.constraints, candidates=(
+                    placement.PlacementCandidate(destination, settings=placement.ExplicitProviderSettings(settings)),)))
+                paths = claim_state.StatePaths(fixture.root / "claims")
+                record: claim_state.RemoteJobClaim = {"claim_id": "retained", "episode": "old", "attempt": "old-attempt",
+                    "submitting_session": "", "pid": request.owner.pid, "proc_start": request.owner.start_time,
+                    "remote_host": destination.host, "what": "busy claim", "worktree": str(fixture.root), "since": "private"}
+                held = claim_state.HeldClaim(destination.scope, paths.run, record)
+                with mock.patch.object(target_config, "read_targets", return_value=(target,)), \
+                     mock.patch.object(build_targets, "ssh_target_eligibility", return_value=target_config.ExcludedTarget(target, "busy")), \
+                     mock.patch.object(claim_state, "state_paths", return_value=paths), \
+                     mock.patch.object(claim_state, "read_claims", return_value=(held,)), \
+                     mock.patch.object(claim_state, "target_claim_scope", return_value=destination.scope), \
+                     mock.patch.object(mac_test, "run_is_live", return_value=False), \
+                     mock.patch.object(eligibility, "repository_identity", return_value=eligibility.KnownRepository("hana")), \
+                     mock.patch.object(subprocess, "run") as probe:
+                    if isinstance(failure, BaseException):
+                        probe.side_effect = failure
+                    else:
+                        probe.return_value = failure
+                    key = fixture.server.host_evidence_key(request, destination)
+                    fixture.server.host_requests[key] = request
+                    first = fixture.server.read_provider_evidence(key)
+                    second = fixture.server.read_provider_evidence(key)
+                    self.assertIsInstance(first, placement.FreshHostEvidence)
+                    self.assertIsInstance(second, placement.FreshHostEvidence)
+                    assert isinstance(second, placement.FreshHostEvidence)
+                    self.assertEqual(len(second.claims), 1)
+                    self.assertEqual(second.claims[0].reference.claim_id, "retained")
+                    self.assertIsInstance(second.executions[0][1], placement.ExecutionEvidenceUnavailable)
+                    self.assertEqual(probe.call_count, 1)
+                    self.assertIsInstance(eligibility.read_backoff(time.time(), "linux"), eligibility.ActiveBackoff)
+
+    def test_hanging_or_failing_target_readers_do_not_delay_a_view(self) -> None:
+        from scripts.build_queue import placement
+        from scripts.build_queue.test_placement import placement_request, local_candidate
+
+        for fails in (False, True):
+            with self.subTest(fails=fails), AdmissionFixture() as fixture:
+                entered = {name: threading.Event() for name in ("mac", "natedev")}
+                release = threading.Event()
+                fixture.server.background_local_evidence = True
+
+                def probe(key: placement.HostEvidenceKey) -> placement.HostEvidence:
+                    entered[key.destination.target].set()
+                    if fails:
+                        raise OSError("private provider unavailable")
+                    if not release.wait(test_hang_guard.TEST_HANG_GUARD_SECS):
+                        raise AssertionError("the test did not release the hanging probe")
+                    return placement.FreshHostEvidence(key, fixture.clock.now(), "", placement.AllowedHost())
+
+                fixture.server.host_probe = probe
+                request = placement_request(fixture)
+                remote = request.constraints.candidates[0].destination
+                local = local_candidate(fixture).destination
+                request = replace(request, constraints=replace(request.constraints,
+                    candidates=(*request.constraints.candidates, placement.PlacementCandidate(local))))
+                second = replace(request, episode="second-placement",
+                    constraints=replace(request.constraints, command=("cargo", "check")))
+                try:
+                    for item in (request, second):
+                        reply, = fixture.server.handle_request(item)
+                        self.assertIsInstance(reply, wire.PlacementWait)
+                    for event in entered.values():
+                        self.assertTrue(event.wait(2))
+                    self.assertEqual(len(fixture.server.host_targets), 2)
+                    remote_keys = [key for key in fixture.server.host_readers if key.destination == remote]
+                    self.assertEqual(len(remote_keys), 2)
+                    self.assertIs(fixture.server.host_readers[remote_keys[0]].thread,
+                                  fixture.server.host_readers[remote_keys[1]].thread)
+                    with fixture.serving():
+                        reading = client.view()
+                        self.assertIsInstance(reading, records.QueueRead)
+                        self.assertFalse(release.is_set())
+                    if fails:
+                        key = fixture.server.host_evidence_key(request, remote)
+                        evidence = fixture.server.host_evidence(key)
+                        self.assertIsInstance(evidence, placement.HostEvidenceUnavailable)
+                finally:
+                    for worker in fixture.server.host_targets.values():
+                        worker.close()
+                    release.set()
+                    for worker in fixture.server.host_targets.values():
+                        worker.thread.join(timeout=5)
+                        self.assertFalse(worker.thread.is_alive())
+
+    def test_local_hold_evidence_uses_each_requesters_checked_lineage(self) -> None:
+        from scripts.build_hold import build_hold
+        from scripts.build_hold.owning_session import OwningSession
+        from scripts.build_queue import placement
+        from scripts.mac_test.claim_state import WholeMacScope
+
+        for case, callers, holds in (
+            ("kept", ((110, "1100", True),), "single"),
+            ("descendant", ((111, "1110", True),), "single"),
+            ("unrelated", ((112, "1120", False),), "single"),
+            ("service-kept", ((112, "1120", False),), "service-kept"),
+            ("reused", ((114, "1140", False),), "single"),
+            ("unavailable", ((115, "1150", False),), "single"),
+            ("ended-hold-invalid-config", ((112, "1120", False),), "single"),
+            ("one-hold", ((111, "1110", False),), "blocking-second"),
+            ("both-holds", ((111, "1110", True),), "kept-second"),
+            ("cache-kept-first", ((111, "1110", True), (112, "1120", False)), "single"),
+            ("cache-unrelated-first", ((112, "1120", False), (111, "1110", True)), "single"),
+            ("cache-reused", ((111, "1110", True), (111, "1111", False)), "single"),
+            ("completed", ((111, "1110", True),), "single"),
+            ("cancelled", ((111, "1110", True),), "single"),
+        ):
+            with self.subTest(case=case), AdmissionFixture() as fixture:
+                directory = fixture.root / "holders"
+                directory.mkdir()
+                keep = [{"pid": 110, "start_time": "1100"}]
+                if holds == "service-kept":
+                    keep.append({"pid": os.getpid(), "start_time": "1"})
+                for key in ("holder", "second") if holds.endswith("second") else ("holder",):
+                    _ = (directory / key).write_text(json.dumps({
+                        "holder": key, "since": "2026-11-12T12:00:00+00:00",
+                        "for": "private test", "release_eta": "unknown",
+                        "keep": [] if key == "second" and holds == "blocking-second" else keep,
+                    }))
+                _ = (fixture.root / "build_targets.conf").write_text(
+                    "targets=natedev\nkind.natedev=local\nplatform.natedev=linux\n")
+                write_process(fixture.proc.path, os.getpid(), start="1")
+                write_process(fixture.proc.path, 110, start="1100")
+                destination = placement.PlacementDestination("local", "natedev", fixture.server.host, WholeMacScope())
+                fixture.server.host_probe = fixture.server.read_provider_evidence
+                with mock.patch.dict(os.environ, {"BUILD_HOLD_DIR": str(directory)}), \
+                     mock.patch.object(build_hold, "PROC_ROOT", fixture.proc.path):
+                    for index, (pid, start, admitted) in enumerate(callers):
+                        with self.subTest(pid=pid, start=start):
+                            owner = fixture.fixture_owner(pid, start)
+                            write_process(fixture.proc.path, pid,
+                                parent=110 if pid in (111, 114) and start != "1111" else 1,
+                                start="1141" if case == "reused" else start)
+                            if case == "unavailable":
+                                (fixture.proc.path / str(pid) / "stat").unlink()
+                            local = fixture.request(owner=owner, episode=f"{case}-{index}")
+                            constraints = placement.PlacementConstraints(placement.SourceKeyKnown("private-source"),
+                                local.argv, "fixture", "fixture", OwningSession("caller"),
+                                (placement.PlacementCandidate(destination),))
+                            request = wire.PlacementRequest(local.episode,
+                                placement.SubmittingOwner(fixture.server.host, pid, start), local.since,
+                                local.profile, constraints, identity=local.identity,
+                                local=wire.LocalAdmissionContext(local.argv, local.cwd, local.sidecar,
+                                    local.call, local.test_width, local.fresh_test), code_version=local.code_version)
+                            key = fixture.server.host_evidence_key(request, destination)
+                            self.assertIsInstance(fixture.server.host_evidence(key), placement.HostEvidenceUnavailable)
+                            evidence = fixture.server.read_provider_evidence(key)
+                            self.assertIsInstance(evidence, placement.FreshHostEvidence)
+                            assert isinstance(evidence, placement.FreshHostEvidence)
+                            self.assertEqual(evidence.eligibility,
+                                placement.AllowedHost() if admitted else placement.TemporaryExclusion("blocked"))
+                            fixture.allow_next_start()
+                            reply, = fixture.server.handle_request(request)
+                            if admitted:
+                                self.assertIsInstance(reply, wire.LocalPlacementGranted)
+                                assert isinstance(reply, wire.LocalPlacementGranted)
+                                if case == "completed":
+                                    fixture.release(reply.grant)
+                                elif case == "cancelled":
+                                    self.assertEqual(fixture.server.handle_request(wire.CancelPlacement(
+                                        "cancel-local", request.episode, request.owner, "the caller cancelled")), [wire.Ok()])
+                                if case in ("completed", "cancelled"):
+                                    for retained in (fixture.server.host_readers, fixture.server.host_requests,
+                                                     fixture.server.host_observations):
+                                        self.assertNotIn(request.owner, [item.local_hold_owner for item in retained])
+                            else:
+                                self.assertIsInstance(reply, wire.PlacementWait)
+                                assert isinstance(reply, wire.PlacementWait)
+                                self.assertIsInstance(reply.wait, wire.PlacementResourceWait)
+                                assert isinstance(reply.wait, wire.PlacementResourceWait)
+                                self.assertEqual(reply.wait.holder,
+                                    placement.ResourceHolderUnit("second" if holds == "blocking-second" else "holder"))
+                                if case == "ended-hold-invalid-config":
+                                    (directory / "holder").unlink()
+                                    fixture.server.pending_configuration = gate.UnusableAdmissionConfiguration(
+                                        "private invalid configuration")
+                                    repeated, = fixture.server.handle_request(request)
+                                    self.assertIsInstance(repeated, wire.PlacementWait)
+                                    assert isinstance(repeated, wire.PlacementWait)
+                                    self.assertIsInstance(repeated.wait, wire.PlacementResourceWait)
+                                    assert isinstance(repeated.wait, wire.PlacementResourceWait)
+                                    self.assertEqual(repeated.wait.holder, placement.ResourceHolderUnknown())
+
+
 class FixedSystemReader:
     """Publish private evidence without an operating-system reader."""
     def __init__(self, latest: service.SystemEvidence) -> None:
@@ -339,6 +752,32 @@ class ReplyPublicationTests(unittest.TestCase):
                 self.assertFalse(any(isinstance(reply, wire.Refused) for reply in replies))
                 self.assertFalse(server.deferred_requests)
                 self.assertEqual(reader.requests, 1)
+
+    def test_new_placement_coordinator_waits_for_fresh_process_evidence(self) -> None:
+        from scripts.build_queue.test_placement import PlacementFixture, placement_request, publish_candidate
+
+        with PlacementFixture() as fixture:
+            server = fixture.server
+            initial = server.system_evidence
+            config = server.last_usable_configuration
+            assert isinstance(initial, service.SystemEvidence)
+            assert isinstance(config, records.MemoryConfig)
+            reader = FixedSystemReader(initial)
+            server.system_reader = reader
+            request = placement_request(fixture)
+            _ = publish_candidate(fixture, request)
+            self.assertNotIn(request.owner.pid, initial.processes)
+            replies = fixture.connect(request).replies()
+            self.assertFalse(any(isinstance(reply, wire.Refused) for reply in replies), replies)
+            self.assertEqual(len(replies), 1)
+            self.assertIsInstance(replies[0], wire.PlacementWait)
+            self.assertNotIn(request.episode, server.current_assignments)
+            reader.latest = service.read_system(service.SystemReadingPlan(config, (), (), False),
+                fixture.readings, fixture.proc, fixture.clock)
+            os.eventfd_write(server.reading_events, 1)
+            server.run_once(0)
+            reply, = fixture.connect(request).replies()
+            self.assertIsInstance(reply, wire.Assignment)
 
     def test_refused_deferred_connection_cannot_admit_on_a_later_read(self) -> None:
         with AdmissionFixture() as fixture:
@@ -1514,9 +1953,57 @@ class ReadingAlertTests(unittest.TestCase):
 
 
 class PlacementRestartTests(unittest.TestCase):
+    def test_first_view_after_restart_uses_the_snapshot_while_a_probe_succeeds_slowly(self) -> None:
+        from scripts.build_queue import placement
+        from scripts.build_queue.test_placement import PlacementFixture, placement_request
+
+        with PlacementFixture() as fixture:
+            request = placement_request(fixture)
+            fixture.server.placement_requests = {
+                f"saved-{index}": replace(request, episode=f"saved-{index}",
+                    owner=request.owner if index == 0 else placement.SubmittingOwner(
+                        fixture.server.host, 700000 + index, "missing"))
+                for index in range(30)}
+            fixture.server.persist()
+            fixture.server.close()
+            entered, succeeded = threading.Event(), threading.Event()
+            release = threading.Event()
+
+            def probe(key: placement.HostEvidenceKey) -> placement.HostEvidence:
+                entered.set()
+                if not release.wait(test_hang_guard.TEST_HANG_GUARD_SECS):
+                    raise AssertionError("the test did not release the probe")
+                succeeded.set()
+                return placement.FreshHostEvidence(key, fixture.clock.now(), "", placement.AllowedHost())
+
+            with mock.patch.object(fixture, "read_provider", side_effect=probe):
+                fixture.server = fixture.new_server()
+                try:
+                    self.assertEqual(len(fixture.server.placement_requests), 30)
+                    self.assertTrue(entered.wait(1))
+                    with fixture.serving():
+                        reading = client.view()
+                        self.assertIsInstance(reading, records.QueueRead)
+                        self.assertFalse(succeeded.is_set())
+                        release.set()
+                        self.assertTrue(succeeded.wait(test_hang_guard.TEST_HANG_GUARD_SECS))
+                    with mock.patch.object(fixture.server, "host_evidence_key",
+                                           side_effect=AssertionError("a view must use cached evidence")):
+                        reply, = fixture.server.handle_request(wire.ViewRequest())
+                        self.assertIsInstance(reply, wire.ViewReply)
+                finally:
+                    for worker in fixture.server.host_targets.values():
+                        worker.close()
+                    release.set()
+                    for worker in fixture.server.host_targets.values():
+                        worker.thread.join(timeout=5)
+                        self.assertFalse(worker.thread.is_alive())
+
     def test_restart_preserves_old_waiters_and_both_placement_permission_states(self) -> None:
         from scripts.build_queue import placement
-        from scripts.build_queue.test_placement import PlacementFixture, placement_request, publish_candidate, assignment_for, adopt_assignment
+        from scripts.build_queue.test_placement import (
+            PlacementFixture, placement_request, publish_candidate, assignment_for, adopt_assignment, consume_permission,
+        )
 
         for version in (1, 2):
             with self.subTest(version=version), PlacementFixture() as fixture:
@@ -1541,7 +2028,7 @@ class PlacementRestartTests(unittest.TestCase):
                 pending_assignment = assignment_for(fixture, pending)
                 consumed_assignment = assignment_for(fixture, consumed)
                 claim = adopt_assignment(fixture, consumed, consumed_assignment)
-                consume = wire.ConsumePermission("first-consumption", consumed_assignment, claim)
+                consume = consume_permission("first-consumption", consumed_assignment, claim)
                 self.assertEqual(fixture.server.handle_request(consume),
                                  [wire.FirstAuthorization(consumed_assignment, claim)])
                 positions = fixture.server.places.copy()
@@ -1553,13 +2040,19 @@ class PlacementRestartTests(unittest.TestCase):
                     self.assertIsInstance(reply, wire.Wait)
                 self.assertEqual({episode: fixture.server.waiters[episode].request for episode in waiters}, waiters)
                 self.assertEqual(assignment_for(fixture, pending), pending_assignment)
-                self.assertEqual(assignment_for(fixture, consumed), consumed_assignment)
+                consumed_reply, = fixture.connect(consumed).replies()
+                self.assertIsInstance(consumed_reply, wire.PlacementWait)
+                saved = fixture.server.assignments[placement.attempt_key(
+                    consumed_assignment.episode, consumed_assignment.attempt)]
+                self.assertEqual(saved.assignment, consumed_assignment)
+                self.assertIsInstance(saved.state, placement.CurrentAssignment)
+                self.assertIsInstance(saved.permission, placement.PermissionConsumed)
                 status, = fixture.server.handle_request(consume)
                 self.assertIsInstance(status, wire.DispatchStatus)
                 assert isinstance(status, wire.DispatchStatus)
                 self.assertIsInstance(status.permission, placement.PermissionConsumed)
                 pending_claim = adopt_assignment(fixture, pending, pending_assignment)
-                self.assertEqual(fixture.server.handle_request(wire.ConsumePermission(
+                self.assertEqual(fixture.server.handle_request(consume_permission(
                     "pending-consumption", pending_assignment, pending_claim)),
                     [wire.FirstAuthorization(pending_assignment, pending_claim)])
 
@@ -5708,7 +6201,8 @@ class AdmissionConfigurationTests(unittest.TestCase):
 
     def test_drain_ignores_current_socket_waiters_and_counts_older_caller_code(self) -> None:
         scripts = Path(__file__).resolve().parents[1]
-        for relative in ("direct/verify.sh", "lint/invoke.sh", "production/merge_gate.py", "build_queue/admission_client.py"):
+        for relative in ("direct/verify.sh", "lint/invoke.sh", "production/merge_gate.py", "build_queue/admission_client.py",
+                         "mac_test/offload.py", "mac_test/copy_watch.py"):
             with self.subTest(script=relative), AdmissionFixture() as fixture:
                 caller = fixture.proc.spawn()
                 script = fixture.root / Path(relative).name

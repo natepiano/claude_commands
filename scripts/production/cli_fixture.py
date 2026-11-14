@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Generator, Mapping
-from contextlib import ExitStack, contextmanager, redirect_stderr, redirect_stdout
+from contextlib import AbstractContextManager, ExitStack, contextmanager, redirect_stderr, redirect_stdout
 from dataclasses import dataclass
 from importlib import import_module
 import io
@@ -103,9 +103,23 @@ def _replace_environment(current: dict[str, str], values: dict[str, str]) -> Non
             os.environ[key] = value
 
 
+@contextmanager
+def locked_environment(environment: Mapping[str, str], lock: AbstractContextManager[object]) -> Generator[None]:
+    """Keep environment changes outside a private service loop's reads."""
+    change = _exact_environment(environment)
+    with lock:
+        _ = change.__enter__()
+    try:
+        yield
+    finally:
+        with lock:
+            _ = change.__exit__(None, None, None)
+
+
 def invoke_cli(module: ModuleType, main: Callable[[], int], arguments: list[str],
                environment: Mapping[str, str], cwd: Path, *, combined_output: bool = False,
-               production_state: bool = False) -> subprocess.CompletedProcess[str]:
+               production_state: bool = False,
+               environment_lock: AbstractContextManager[object] | None = None) -> subprocess.CompletedProcess[str]:
     """Keep the real parser, handlers and child commands; isolate their boundaries.
 
     These commands do not mutate containers in their module globals. Restore
@@ -123,11 +137,14 @@ def invoke_cli(module: ModuleType, main: Callable[[], int], arguments: list[str]
     directory = Path.cwd()
     stdout = io.StringIO()
     stderr = stdout if combined_output else io.StringIO()
+    mask = signal.pthread_sigmask(signal.SIG_BLOCK, set())
     handlers = {sig: signal.getsignal(sig) for sig in
                 (signal.SIGINT, signal.SIGTERM, signal.SIGHUP, signal.SIGQUIT)}
     try:
         with ExitStack() as scope:
-            scope.enter_context(_exact_environment(environment))
+            environment_scope = (locked_environment(environment, environment_lock) if environment_lock is not None
+                                 else _exact_environment(environment))
+            scope.enter_context(environment_scope)
             _ = scope.enter_context(patch.object(sys, "argv", [str(module.__file__), *arguments]))
             _ = scope.enter_context(patch.object(sys, "path", sys.path.copy()))
             _ = scope.enter_context(redirect_stdout(stdout))
@@ -142,11 +159,14 @@ def invoke_cli(module: ModuleType, main: Callable[[], int], arguments: list[str]
                 if isinstance(exit_status.code, str):
                     print(exit_status.code, file=sys.stderr)
     finally:
-        os.chdir(directory)
-        for sig, handler in handlers.items():
-            _ = signal.signal(sig, handler)
-        vars(module).clear()
-        vars(module).update(before)
+        try:
+            os.chdir(directory)
+            for sig, handler in handlers.items():
+                _ = signal.signal(sig, handler)
+            vars(module).clear()
+            vars(module).update(before)
+        finally:
+            _ = signal.pthread_sigmask(signal.SIG_SETMASK, mask)
     return subprocess.CompletedProcess([sys.executable, str(module.__file__), *arguments],
                                        status, stdout.getvalue(), "" if combined_output else stderr.getvalue())
 

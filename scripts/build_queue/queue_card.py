@@ -10,7 +10,7 @@ from scripts.build_queue.queue_lines import Line, Span, age, wrap
 from scripts.build_queue.scope_activity import NotServiceSlice
 from scripts.build_queue.queue_view import (QueueModel, behind_place, eligible_head_position, check_line, check_lines, clock, estimate_minutes,
     cloud_lines, cloud_matches, cloud_rows, has_move_priority, is_moved, name_spans, name_text, pressure_check, shown_waiters, reason_phrase, running_matches_selector, start_text, step_checks, same_waiter, HostLoad)
-from scripts.build_queue import admission_records
+from scripts.build_queue import admission_records, placement
 from scripts.lint import memory_admit as gate
 
 
@@ -143,14 +143,20 @@ def _recorded_evidence(model: QueueModel, head_card: bool, columns: int,
         add(priority)
     add("Running:")
     running_steps = page_running_steps(model)
-    machine = store.host_name() if running_steps else ""
     for running in running_steps:
+        machine = admission_records.execution_host(running.step, store.host_name())
+        if isinstance(running.step.measured, admission_records.RemoteMemoryUnavailable):
+            machine += " (uncertain)" if not isinstance(running.step.execution, placement.ObservedExecution) else ""
         selected = running in selected_running
         if (not selected and isinstance(running.step.measured, admission_records.UnownedSliceMemory)
                 and isinstance(running.step.measured.job_state, NotServiceSlice)):
             continue
         prefix = "Selected running step: " if selected else ""
         text = queue_evidence.running_text(running, explanation, model.labels, model.zone, names=model.names)
+        if isinstance(running.step.measured, admission_records.RemoteMemoryUnavailable):
+            text += "; " + running.step.measured.reason
+            if isinstance(running.step.execution, placement.ExecutionEvidenceUnavailable):
+                text += "; " + running.step.execution.reason
         if not isinstance(running.step.measured, (admission_records.CompilerServiceMemory, admission_records.UnownedSliceMemory)):
             pid, separator, detail = text.partition(" · ")
             text = pid + separator + machine + separator + detail

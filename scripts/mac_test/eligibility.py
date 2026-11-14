@@ -38,6 +38,7 @@ NonBusyMacDeclineReason = Literal[
     "target does not permit this command",
     "disk",
     "copy",
+    "source_changed",
 ]
 
 
