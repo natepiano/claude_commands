@@ -331,6 +331,20 @@ def has_linux_only(repo_root: Path, package: str, excluded: set[str]) -> bool:
     return workspace_has_linux_only(repo_root, excluded)
 
 
+def linux_only_policy(config: OffloadConfig, repository: KnownRepository, repo_root: Path,
+                      package: str) -> KnownRepository | IneligibleMacStep:
+    """Apply the repository's linux_only setting; an unset or unreadable setting refuses the step."""
+    key = f"linux_only.{repository.name}"
+    if key not in config.values:
+        return IneligibleMacStep("repo")
+    try:
+        if has_linux_only(repo_root, package, comma_values(config.values[key])):
+            return IneligibleMacStep("linux_only")
+    except (OSError, UnicodeError, ValueError):
+        return IneligibleMacStep("repo")
+    return repository
+
+
 def linux_kind_permitted(values: dict[str, str], kind: str) -> bool:
     return all(step in ('test', 'check', 'doc', 'lint', 'example', 'build')
                and step in comma_values(values.get('kinds', '')) for step in remote_step_kinds(kind))
@@ -359,14 +373,9 @@ def mac_step_eligibility(config: OffloadConfig, repo_root: Path, package: str,
         if isinstance(read_backoff(time.time(), target), ActiveBackoff):
             return IneligibleMacStep("backoff")
         return repository
-    key = f"linux_only.{repository.name}"
-    if key not in config.values:
-        return IneligibleMacStep("repo")
-    try:
-        if has_linux_only(repo_root, package, comma_values(config.values[key])):
-            return IneligibleMacStep("linux_only")
-    except (OSError, UnicodeError, ValueError):
-        return IneligibleMacStep("repo")
+    policy = linux_only_policy(config, repository, repo_root, package)
+    if isinstance(policy, IneligibleMacStep):
+        return policy
     if isinstance(read_backoff(time.time(), target), ActiveBackoff):
         return IneligibleMacStep("backoff")
     return repository

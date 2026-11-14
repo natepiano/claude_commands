@@ -274,6 +274,23 @@ class EligibilityTests(IsolatedTargetTest):
                 self.assertEqual(targets.target_eligibility(self.root, "hana", routing),
                                  (expected, targets.EligibleTarget(local)))
 
+    def test_mac_table_uses_the_offload_linux_only_rule(self) -> None:
+        for name, manifest in (("portable", 'name="portable"\nversion="0.1.0"\n'),
+                               ("linux-part", 'name="linux-part"\nversion="0.1.0"\n')):
+            (self.root / name).mkdir()
+            _ = (self.root / name / "Cargo.toml").write_text("[package]\n" + manifest)
+        _ = (self.root / "Cargo.toml").write_text('[workspace]\nmembers=["portable", "linux-part"]\n')
+        _ = write_config_fixture(self.settings, "linux_only.hana=linux-part\n", template="mac_test")
+        mac = targets.SshTarget("mac", "macos", self.settings)
+        for package, expected in (("portable", targets.EligibleTarget(mac)),
+                                  ("linux-part", targets.ExcludedTarget(mac, "linux_only")),
+                                  ("", targets.ExcludedTarget(mac, "linux_only"))):
+            with self.subTest(package=package):
+                self.assertEqual(targets.target_eligibility(self.root, package, targets.AnyEligibleTarget())[0], expected)
+        _ = (self.root / "Cargo.toml").write_text("[workspace]\nmembers=[\n")
+        self.assertEqual(targets.target_eligibility(self.root, "", targets.AnyEligibleTarget())[0],
+                         targets.ExcludedTarget(mac, "repo"))
+
     def test_unknown_repository_excludes_mac_without_excluding_linux(self) -> None:
         with mock.patch.object(eligibility, "repository_identity", return_value=eligibility.UNKNOWN_REPOSITORY):
             results = targets.target_eligibility(self.root, "hana", targets.AnyEligibleTarget())
