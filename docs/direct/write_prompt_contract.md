@@ -46,6 +46,7 @@ Codex review prompts also include section 3's command block.
    (pass or fail, exit code, log path, last lines) arrives as your next
    message, also after an account move or a stop. Never poll, sleep, call
    `wait`, loop on a status file, or post a waiting status.
+   The run's record and log stay until your pass ends; then they are deleted.
    Status 77 means cancelled because the tree changed: resubmit after your
    edits are done; it is not a test failure.
    When a later edit or result makes a run of yours useless, cancel it in

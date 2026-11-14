@@ -577,8 +577,16 @@ class StaffSnapshot:
         row = self.by_member_reference(reference)
         return self.parent_of(row) if row is not None and row.kind == "worker" else row
 
+    @cached_property
+    def rows_by_current_session(self) -> dict[str, StaffRow]:
+        """The first row for each session, as a scan in row order finds it."""
+        found: dict[str, StaffRow] = {}
+        for row in self.rows:
+            _ = found.setdefault(row.current_session, row)
+        return found
+
     def by_current_session(self, session_id: str) -> StaffRow | None:
-        return next((row for row in self.rows if row.current_session == session_id), None)
+        return self.rows_by_current_session.get(session_id)
 
     def by_member_reference(self, reference: str) -> StaffRow | None:
         """Resolve a persisted fixed member id or its current conversation."""
@@ -1073,7 +1081,7 @@ def backend(row: StaffRow) -> ClaudeBackend | CodexBackend | BackendUnavailable:
 def _found_backends(rows: Sequence[StaffRow],
                     running: frozenset[str] | None = None) -> dict[StaffId, ClaudeBackend | CodexBackend]:
     """Find worker sessions with one scan of each real session folder."""
-    from scripts.lib.transcripts import transcript_paths, uncompressed_path
+    from scripts.lib.transcripts import transcript_stems
     from scripts.message import session_records as sessions
 
     accounts = import_module("scripts.whoami.agent_accounts")
@@ -1092,10 +1100,7 @@ def _found_backends(rows: Sequence[StaffRow],
             for folder in ("sessions", "archived_sessions"):
                 real_folder = (home / folder).resolve()
                 if real_folder not in ids_by_folder:
-                    ids_by_folder[real_folder] = [
-                        StaffId(uncompressed_path(path).stem[-36:])
-                        for path in transcript_paths(real_folder)
-                    ]
+                    ids_by_folder[real_folder] = [StaffId(stem[-36:]) for stem in transcript_stems(real_folder)]
                 for session_id in ids_by_folder[real_folder]:
                     identity = wanted.get(session_id)
                     if identity is not None:
