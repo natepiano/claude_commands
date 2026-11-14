@@ -500,11 +500,20 @@ sweep_after_step() {
     fi
     printf '%s\n' "$now" > "$stamp" || return 0
     # Cargo locks protect the sweep. It must not take the board token.
+    # Its removal lines go to the journal, where read_sweep_journal and the
+    # floor alert find them: this sweep can hold floor.lock while the
+    # disk-floor service run skips. The pipeline keeps no fd of the caller.
+    # When systemd-cat cannot reach the journal (a sandbox), cat reads the
+    # rest, so the sweep never stops on a broken pipe in a removal.
     (
         trap '' HUP
         TOKEN_HELD=0
         run() { run_once "$@"; }
-        invoke_sweep </dev/null >/dev/null 2>&1 &
+        if command -v systemd-cat >/dev/null 2>&1; then
+            invoke_sweep </dev/null 2>&1 | { systemd-cat -t lint-sweep || cat; } >/dev/null 2>&1 &
+        else
+            invoke_sweep </dev/null >/dev/null 2>&1 &
+        fi
     )
 }
 

@@ -113,7 +113,14 @@ The action check confirms the session before signals or pane input.
 The command changes to the saved folder before the account launch.
 The pane receives one opening message after identity confirmation.
 
-Resume from its own empty pane executes the saved launch in that pane.
+Resume, restart and account moves start a session in its own pane.
+The own pane is a pane that runs the member, else the newest pane whose launch record names the member and no other member runs in.
+`herdr.saved_row_tab` waits within `OWN_PANE_SHELL_SECONDS` (`config/shutdown.conf`) for that pane to reach the shell, then reuses it.
+When the wait ends first, the start is refused with one line.
+The line names the session, its own pane and `agents resume <name>`, and the session stays stopped.
+A new tab opens only for a session with no own pane.
+A producer whose own pane is outside `PRODUCER_WORKSPACE`, or shares its tab, gets a new tab in that workspace with no wait.
+A restart never splits a pane beside a worker.
 `stop_resume._resume_once` and `restart.start_row` use `herdr.row_workspace` for new tabs.
 Producers use `PRODUCER_WORKSPACE` from `config/staff.conf`, normally `producers`.
 Other rows use their parent showrunner's workspace, the entry name, or the shared session.
@@ -246,6 +253,16 @@ Publication replaces earlier bindings through the recoverable `.producer-publica
 Resume compares source and destination pane locations before it lists panes.
 An own-pane resume therefore needs no pane list call.
 
+### Catch-up reader
+
+`scripts/agents/catch_up.py NATIVE_ID [--blocks N] [--chars N]` prints the last blocks of a saved conversation.
+A session that takes a producer role reads the earlier conversation of that role with it.
+`NATIVE_ID` is `session:<id>`, `codex:<id>` or an ID alone. An ID alone selects the newest transcript of either family.
+A block is one user message, assistant message, tool call or tool result. A tool block is one shortened line.
+A Claude compaction summary is one block. A Codex compaction summary is encrypted, so only its time shows.
+The reader finds transcripts through `scripts/lib/transcripts.py` and reads from the end of the file in windows that double.
+`config/catch_up.conf` sets the default block count, the characters kept from one message, the tool line length and the first read window. Times use the user's zone.
+
 ### First start
 
 `ProducerFirstStart(name, folder)` represents a configured producer before staff admission.
@@ -285,6 +302,24 @@ Recovery resumes the retained conversation only when no other live session carri
 Several tabs with the producer label therefore do not select a different conversation.
 The shared native process reader uses Claude's session registry to prove a plain `claude` start.
 The process arguments need no session ID.
+
+`agents transfer NAME [--model MODEL --effort EFFORT]` gives a producer role to the conversation that runs it.
+`producer_transfer.transfer` holds the `producer-first-NAME` slot and the row lock for these steps:
+
+1. Refuse a caller that another staff row records. Refuse a producer on another machine.
+2. Prove the caller through `stop_resume.producer_adoption_launch`: native id, family, account home, folder, and pane.
+3. Refuse a Claude caller outside the showrunners account; the refusal names the `agents move` command.
+4. Validate the settings through `models_registry.producer_settings`. Without options, the configured family must match the caller.
+5. Stop the old conversation through `restart.stop_row`, print its `catch_up.py` command, and close its panes.
+6. Publish `[producers].NAME` through `models_registry.store_producer`.
+7. Write the row through `staff.transfer_producer`, then publish the pane record as the producer binding.
+8. Give the tab the producer name through `retitle_row`; the saved layout supplies the position of the old tab.
+
+`restart.restart(stop_all=True, only=(row id,))` then restarts the caller outside the row lock.
+The restart runs in a detached process and sends no opening prompt.
+The row id, the document, and the `staff:<row id>` message queue do not change.
+Each step is safe to run again; a caller that already holds the row skips step 5.
+A failure between steps 6 and 7 leaves the new settings on the old session until the next run.
 
 `agents remove-stray NAME SESSION` removes a local stray producer conversation.
 The command uses this order:
@@ -375,6 +410,16 @@ The message names idle children separately.
 It keeps the account move source and destination.
 Restart and pane restore select each worker's current staff parent directly.
 Closed idle workers stay closed until their next assignment.
+
+`quota_alert.no_worker_mode()` reads the quota state at each call, from the current `XDG_STATE_HOME`.
+A missing or unreadable state reads as off.
+In no-worker mode, `worker.restore` prints `<worker>: not resumed: no-worker mode` for each Codex worker it would start or resume, and leaves it stopped.
+`agents restart`, the restart of a director, `agents resume` and unit recovery all restore workers through `worker.restore`.
+A skipped worker leaves the restart record. The next assignment resumes it.
+`stop_resume` refuses a Codex worker row with `no-worker mode keeps Codex workers stopped`, before it opens a pane.
+`resume_message.worker_mode()` gives `WorkersHeld` in no-worker mode.
+The resume, restart and relaunch messages of a director then carry the `no_worker_mode_on` text from `config/accounts.conf` and no worker lines.
+A paused director gets `Continue where you stopped.` and the same text.
 Pane worker resume uses the dispatch record and transcript to select one step.
 An idle worker receives a continuation prompt when its transcript contains the open dispatch.
 Restore holds the dispatch lock across the record read, receipt read, and prompt delivery.
@@ -419,7 +464,17 @@ After login, run `agents restart`.
 
 `agents stop --all` selects live Claude and Codex rows on this machine from `staff.json`.
 The selection includes producers, such as brain, morty, and dwight.
-It saves each row ID before its stop. It starts nothing.
+A complete unscoped read prunes recorded rows whose sessions still run.
+Each prune checks current liveness again while it holds the row lock.
+A refused row lock preserves the entry.
+A partial liveness read prints an anomaly and prunes nothing.
+Recorded stopped rows remain pending.
+Each stop holder saves its selected rows while it holds their row locks.
+A refused stop removes its provisional entry before the row lock releases.
+No command clears the whole record.
+It starts nothing.
+`stop --all --only ID[,ID...]` and `stop --all --account ACCOUNT` merge selected rows into the record.
+These scoped stops preserve other saved rows.
 A live session without a staff row prints one anomaly line. Stop does not save it.
 `agents restart --all` uses the same selection and stop loop, then resumes the selected rows.
 It keeps only the row IDs whose starts failed.
@@ -500,6 +555,12 @@ A running row gets no continuation message.
 Producers keep their existing start behavior.
 Herdr server restore keeps its existing start behavior.
 A row leaves the saved list when it starts or already runs.
+`stop_resume.resume` removes a row after a confirmed start while it holds the row lock.
+Upkeep, account moves, watchdog recovery, and named resume share this removal.
+Named resume also removes a row after a successful continuation message.
+Retired recovery removes a row after it proves the resumed native session.
+These removals and restart cleanup occur before the row locks release.
+Native resume, continuation messages, restart, retired recovery, and pruning use `shutdown_record.remove_started`.
 A failed start adds the row to the list.
 A refused row lock changes no saved row.
 `--only` leaves other saved rows on the list.
@@ -511,6 +572,14 @@ Both commands change nothing.
 
 `shutdown_record.py` stores only a JSON list of staff row IDs in `shutdown/restart.json`.
 The record stores no session facts, progress, claims, recovery states, or pane positions.
+`shutdown_record.update` holds the record lock for each change.
+Unscoped `held-sessions` prunes confirmed live entries after a complete liveness read.
+It checks current liveness again under each row lock.
+It saves the live tab positions and preserves recorded stopped rows.
+`held-sessions ACCOUNT` and `held-sessions --only ID[,ID...]` merge selected rows and preserve other saved rows.
+A failed staff read preserves the record.
+A partial live-row read prunes nothing.
+The stop loop can still save rows that it stops.
 Herdr stores the tab order and associates each saved tab with its staff row ID.
 
 Start reads `current_session` and the worktree from staff.

@@ -420,7 +420,8 @@ def branch_keep_reason(request: MergeRequest, branch: str) -> str:
     record = request.staff_record if request.staff_record is not None else staff.snapshot()
     resolver = session_staff.RowResolver(record)
     for row in record.rows:
-        if isinstance(row.worktree, staff.PresentWorktree):
+        # A producer's worktree is its launch folder; it holds no branch of this repository.
+        if row.kind != "producer" and isinstance(row.worktree, staff.PresentWorktree):
             owner_branch = resolver.unit_branch(row)
             if not isinstance(owner_branch, session_staff.Branch):
                 return f"{row.name}: owner branch is unreadable"

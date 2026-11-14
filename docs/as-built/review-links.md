@@ -83,6 +83,57 @@ The lock file stays on disk. Closing it releases the lock, also on an error. If 
 - Code blocks and the `<pre>` fallback scroll sideways without wrapping. Tables are centered and use as much of the window width as their content needs; wider tables scroll inside the page. Cells wrap at spaces, never inside a word or number. Images fit the width.
 - A custom `marked` renderer escapes raw HTML. A `<details>` or `<script>` block shows as text and does not run.
 
+### Hana console
+
+`change_page.py` without rows prints `/<snapshot>/console.html?page=changes`.
+Selected-row links with `--production NAME C27` still open `changes.html` directly.
+`scripts/review_links/console.py` publishes the console beside its Changes snapshot.
+The server applies the same root, traversal, private-file, and symlink rules to both pages.
+The console adds a same-origin content policy and permits same-origin framing.
+Its title is **Hana console**, followed by the selected page title.
+
+The left navigation has icons and labels for Changes and Builds.
+The desktop top bar shows only the selected page title.
+Its toggle collapses the labels into an icon rail.
+Hover and keyboard focus show each collapsed label.
+The browser stores the collapse state in `localStorage`.
+Each storage operation catches failures, so blocked storage does not stop navigation.
+The selected page fills a same-origin frame beside the navigation.
+The shell follows the system light or dark theme.
+At phone width, a slim top bar shows **Hana console** and a menu button.
+The frame uses the full page width below the top bar.
+The menu button opens the navigation above the frame.
+A page choice, the Escape key, or a click outside closes the navigation.
+The phone navigation starts closed and does not change the stored desktop state.
+
+`?page=<id>` selects a page.
+Missing and unknown ids select the first configured entry.
+Navigation clicks update this query with `history.replaceState`.
+
+`config/console.conf` defines entries in file order.
+The publisher reads it through `conf.read("console")` when it creates the link.
+Each entry defines `page.<id>.label`, `.icon`, `.title`, and `.url`.
+The URL value has the form `python:<module>:<function>`.
+The function takes no arguments and returns a URL path under the review root.
+The console also accepts a full URL from the configured review origin and converts it to a path.
+The URL function raises one of `review_link.SNAPSHOT_ERRORS` when the page is unavailable.
+An absent function also makes the entry unavailable.
+That entry remains visible and shows **Not available** when selected.
+Publishing the console again resolves the current configuration and page availability.
+
+A page joins with one configuration block and its URL function.
+The page serves itself at that path and permits same-origin framing.
+A link that leaves the page uses `target="_top"`.
+The server must not send `X-Frame-Options: DENY` or `frame-ancestors 'none'` for these pages.
+`change_page.page_url` reuses the existing Changes publisher.
+The Builds entry calls `memory_feed.page_url`.
+That function returns the configured Builds page URL without publishing a reading.
+
+The console vendors five SVGs from `lucide-static` **0.468.0** under `scripts/review_links/lucide/`.
+They are `list-checks`, `hammer`, `panel-left-close`, `panel-left-open`, and `menu`.
+That folder includes the version, source, and ISC license.
+The console inlines the icons and makes no CDN, font, script, or stylesheet request.
+
 ### Questions, Changes, and Rebuilds
 
 The review page has one tab bar for Questions, Changes, and Rebuilds, with waiting counts.
@@ -266,7 +317,13 @@ Builds rows can remain in the natedev list while the builds filter shows them.
 Each showrunner group orders its prepared change rows with `urgency.queue_order`, the same order that `/next change` uses.
 The page keeps row entries during ordering and does not format the text that `/next` prints.
 The existing urgency order, pin, dependencies, and moved rows determine its order.
-Rows from another list use qualified row IDs and qualified prerequisite IDs.
+Queue keys and prerequisites retain their list-based IDs.
+The `change` line and `/next` show the responsible showrunner's ID, such as `sdlc/C1514`.
+The shared staff resolver supplies the prefix used by the showrunner filter.
+Rows without a staff producer use the list's showrunner through the same resolver.
+`verdict` and `answer-question` print the same responsible-showrunner ID.
+Row commands and selected-row links accept that ID and the existing list-based ID.
+An ambiguous displayed ID requires an explicit `--list <path>`.
 Skip for now selects the next prepared row in the browser without a server request.
 The URL fragment stores the showrunner and row key.
 A reload restores that place when the row waits, awaits validation, or has an open question.
@@ -282,16 +339,16 @@ Set it with `change_review.py set-kind --production <showrunner name> --row C27 
 Use **See in action** for a change to something the user runs or sees.
 Use **Read only** for other changes.
 Both kinds appear.
-An older row without Kind appears as **Kind not recorded**.
-The page shows every row with its recorded kind or the missing-kind notice.
+An older row without Kind shows no kind line.
+The page shows every row with its recorded kind.
 
 The short URL ends in `/changes.html`.
 The page retains the plain, narrow layout and fits a phone.
-Each card starts with its title.
-One closed **Details** disclosure holds the ID, date, commit, and kind.
-How to check or Proof stays in the main view.
+Each card starts with its title, then How to check or Proof.
 The title uses 20px text; section labels use 17px text.
-A 16px gap separates the title and metadata.
+Aligned detail lines follow the buttons and are always shown: `change`, `date`, `time`, `commit`, and `kind`.
+A line is left out when its value is unknown.
+`time` is the time of day that the row was added, in the user's zone; older rows have no time.
 How to check and Proof show text lines in preformatted blocks.
 Consecutive lines that start with `- ` form a bulleted list.
 Consecutive lines that start with a number, a dot, and a space form a numbered list.
@@ -301,8 +358,8 @@ The list file stores cell line breaks as `<br>` and reads them as line breaks.
 A typed `<br>` takes one more backslash in storage and reads back unchanged.
 Every line separator that Python's `splitlines` recognizes is a line break.
 Each row stays on one table line.
-Works and Does not work are the main actions.
-Ask showrunner to check, Ask a question, and Send feedback are secondary actions.
+Works, Does not work, Ask showrunner to check, Ask a question, Send feedback, and Skip for now share one wrapping row in that order.
+A desktop width shows two button rows; a 390px phone shows three.
 The **Comment, question or feedback** field is a textarea with `feedback_rows` rows.
 The setting starts at 5.
 The box accepts line breaks for every outcome.
@@ -407,7 +464,8 @@ An absent proposal returns `skipped: no proposal for <row>` and is not an error.
 Malformed proposals, incompatible states, and SSH failures raise `FeatureLogError`.
 The server makes no separate proposal lookup.
 A Hana list uses a bare review ID, such as `C27`.
-Other lists use their filename's showrunner name, such as `natedev/C27`.
+Other feature-log review IDs retain their filename's showrunner name, such as `natedev/C27`.
+These stored IDs stay valid when the displayed ID names another responsible showrunner.
 A landing answer calls `land_review`, which lands the proposal with the verb that the proposal records (`add` or `supersede`).
 A returning answer calls `drop_review` with the saved verdict.
 An operation failure keeps the row open and sends the showrunner the row ID and the `FeatureLogError.diagnostic` text.

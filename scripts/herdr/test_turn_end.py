@@ -139,6 +139,13 @@ class TurnEndTests(unittest.TestCase):
                         kept = scratch.new_worker()
                         atomic_file.write_text_atomic(kept / "peer.txt", "peer output")
                         kept_folders.append(kept)
+                    runs = self.case.run_dir / "detached_runs"
+                    runs.mkdir(exist_ok=True)
+                    for run_id, owner, owner_id in (("own", name, str(row.id)), ("director", "director", "")):
+                        atomic_file.write_text_atomic(runs / f"{run_id}.json", json.dumps(
+                            {"run_id": run_id, "worker": owner, "staff_id": owner_id, "status": "finished",
+                             "started_at": datetime.now().timestamp()}))
+                        atomic_file.write_text_atomic(runs / f"{run_id}.log", "output")
                 active = progress_history.active_dispatch(row.id, self.case.run_dir)
                 self.assertIsInstance(active, progress_history.ActiveDispatch)
                 assert isinstance(active, progress_history.ActiveDispatch)
@@ -201,6 +208,10 @@ class TurnEndTests(unittest.TestCase):
                 if close == "scratch":
                     self.assertEqual(list(Path(os.environ["TMPDIR"]).iterdir()), kept_folders)
                     self.assertEqual((kept_folders[0] / "peer.txt").read_text(), "peer output")
+                    # The pass end deletes the worker's finished runs; a director keeps its newest run.
+                    runs = self.case.run_dir / "detached_runs"
+                    self.assertEqual(sorted(path.name for path in runs.iterdir() if not path.name.startswith(".")),
+                                     ["director.json", "director.log"])
                 self.assertEqual(staff.by_id(row.id), row)
                 log = self.case.fixture.root / "state/herdr/turn-end-ignored.jsonl"
                 entry = cast(dict[str, object], json.loads(log.read_text().splitlines()[-1]))
@@ -923,7 +934,7 @@ class TurnEndTests(unittest.TestCase):
     def test_the_astra_launcher_returns_with_an_active_pass_and_a_worker_process_hold(self) -> None:
         router = test_worker.PaneCommandRouter()
         router.setup(self, self.case.fixture.root)
-        args = assign.Arguments(new_worker="astra-reviewer", summary=str(self.case.reply), policy="astra-reviewer")
+        args = assign.Arguments(new_worker="astra-reviewer", reply_file=str(self.case.reply), policy="astra-reviewer")
         hold_role = astra_roles.hold
         bootstrap_hooks: list[Future[turn_end.TurnOutcome]] = []
 

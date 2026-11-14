@@ -41,8 +41,11 @@ class AutoSilenceTests(unittest.TestCase):
     @override
     def setUp(self) -> None:
         folder = self.enterContext(tempfile.TemporaryDirectory())
+        records = Path(folder) / "pane-records"
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
-            "NOTIFY_STATE_DIR": folder, "STAFF_FILE": str(Path(folder) / "staff.json")})))
+            "NOTIFY_STATE_DIR": folder, "STAFF_FILE": str(Path(folder) / "staff.json"),
+            "HERDR_PANE_RECORD_DIR": str(records)})))
+        _ = cast(object, self.enterContext(mock.patch.object(pane_record, "RECORD_DIR", records)))
         self.commands, self.pushes, self.posted, self.now = [], [], [], START
         registry = Path(folder) / "sessions"
         registry.mkdir()

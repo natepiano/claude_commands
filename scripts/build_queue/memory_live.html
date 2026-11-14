@@ -14,6 +14,7 @@
   --remote-memory: var(--remote-memory-light); --machine-natedev: var(--machine-natedev-light);
   --machine-mac: var(--machine-mac-light); --machine-aws: var(--machine-aws-light);
   --other: #a3a19b; --free: #e7e5df; --floor: #eda100; --cap: #c22d2c; --block: #8a5a00;
+  --agents: #7f6fc4; --desktop: #78756e;
 }
 @media (prefers-color-scheme: dark) {
   :root:not([data-theme="light"]) {
@@ -25,6 +26,7 @@
     --remote-memory: var(--remote-memory-dark); --machine-natedev: var(--machine-natedev-dark);
     --machine-mac: var(--machine-mac-dark); --machine-aws: var(--machine-aws-dark);
     --other: #5c5b57; --free: #2a2a28; --floor: #c98500; --cap: #ef7372; --block: #e3a83f;
+    --agents: #9585e0; --desktop: #8a877f;
   }
 }
 :root[data-theme="dark"] {
@@ -36,6 +38,7 @@
   --remote-memory: var(--remote-memory-dark); --machine-natedev: var(--machine-natedev-dark);
   --machine-mac: var(--machine-mac-dark); --machine-aws: var(--machine-aws-dark);
     --other: #5c5b57; --free: #2a2a28; --floor: #c98500; --cap: #ef7372; --block: #e3a83f;
+    --agents: #9585e0; --desktop: #8a877f;
 }
 * { box-sizing: border-box; }
 body { margin: 0; background: var(--bg); color: var(--ink); font: 15px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
@@ -60,6 +63,7 @@ h1 { font-size: 1.4rem; margin: 0; letter-spacing: -0.01em; }
 .bar > div { height: 100%; border-radius: 2px; min-width: 0; transition: flex-basis 0.6s ease; position: relative; display: flex; align-items: center; justify-content: center; overflow: hidden; }
 .lbl { flex: none; font-size: 0.85rem; font-weight: 700; font-variant-numeric: tabular-nums; padding: 1px 6px; border-radius: 5px; background: color-mix(in srgb, var(--card) 82%, transparent); color: var(--ink); white-space: nowrap; pointer-events: none; transition: opacity 0.2s ease; }
 .lbl.hide { opacity: 0; }
+.lbl.tight { padding: 1px 2px; font-size: 0.75rem; }
 .legend-box { margin-top: 12px; }
 .legend-box > summary .chev { display: block; width: 14px; height: 14px; font-size: 0; position: relative; top: 1px; }
 .legend-box > summary .chev::before { content: ""; position: absolute; left: 4px; top: 3px; border-left: 6px solid currentColor; border-top: 4px solid transparent; border-bottom: 4px solid transparent; }
@@ -72,6 +76,9 @@ h1 { font-size: 1.4rem; margin: 0; letter-spacing: -0.01em; }
 .seg-other { background: var(--other); }
 .seg-free { background: var(--free); box-shadow: inset 0 0 0 1px var(--ink-2); }
 .seg-floor { background: var(--floor); }
+.seg-agents { background: var(--agents); }
+.seg-desktop { background: var(--desktop); }
+.hatch-swap { background: repeating-linear-gradient(135deg, var(--agents) 0 3px, var(--free) 3px 6px); }
 .mark { position: absolute; top: 18px; bottom: -6px; width: 15px; margin-left: -7px; cursor: help; transition: left 0.6s ease; }
 .mark::before { content: ""; position: absolute; left: 6px; top: 0; bottom: 0; border-left: 3px solid var(--cap); }
 .bar > div, .mark-label { cursor: help; }
@@ -125,6 +132,9 @@ summary .v { margin-left: auto; padding-left: 12px; font-variant-numeric: tabula
 .sw.other { background: var(--other); }
 .sw.free { background: var(--free); border: 1px solid var(--ink-2); }
 .sw.floor { background: var(--floor); }
+.sw.agents { background: var(--agents); }
+.sw.desktop { background: var(--desktop); }
+.sw.agents_swap { background: repeating-linear-gradient(135deg, var(--agents) 0 2px, var(--free) 2px 4px); }
 .sw.cap { height: 14px; border-radius: 0; background: linear-gradient(to right, transparent 4px, var(--cap) 4px 7px, transparent 7px); }
 .section-head { font-weight: 600; font-size: 1rem; }
 table { width: 100%; border-collapse: collapse; font-size: 0.86rem; margin-top: 6px; }
@@ -326,7 +336,10 @@ body.queue-unavailable .status, body.queue-unavailable .card { display: none; }
         <div class="seg-ci" id="s-ci_ram" data-tip="ci"><span class="lbl" id="l-ci_ram"></span></div>
         <div class="hatch" id="s-reserved" data-tip="reserved"><span class="lbl" id="l-reserved"></span></div>
         <div class="seg-room" id="s-room" data-tip="room"><span class="lbl" id="l-room"></span></div>
+        <div class="hatch-swap" id="s-agents_swap" data-tip="agents_swap"><span class="lbl" id="l-agents_swap"></span></div>
         <div class="seg-floor" id="s-floor" data-tip="floor"><span class="lbl" id="l-floor"></span></div>
+        <div class="seg-agents" id="s-agents" data-tip="agents"><span class="lbl" id="l-agents"></span></div>
+        <div class="seg-desktop" id="s-desktop" data-tip="desktop"><span class="lbl" id="l-desktop"></span></div>
         <div class="seg-other" id="s-other" data-tip="other"><span class="lbl" id="l-other"></span></div>
         <div class="seg-free" id="s-past" data-tip="past"><span class="lbl" id="l-past"></span></div>
       </div>
@@ -343,6 +356,9 @@ body.queue-unavailable .status, body.queue-unavailable .card { display: none; }
       <div class="row" data-tip="room"><span class="sw room"></span><span class="name">Next step room</span><span class="v num" id="v-room">–</span></div>
       <div class="row" data-tip="cap"><span class="sw cap"></span><span class="name">Cap line</span><span class="v num" id="v-cap">–</span></div>
       <div class="row" data-tip="floor"><span class="sw floor"></span><span class="name">Safety</span><span class="v num" id="v-floor">–</span></div>
+      <div class="row" data-tip="agents_swap"><span class="sw agents_swap"></span><span class="name">Agents' swapped memory</span><span class="v num" id="v-agents_swap">–</span></div>
+      <div class="row" data-tip="agents"><span class="sw agents"></span><span class="name">Agents</span><span class="v num" id="v-agents">–</span></div>
+      <div class="row" data-tip="desktop"><span class="sw desktop"></span><span class="name">Desktop guarantee</span><span class="v num" id="v-desktop">–</span></div>
       <div class="row" data-tip="other"><span class="sw other"></span><span class="name">Other programs and the system</span><span class="v num" id="v-other">–</span></div>
       <div class="row" data-tip="past"><span class="sw free"></span><span class="name">Shortfall</span><span class="v num" id="v-past">–</span></div>
       <div class="row" data-tip="waiting"><span class="sw waiting"></span><span class="name">Waiting step, memory it needs</span></div>
@@ -375,7 +391,7 @@ body.queue-unavailable .status, body.queue-unavailable .card { display: none; }
     <div class="gauges">
       <div class="gauge" data-tip="g-some"><span>Some tasks stall</span><div class="gt"><div class="gf" id="gf-some"></div><div class="gl" id="gl-some"></div><div class="amounts"><span class="bar-amount" id="gv-some" data-start="0"></span><span class="bar-amount limit-label" id="limit-some"></span></div></div></div>
       <div class="gauge" data-tip="g-full"><span>All tasks stall</span><div class="gt"><div class="gf" id="gf-full"></div><div class="gl" id="gl-full"></div><div class="amounts"><span class="bar-amount" id="gv-full" data-start="0"></span><span class="bar-amount limit-label" id="limit-full"></span></div></div></div>
-      <div class="gauge" data-tip="g-swap"><span>Swap used <span class="num" id="swap-sum"></span></span><div class="gt"><div class="gf" id="gf-swap"></div><div class="gl" id="gl-swap"></div><div class="amounts"><span class="bar-amount" id="gv-swap" data-start="0"></span><span class="bar-amount limit-label" id="limit-swap"></span></div></div></div>
+      <div class="gauge" data-tip="g-swap"><span>Swap used <span class="num" id="swap-sum"></span></span><div class="gt"><div class="gf" id="gf-swap"></div><div class="amounts"><span class="bar-amount" id="gv-swap" data-start="0"></span></div></div></div>
     </div>
     <h3>Swap by group</h3>
     <div class="swaprows" id="swaprows"></div>
@@ -405,7 +421,10 @@ const TIPS = {
     const row = d.walk.find((r) => r.ci);
     return [`hana CI · ${row ? row.detail : `${f1(d.ci_ram)} GiB RAM`}`, row ? row.keep_text : "CI runner memory is not readable."];
   },
-  other: (d) => [`Other programs and the system · ${f1(d.other)} GiB`, "Memory that is not builds: editors, agents, browsers and the system."],
+  agents_swap: (d) => [`Agents' swapped memory · ${f1(d.agents_swap)} GiB`, "Agent memory in swap. It can return to RAM at any time, so the queue does not give it to builds."],
+  agents: (d) => [`Agents · ${sliceAmount(d.agents_ram)}`, recorded(d.agents_ram) ? "Agent sessions and their tools in RAM. This changes as agents start and stop." : d.slices_unavailable],
+  desktop: (d) => [`Desktop guarantee · ${sliceAmount(d.desktop_guarantee)}`, recorded(d.desktop_guarantee) ? "Memory the system keeps for the desktop, so the mouse and keyboard stay responsive." : d.slices_unavailable],
+  other: (d) => [`Other programs and the system · ${f1(d.other)} GiB`, "Memory that is not builds, agents or the desktop guarantee: editors, browsers and the system."],
   past: (d) => [`Shortfall · ${f1(d.shortfall)} GiB`, "Reserved exceeds free memory minus safety. The bar shows zero room."],
   floor: (d) => [`Safety · ${f1(d.floor)} GiB`, `The queue keeps ${f1(d.floor)} GiB free.`],
 };
@@ -417,8 +436,8 @@ function formatPercent(value, complete = true) {
 function level(d) {
   if (!recorded(d.psi.some) || !recorded(d.psi.full)) return "neutral";
   if (d.pressure !== "none") return "hold";
-  const L = d.limits, sp = pctOf(d.swap_used, d.swap_total);
-  return (d.psi.some >= L.some * 0.6 || d.psi.full >= L.full * 0.6 || sp >= L.swap * 0.8) ? "warn" : "ok";
+  const L = d.limits;
+  return (d.psi.some >= L.some * 0.6 || d.psi.full >= L.full * 0.6) ? "warn" : "ok";
 }
 Object.assign(TIPS, {
   pill: (d) => [`Memory pressure · ${({ ok: "none", warn: "near a limit", hold: "queue holds", neutral: "stall not recorded" })[level(d)]}`, `Pressure means the system waits for memory. Above a limit, the queue starts no new step. Click to see swap and the pressure checks.`],
@@ -429,7 +448,7 @@ Object.assign(TIPS, {
   swaphead: () => ["Swap and memory pressure", "Swap is disk space the system uses when RAM is short. Swap itself is not a problem. Stalls are the problem: they show the system waits for memory."],
   "g-some": (d) => [`Some tasks stall · ${(!recorded(d.psi.some) ? "not recorded" : formatPercent(d.psi.some))}`, `Part of the last 10 s that at least one task waited for memory. The queue holds above ${formatPercent(d.limits.some)} (the red line).`],
   "g-full": (d) => [`All tasks stall · ${(!recorded(d.psi.full) ? "not recorded" : formatPercent(d.psi.full))}`, `Part of the last 10 s that all tasks waited for memory. This is the serious signal. The queue holds above ${formatPercent(d.limits.full)}.`],
-  "g-swap": (d) => [`Swap used · ${formatPercent(pctOf(d.swap_used, d.swap_total))}`, `The queue holds above ${formatPercent(d.limits.swap)} swap used.`],
+  "g-swap": (d) => [`Swap used · ${formatPercent(pctOf(d.swap_used, d.swap_total))}`, "Swap use alone does not hold the queue."],
 });
 function macRow(row) {
   return row.kind === "mac-build" || row.kind === "mac-unavailable";
@@ -663,6 +682,7 @@ const STALE = Math.max(15, SECONDS * 5);
 const $ = (id) => document.getElementById(id);
 const f1 = (n) => recorded(n) ? n.toFixed(1) : "unavailable";
 const memoryAmount = (n) => recorded(n) ? `${f1(n)} GiB` : "use unavailable";
+const sliceAmount = (n) => recorded(n) ? `${f1(n)} GiB` : "unavailable";
 
 function setSeg(id, value, total) {
   $(id).style.flex = `0 0 ${value / total * 100}%`;
@@ -699,12 +719,15 @@ function render(d) {
   setSeg("s-ci_ram", d.ci_ram, t);
   setSeg("s-past", 0, t);
   setSeg("s-floor", d.shown_safety, t);
+  setSeg("s-agents_swap", d.shown_agents_swap, t);
+  setSeg("s-agents", d.shown_agents, t);
+  setSeg("s-desktop", d.shown_desktop, t);
   $("mark").hidden = !hasCap(d);
   $("marklabel").hidden = !hasCap(d);
   document.querySelector('.sw.cap').hidden = !hasCap(d);
   $("marklabel").textContent = !hasCap(d) ? "cap unavailable" : `cap ${f1(d.cap)}`;
   $("barwrap").setAttribute("aria-label",
-    `RAM ${f1(t)} GiB: builds use ${f1(d.used)}, CI RAM ${f1(d.ci_ram)}, reserved ${f1(d.reserved)}, room ${f1(d.room)}, ${!hasCap(d) ? d.cap_text : `cap ${f1(d.cap)}`}`);
+    `RAM ${f1(t)} GiB: builds use ${f1(d.used)}, CI RAM ${f1(d.ci_ram)}, reserved ${f1(d.reserved)}, room ${f1(d.room)}, agents ${sliceAmount(d.agents_ram)}, agents' swapped memory ${f1(d.agents_swap)}, desktop guarantee ${sliceAmount(d.desktop_guarantee)}, ${!hasCap(d) ? d.cap_text : `cap ${f1(d.cap)}`}`);
 
   const [roomValue, roomUnit] = memoryAmount(d.room).split(" ");
   $("room").textContent = roomValue;
@@ -713,7 +736,10 @@ function render(d) {
   $("cap-reason").textContent = hasCap(d) ? "" : d.cap_text;
   $("v-cap").textContent = !hasCap(d) ? "unavailable" : memoryAmount(d.cap);
   $("v-past").textContent = memoryAmount(d.shortfall);
-  const segVals = { used: shownUse, reserved: d.shown_reserved, room: d.room, other: d.other, past: 0, floor: d.shown_safety, ci_ram: d.ci_ram };
+  $("v-agents_swap").textContent = memoryAmount(d.agents_swap);
+  $("v-agents").textContent = sliceAmount(d.agents_ram);
+  $("v-desktop").textContent = sliceAmount(d.desktop_guarantee);
+  const segVals = { used: shownUse, reserved: d.shown_reserved, room: d.room, other: d.other, past: 0, floor: d.shown_safety, ci_ram: d.ci_ram, agents_swap: d.shown_agents_swap, agents: d.shown_agents, desktop: d.shown_desktop };
   for (const [k, v] of Object.entries(segVals)) $(`l-${k}`).textContent = f1(v);
   latest = d;
   setTimeout(fitLabels, 650);
@@ -746,7 +772,7 @@ function renderSwap(d) {
   const missing = Object.values(d.psi).filter(value => value && !recorded(value)).map(value => value.reason);
   if (d.pressure !== "none") missing.unshift(d.pressure);
   $("pressure-reason").textContent = [...new Set(missing)].join(" · ");
-  const g = { some: [d.psi.some, d.limits.some], full: [d.psi.full, d.limits.full], swap: [pctOf(d.swap_used, d.swap_total), d.limits.swap] };
+  const g = { some: [d.psi.some, d.limits.some], full: [d.psi.full, d.limits.full] };
   for (const [k, [v, lim]] of Object.entries(g)) {
     $(`gf-${k}`).style.width = `${!recorded(v) ? 0 : Math.min(100, v).toFixed(2)}%`;
     $(`gf-${k}`).className = `gf ${v >= lim ? "hold" : v >= lim * 0.6 ? "warn" : ""}`;
@@ -754,6 +780,9 @@ function renderSwap(d) {
     $(`gv-${k}`).textContent = !recorded(v) ? "not recorded" : formatPercent(v);
     $(`limit-${k}`).textContent = `Queue holds at ${formatPercent(lim)}`;
   }
+  const swap = pctOf(d.swap_used, d.swap_total);
+  $("gf-swap").style.width = `${Math.min(100, swap).toFixed(2)}%`;
+  $("gv-swap").textContent = formatPercent(swap);
   placeLimitLabels();
   $("swaprows").innerHTML = d.swap_by.map((row, index) =>
     `<div class="row ${row.kind}" data-tip="swap:${index}" data-bytes="${row.bytes}"><span class="name">${row.kind === "smaller" ? `<details data-owner-key="${esc(row.kind)}"><summary><span class="chev">▶</span>${esc(row.name)}</summary><div class="swap-members">${row.detail.split("; ").map(part => `<div>${esc(part)}</div>`).join("")}</div></details>` : esc(row.name)}</span><span class="v">${swapAmount(row.bytes)}</span><small>${row.kind === "smaller" ? "" : esc(visibleDetail(row))}</small></div>`).join("");
@@ -882,7 +911,7 @@ function placeBarLabels(container, limit) {
 }
 
 function placeLimitLabels() {
-  for (const key of ["some", "full", "swap"]) {
+  for (const key of ["some", "full"]) {
     const label = $(`limit-${key}`);
     const track = label.closest(".gt");
     const line = $(`gl-${key}`);
@@ -1186,9 +1215,11 @@ function fitLabels() {
   const at = latest && hasCap(latest) ? $("barwrap").getBoundingClientRect().width * latest.cap / latest.total : 0;
   $("mark").style.left = `${at}px`;
   $("marklabel").style.left = `${at}px`;
-  for (const k of ["used", "reserved", "room", "other", "past", "floor", "ci_ram"]) {
+  for (const k of ["used", "reserved", "room", "other", "past", "floor", "ci_ram", "agents_swap", "agents", "desktop"]) {
     const seg = $(`s-${k}`), lbl = $(`l-${k}`);
-    lbl.classList.toggle("hide", lbl.offsetWidth + 6 > seg.clientWidth);
+    lbl.classList.remove("tight");
+    if (lbl.offsetWidth + 6 > seg.clientWidth) lbl.classList.add("tight");
+    lbl.classList.toggle("hide", lbl.offsetWidth + 2 > seg.clientWidth);
   }
 }
 window.addEventListener("resize", fitLabels);

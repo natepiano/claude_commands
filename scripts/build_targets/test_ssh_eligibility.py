@@ -26,7 +26,7 @@ import unittest
 from unittest import mock
 
 from scripts.build_targets import build_targets as build_targets, targets
-from scripts.mac_test import claim_state, mac_test as mac_test, offload as offload
+from scripts.mac_test import eligibility, claim_state, mac_test as mac_test, offload as offload
 from scripts.build_hold import build_hold
 from scripts.aws_target import ledger
 from scripts.aws_target.ledger_test_support import REAL_POPEN, instant
@@ -64,8 +64,8 @@ class SshEligibilityTests(unittest.TestCase):
             "NOTIFIER_SESSIONS_DIR": str(self.root / "sessions"),
         })))
         _ = self.enterContext(mock.patch.object(Path, "home", return_value=self.root))
-        _ = self.enterContext(mock.patch.object(offload, "repository_identity",
-                                               return_value=offload.KnownRepository("hana", "github.com/team/hana")))
+        _ = self.enterContext(mock.patch.object(eligibility, "repository_identity",
+                                               return_value=eligibility.KnownRepository("hana", "github.com/team/hana")))
         _ = self.enterContext(mock.patch.object(mac_test, "target_claim_scope",
                                                return_value=mac_test.RepositoryScope("hana", "github.com/team/hana")))
         _ = self.enterContext(mock.patch.object(process_identity, "process_start", side_effect=process_reader(self.process_start)))
@@ -170,7 +170,7 @@ class SshEligibilityTests(unittest.TestCase):
                 record.update(remote_host="fake-mac", cleanup_pending=True)
             _ = claim.path.write_text(json.dumps(record))
             if refusal == "blocked":
-                offload.backoff_path("mac").unlink(missing_ok=True)
+                eligibility.backoff_path("mac").unlink(missing_ok=True)
                 mac_test.write_block(paths.block, block)
             else:
                 paths.block.unlink(missing_ok=True)

@@ -34,7 +34,7 @@ from typing import Literal, NoReturn, Protocol, TypedDict, cast
 from scripts.agents import worker_lifecycle  # noqa: E402
 from scripts.direct import plan_history, recorder_state  # noqa: E402
 from scripts.direct.recorder_state import OPEN_PHASES_KEY as OPEN_PHASES_KEY  # noqa: E402
-from scripts.lib import conf_reads, models_registry, unit_runs  # noqa: E402
+from scripts.lib import conf_reads, git_files, models_registry, unit_runs  # noqa: E402
 from scripts.lib.atomic_file import write_text_atomic  # noqa: E402
 from scripts.lib.intervals import merged_spans  # noqa: E402
 from scripts.lib.probe_session import PROBE_ENV  # noqa: E402
@@ -521,6 +521,11 @@ def _refresh_phase_table(session_dir: Path) -> None:
             return
     except (OSError, UnicodeError, SystemExit) as error:
         print(f"phase table not written: {error}", file=sys.stderr)
+        return
+    from scripts.direct import phase_table
+
+    # Without a vault the refresh writes nothing; skip its process start.
+    if not phase_table.vault_present():
         return
 
     command = [
@@ -1223,6 +1228,15 @@ def _park_current(state: dict[str, object], current: dict[str, object]) -> None:
     _parked_phases(state).append(current)
 
 
+def _report_unclosed_phase(state: dict[str, object], phase: dict[str, object]) -> None:
+    """Name a phase set aside with no open pass: its director never closed it."""
+    identity = resolve_production_unit(state)
+    unit = identity.unit if isinstance(identity, ProductionUnitIdentity) else f"unit not recorded ({identity.reason})"
+    started = datetime.fromtimestamp(_number(phase.get("started_at")), user_zone())
+    print(f"anomaly: start-phase: {unit}: phase {_string(phase.get('id'))} set aside unclosed, "
+          + f"started {started:%Y-%m-%d %H:%M %Z}", file=sys.stderr)
+
+
 def _unpark_newest(state: dict[str, object]) -> None:
     """Make the most recently started older open phase current again."""
     parked = _parked_phases(state)
@@ -1665,6 +1679,9 @@ def _start_phase(args: argparse.Namespace) -> None:
     active = _object_dict(state.get("phase"))
     if active is not None and _string(active.get("status")) == "active":
         _park_current(state, active)
+        if not any(_string((_object_dict(record.get("phase")) or {}).get("instance_id"))
+                   == _string(active.get("instance_id")) for record in _open_passes(state).values()):
+            _report_unclosed_phase(state, active)
     else:
         state["pass"] = {}
     phase: dict[str, object] = {
@@ -2051,8 +2068,12 @@ class DispatchRunNotRecorded(Enum):
     MISSING = "the worker has no dispatch state link"
 
 
+def _dispatch_state_links() -> Path:
+    return staff.record_path().parent / "dispatches"
+
+
 def _dispatch_state_link(worker_id: staff.StaffId) -> Path:
-    return staff.record_path().parent / "dispatches" / str(worker_id)
+    return _dispatch_state_links() / str(worker_id)
 
 
 def recorded_dispatch_run(worker_id: staff.StaffId) -> RecordedDispatchRun | DispatchRunNotRecorded:
@@ -2062,6 +2083,27 @@ def recorded_dispatch_run(worker_id: staff.StaffId) -> RecordedDispatchRun | Dis
     except FileNotFoundError:
         return DispatchRunNotRecorded.MISSING
     return RecordedDispatchRun(path.parent)
+
+
+def recorded_dispatch_runs() -> dict[staff.StaffId, RecordedDispatchRun]:
+    """Map each linked worker to its pass state run with one read of the link folder."""
+    try:
+        with os.scandir(_dispatch_state_links()) as entries:
+            links = {entry.name: (entry.path, os.readlink(entry.path)) for entry in entries if entry.is_symlink()}
+    except FileNotFoundError:
+        return {}
+    # Many workers link to one run; resolve each target once.
+    runs: dict[str, RecordedDispatchRun | DispatchRunNotRecorded] = {}
+    found: dict[staff.StaffId, RecordedDispatchRun] = {}
+    for name, (path, target) in links.items():
+        if target not in runs:
+            try:
+                runs[target] = RecordedDispatchRun(Path(path).resolve(strict=True).parent)
+            except FileNotFoundError:
+                runs[target] = DispatchRunNotRecorded.MISSING
+        if isinstance(run := runs[target], RecordedDispatchRun):
+            found[staff.StaffId(name)] = run
+    return found
 
 
 def _link_dispatch_state(worker_id: staff.StaffId, session_dir: Path) -> None:
@@ -2248,6 +2290,17 @@ def mark_pass_refused(session_dir: Path, worker_name: str) -> None:
                 passed["status"] = "refused"
                 _write_state(session_dir, state)
                 _append_event(state, _event(state, "pass_refused", plan_history.now_epoch(), passed))
+
+
+def cancel_worker_passes(session_dir: Path, worker_id: staff.StaffId) -> int:
+    """End each open pass of a stopped worker as canceled. Return the number of passes ended."""
+    if not _state_path(session_dir).is_file():
+        return 0
+    with (session_dir / ".progress_history.lock").open("a+", encoding="utf-8") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        state = _read_state(session_dir)
+        slots = [slot for slot, passed in _open_passes(state).items() if passed.get("worker_id") == worker_id]
+        return sum(_close_slot_pass(session_dir, state, slot, "canceled", plan_history.now_epoch()) for slot in slots)
 
 
 def _finish_pass(args: argparse.Namespace) -> None:
@@ -5701,27 +5754,11 @@ def _phase_repository(working_dir: str) -> RecordedPhaseMetadata | PhaseMetadata
     worktree = Path(working_dir).expanduser()
     if not worktree.is_dir():
         return PhaseMetadataNotRecorded("phase working directory is unavailable")
-    for directory in (worktree, *worktree.parents):
-        marker = directory / ".git"
-        if marker.is_dir():
-            return RecordedPhaseMetadata(directory.name)
-        if not marker.is_file():
-            continue
-        try:
-            location = marker.read_text(encoding="utf-8").strip()
-            if not location.startswith("gitdir:") or not location.removeprefix("gitdir:").strip():
-                break
-            git_directory = (directory / location.removeprefix("gitdir:").strip()).resolve()
-            common = (git_directory / "commondir").read_text(encoding="utf-8").strip()
-            if not common:
-                break
-            repository = (git_directory / common).resolve()
-            if not repository.is_dir():
-                break
-            return RecordedPhaseMetadata(repository.parent.name if repository.name == ".git" else repository.name)
-        except (OSError, ValueError):
-            break
-    return PhaseMetadataNotRecorded("repository common directory is unavailable")
+    try:
+        repository = git_files.locate(worktree).common_dir
+    except git_files.GitFilesError:
+        return PhaseMetadataNotRecorded("repository common directory is unavailable")
+    return RecordedPhaseMetadata(repository.parent.name if repository.name == ".git" else repository.name)
 
 
 def _phase_plan_names(state: Mapping[str, object]) -> tuple[

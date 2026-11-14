@@ -116,8 +116,9 @@ def room_text(room: admission_records.MemoryRoom | admission_records.ReadingUnav
         if missing:
             calculation += f": swap-backed use unavailable for {missing}"
         calculation += f"; free {gib(room.available)}"
+    swapped = f"; − {gib(room.agent_swap_demand)} swapped outside builds" if room.agent_swap_demand else ""
     text = (f"{calculation} "
-            f"− safety {gib(room.safety)}; kept aside {gib(room.kept)}; room {gib(room.room)}")
+            f"− safety {gib(room.safety)}; kept aside {gib(room.kept)}{swapped}; room {gib(room.room)}")
     if room.shortfall:
         text += f"; shortfall {gib(room.shortfall)}"
     return text
@@ -147,9 +148,8 @@ def pressure_text(pressure: admission_records.MemoryPressure | admission_records
               + f"some avg10 {pressure.some_avg10:.1f}%, swap used {pressure.swap_used_percent:.1f}%")
     if isinstance(pressure.condition, admission_records.PressureConditionNotRecorded):
         return values + "; condition not recorded by service"
-    if pressure.condition == "swap":
-        return (values + f"; starts when swap is at most {policy.pressure.swap_used_limit:g}% "
-                + f"or some avg10 is at most {policy.pressure.some_avg10_limit:.1f}%")
+    if pressure.condition == "some":
+        return values + f"; starts below some avg10 {policy.pressure.some_avg10_limit:.1f}%"
     return values + f"; starts below full avg10 {policy.pressure.full_avg10_limit:.1f}%"
 
 

@@ -26,7 +26,7 @@ from scripts.build_targets import build_targets
 from scripts.lib import process_start as process_identity
 
 from scripts.build_hold import build_hold
-from scripts.mac_test import claim_state, mac_test, offload
+from scripts.mac_test import eligibility, claim_state, mac_test, offload
 from scripts.build_targets import targets
 from scripts.buildlog.mac_idle_test_support import NotificationGuardedTestCase, write_idle_alert
 from scripts.message import roster
@@ -599,7 +599,7 @@ class StatusTests(IsolatedBuildTargetTest):
 
         def unavailable(
             _controller: offload.ProcessController,
-            config: offload.OffloadConfig,
+            config: eligibility.OffloadConfig,
         ) -> offload.HostReachability:
             calls.append(config.host)
             return offload.UnreachableHost(f"SSH probe failed for {config.host}")
@@ -610,7 +610,7 @@ class StatusTests(IsolatedBuildTargetTest):
         )
         with mock.patch.dict(os.environ, {"CONF_DIR": str(Path(config).parent)}):
             with mock.patch.object(
-                offload, "repository_identity",
+                eligibility, "repository_identity",
                 side_effect=AssertionError("Reachability needs no repository"),
             ):
                 with mock.patch.object(offload, "probe_reachability", side_effect=unavailable):
@@ -621,12 +621,12 @@ class StatusTests(IsolatedBuildTargetTest):
 
     def test_probe_uses_shared_settings_reader_without_building_config(self) -> None:
         target = targets.SshTarget("mac", "macos", self.settings)
-        config = offload.OffloadConfig(False, offload.SshConnectionSettings("reader-mac", 2.0, 10.0), 3.0, 4.0, 5.0, "6", {})
-        calls: list[offload.OffloadConfig] = []
+        config = eligibility.OffloadConfig(False, eligibility.SshConnectionSettings("reader-mac", 2.0, 10.0), 3.0, 4.0, 5.0, "6", {})
+        calls: list[eligibility.OffloadConfig] = []
 
         def reachable(
             _controller: offload.ProcessController,
-            received: offload.OffloadConfig,
+            received: eligibility.OffloadConfig,
         ) -> offload.HostReachability:
             calls.append(received)
             return offload.ReachableHost()
@@ -634,9 +634,9 @@ class StatusTests(IsolatedBuildTargetTest):
         self.write_block()
         block = self.mac_state / "block.json"
         before = block.read_bytes()
-        with mock.patch.object(offload, "read_config", return_value=config) as reader:
-            with mock.patch.object(offload, "OffloadConfig", side_effect=AssertionError("Use the shared config reader")):
-                with mock.patch.object(offload, "repository_identity", side_effect=AssertionError("No repository required")):
+        with mock.patch.object(eligibility, "read_config", return_value=config) as reader:
+            with mock.patch.object(eligibility, "OffloadConfig", side_effect=AssertionError("Use the shared config reader")):
+                with mock.patch.object(eligibility, "repository_identity", side_effect=AssertionError("No repository required")):
                     with mock.patch.object(offload, "probe_mac", side_effect=AssertionError("Use reachability only")):
                         with mock.patch.object(offload, "probe_reachability", side_effect=reachable):
                             self.assertEqual(
@@ -666,7 +666,7 @@ class EligibleCommandTests(IsolatedBuildTargetTest):
                         if not line.startswith("linux_only.hana=")) + "\n")
                 output = io.StringIO()
                 with mock.patch.dict(os.environ, {"CONF_DIR": str(Path(config).parent)}), \
-                     mock.patch.object(offload, "repository_identity", return_value=offload.KnownRepository("hana")), \
+                     mock.patch.object(eligibility, "repository_identity", return_value=eligibility.KnownRepository("hana")), \
                      mock.patch.object(sys, "argv", ["build_targets.py", "eligible", "--repo-root", str(self.root),
                                                     "--package", "hana", *local]), redirect_stdout(output):
                     self.assertEqual(build_targets.main(), 0)
@@ -688,7 +688,7 @@ class StepKindEligibilityTests(IsolatedBuildTargetTest):
             member.mkdir(parents=True)
             _ = (member / "Cargo.toml").write_text(f'[package]\nname="{name}"\nversion="0.1.0"\n')
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {"CONF_DIR": str(Path(config).parent)})))
-        _ = self.enterContext(mock.patch.object(offload, "repository_identity", return_value=offload.KnownRepository("hana")))
+        _ = self.enterContext(mock.patch.object(eligibility, "repository_identity", return_value=eligibility.KnownRepository("hana")))
 
     def kind_output(self, kind: str, package: str = "", free_gib: float = 60) -> str:
         output = io.StringIO()
@@ -1481,16 +1481,16 @@ class RecordedStepKindTests(unittest.TestCase):
 
     def test_step_policy_passes_the_snapshot_backoff_to_each_remote_kind(self) -> None:
         target = targets.SshTarget("mac", "macos", Path("/fixture/mac.conf"))
-        unreadable = offload.UnreadableBackoff("bad")
-        config = offload.OffloadConfig(True, offload.SshConnectionSettings("dummy", 1, 1), 1, 1, 1, "1", {})
-        with mock.patch.object(offload, "read_config", return_value=config), \
-             mock.patch.object(offload, "mac_step_eligibility", return_value=offload.KnownRepository("hana")) as eligibility:
+        unreadable = eligibility.UnreadableBackoff("bad")
+        config = eligibility.OffloadConfig(True, eligibility.SshConnectionSettings("dummy", 1, 1), 1, 1, 1, "1", {})
+        with mock.patch.object(eligibility, "read_config", return_value=config), \
+             mock.patch.object(eligibility, "mac_step_eligibility", return_value=eligibility.KnownRepository("hana")) as checks:
             result = build_targets.step_policy(target, Path("/fixture/hana"), "hana", "final", backoff=unreadable)
-        self.assertEqual(result, offload.KnownRepository("hana"))
-        self.assertEqual([call.kwargs["kind"] for call in eligibility.call_args_list], ["check", "test"])
-        self.assertTrue(all(call.kwargs["backoff"] is unreadable for call in eligibility.call_args_list))
-        with mock.patch.object(offload, "read_config", return_value=config), \
-             mock.patch.object(offload, "mac_step_eligibility", return_value=offload.IneligibleMacStep("state")):
+        self.assertEqual(result, eligibility.KnownRepository("hana"))
+        self.assertEqual([call.kwargs["kind"] for call in checks.call_args_list], ["check", "test"])
+        self.assertTrue(all(call.kwargs["backoff"] is unreadable for call in checks.call_args_list))
+        with mock.patch.object(eligibility, "read_config", return_value=config), \
+             mock.patch.object(eligibility, "mac_step_eligibility", return_value=eligibility.IneligibleMacStep("state")):
             self.assertEqual(build_targets.step_policy(target, Path("/fixture/hana"), "hana", "check", backoff=unreadable),
                              targets.ExcludedTarget(target, "state"))
 

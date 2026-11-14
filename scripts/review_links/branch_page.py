@@ -312,7 +312,8 @@ def list_branches(repository: Path, record: staff.StaffSnapshot,
     protected = {"main"}
     active_branches: dict[str, ActiveUnitBranch] = {}
     for row in record.rows:
-        if isinstance(row.worktree, staff.PresentWorktree):
+        # A producer's worktree is its launch folder; it holds no branch of this repository.
+        if row.kind != "producer" and isinstance(row.worktree, staff.PresentWorktree):
             tree = row.worktree
             if tree.machine == "natedev" and tree.path in scope.registered:
                 active_branch = scope.registered[tree.path]

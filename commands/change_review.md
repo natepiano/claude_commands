@@ -8,6 +8,9 @@ description: Add a change for the user to check to the top-level showrunner's ch
 
 For `/change_review` with no action:
 
+The command prints the Hana console link with Changes selected.
+The console navigation switches between Changes and Builds.
+
 1. Run the page script:
 
    ```sh
@@ -85,7 +88,8 @@ type; `--see` is what the person then sees. Example: `--change "The Units table
 shows each unit's phase" --check "In a showrunner session on natedev, type
 /showrunner:units" --see "Each row has a Phase column"`. The row's How to
 check cell is `<how to try it> You see: <what you see>`. Pass `--merged` when a
-commit holds the change. It prints the new row's id, such as `C12`.
+commit holds the change. The Merged cell holds the date and time of the add, in the
+user's zone, then the commit: `2026-11-13 16:20 · 31770c75`. It prints the new row's id, such as `C12`.
 
 ## list-ready and live
 
@@ -125,7 +129,10 @@ what the person sees:
 … edit [--production <name>] --row <id> --change "<what changed for you>" --check "<how to try it>" --see "<what you see>"
 ```
 
-Pass the ID as `/next` shows it, such as `C434` or `sdlc/C9`.
+Pass the displayed ID, such as `sdlc/C9`.
+The prefix names the responsible showrunner, even when another showrunner's list stores the row.
+Commands also accept the list-based ID and a bare row number with the selected list.
+Pass `--list <path>` when the displayed ID matches several lists.
 The row keeps its id, its Merged cell and its place. It prints the new row.
 
 ## show
@@ -185,10 +192,9 @@ It combines these needs with cached system comparisons without duplicate machine
 
 The Changes tab contains every waiting change.
 Each card starts with its 20px title; section labels use 17px text.
-One closed Details disclosure holds the ID, date, commit, and kind, with 16px space after the title.
-How to check or Proof stays in the main view.
-Works and Does not work are the main actions.
-Ask showrunner to check, Ask a question, and Send feedback are secondary actions.
+How to check or Proof follows the title.
+Works, Does not work, Ask showrunner to check, Ask a question, Send feedback, and Skip for now share one wrapping row.
+Aligned lines under the buttons always show `change`, `date`, `time`, `commit`, and `kind`; an unknown value has no line.
 The Does not work button submits `not works` and saves `not works: <text>` when the user supplies text.
 An open Production cell holds the unit's fixed staff id or the showrunner's fixed staff id.
 The reader follows a unit's current staff parent and displays current names.
@@ -249,7 +255,7 @@ The diagnostic command `show [--production <name>]` still prints the current row
 The list keeps the order of `/next` (`commands/next.md`): the row `show`
 printed stays first until its verdict. When the user calls a row important,
 run `mark-important [--production <name>] --row <id>`, with the ID as `/next` shows it,
-such as `C434` or `sdlc/C9`.
+such as `sdlc/C434` or `sdlc/C9`.
 
 ## A folder for the user to try
 
@@ -282,9 +288,9 @@ Then:
 … verdict [--production <name>] --row <id> --verdict "<the user's words>"
 ```
 
-Pass the ID as `/next` shows it, such as `C434` or `sdlc/C9`.
+Pass the displayed ID, such as `sdlc/C9`, or its existing list-based ID.
 It moves the row to `## Reviewed` with the verdict, today's date and its Merged cell, and prints
-`C<n> landed` or `C<n> returns to its unit (merged …)`. Either way it removes
+`<showrunner>/C<n> landed` or `<showrunner>/C<n> returns to its unit (merged …)`. Either way it removes
 the row's scratch folders and prints `removed <path>` for each.
 The Producer cell stays with the row in Reviewed.
 Send a returning row and the user's words to its Producer staff id.
@@ -316,7 +322,7 @@ Use the `verdict` command above for both. The row stays out of the user's count 
 3. Save the answer with this command:
 
 ```sh
-"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/review_links/change_page.py" answer-question --production <showrunner name> --list <list> --row C<n> --question <id> --text "<answer>"
+"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/review_links/change_page.py" answer-question --production <showrunner name> --list <list> --row <showrunner>/C<n> --question <id> --text "<answer>"
 ```
 
 The row returns to the user's count with the question and answer below the change.
@@ -332,7 +338,7 @@ The command refuses an old or unknown ID, a different answer, or a row without a
 3. Record what you did with the feedback id:
 
 ```sh
-"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/review_links/change_page.py" answer-question --production <showrunner name> --list <list> --row C<n> --question <id> --text "<what you did>"
+"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/review_links/change_page.py" answer-question --production <showrunner name> --list <list> --row <showrunner>/C<n> --question <id> --text "<what you did>"
 ```
 
 The note returns the row to the user's waiting count.

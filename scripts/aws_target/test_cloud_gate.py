@@ -608,6 +608,28 @@ class CloudGateTests(CostFixture):
         self.assertEqual(self.execute()['status'], 'complete')
         self.assertEqual(self.fake.launches[-1]['InstanceType'], 'm7a.4xlarge')
 
+    def test_type_outside_the_deployed_stack_is_skipped(self) -> None:
+        self.deployment['instance_types'] = ['m7a.4xlarge']
+        self.assertEqual(self.execute()['status'], 'complete')
+        self.assertEqual({launch['InstanceType'] for launch in self.fake.launches}, {'m7a.4xlarge'})
+
+    def test_unauthorized_type_is_skipped_for_the_next_type(self) -> None:
+        self.fake.refusals = ['An error occurred (UnauthorizedOperation) when calling the RunInstances operation: fixture']
+        self.assertEqual(self.execute()['status'], 'complete')
+        self.assertEqual([launch['InstanceType'] for launch in self.fake.launches], ['m7a.8xlarge', 'm7a.4xlarge'])
+        self.assertEqual(cloud_gate.read(self.folder / 'launch.json')['unauthorized_types'], ['m7a.8xlarge'])
+
+    def test_unauthorized_last_type_falls_back(self) -> None:
+        self.fake.refusals = ['An error occurred (UnauthorizedOperation) when calling the RunInstances operation: fixture'] * 2
+        self.assertEqual(self.execute()['status'], 'fallback')
+        self.assertEqual([launch['InstanceType'] for launch in self.fake.launches], ['m7a.8xlarge', 'm7a.4xlarge'])
+
+    def test_stack_without_a_configured_type_falls_back_before_launch(self) -> None:
+        self.deployment['instance_types'] = ['c7a.4xlarge']
+        self.assertEqual(self.execute()['status'], 'fallback')
+        self.assertEqual(self.fake.launches, [])
+        self.assertIsInstance(self.book.read_snapshot().gate_reservations[0].state, ledger.GateAbsent)
+
     def test_expired_pending_sweep_searches_both_regions(self) -> None:
         path = self.root / 'cloud_gate.conf'
         _ = path.write_text(re.sub(r'(?m)^(regions|spot_candidate_regions)=.*$',
@@ -1190,6 +1212,8 @@ with (mock.patch.object(cloud_gate, 'AwsCli', return_value=api),
                 self.assertIsInstance(self.book.read_snapshot().gate_reservations[0].state, ledger.GateLaunchPending)
 
     def test_unauthorized_launch_records_absence_at_once(self) -> None:
+        # With no other type left, the refusal ends the launch.
+        text_setting(self.root / 'cloud_gate.conf', 'instance_types', 'm7a.4xlarge')
         self.fake.refusals = ['An error occurred (UnauthorizedOperation) when calling the RunInstances operation: fixture']
         self.assertEqual(self.execute()['status'], 'fallback')
         self.assertEqual(len(self.fake.launches), 1)

@@ -30,7 +30,7 @@ from scripts.build_targets.target_config import (
 
 
 if TYPE_CHECKING:
-    from scripts.mac_test import mac_test, offload
+    from scripts.mac_test import eligibility, mac_test
 
 
 @dataclass(frozen=True)
@@ -147,7 +147,7 @@ class TargetSnapshot:
     target: Target
     states: tuple[TargetState, ...]
     claims: tuple[mac_test.HeldClaim, ...]
-    backoff: offload.BackoffState
+    backoff: eligibility.BackoffState
 
 
 def target_eligibility(
@@ -164,26 +164,22 @@ def mac_policy_eligibility(
     repo_root: Path, package: str, routing: Routing, configured: tuple[Target, ...]
 ) -> tuple[EligibleTarget | ExcludedTarget, ...]:
     """Read repository policy when a configured target uses macOS."""
-    from scripts.mac_test import offload
+    from scripts.mac_test import eligibility
 
     results: list[EligibleTarget | ExcludedTarget] = []
-    repository = offload.repository_identity(repo_root)
+    repository = eligibility.repository_identity(repo_root)
     for target in configured:
         if target.platform == "linux":
             results.append(EligibleTarget(target))
         elif isinstance(routing, LocalRequired):
             results.append(ExcludedTarget(target, routing.reason))
-        elif isinstance(repository, offload.UnknownRepository):
+        elif isinstance(repository, eligibility.UnknownRepository):
             results.append(ExcludedTarget(target, "repo"))
         else:
-            config = offload.read_config(target.settings) if isinstance(target, SshTarget) else offload.read_config()
-            key = f"linux_only.{repository.name}"
-            if key not in config.values:
-                results.append(ExcludedTarget(target, "repo"))
-            elif package in offload.comma_values(config.values[key]):
-                results.append(ExcludedTarget(target, "linux_only"))
-            else:
-                results.append(EligibleTarget(target))
+            config = eligibility.read_config(target.settings) if isinstance(target, SshTarget) else eligibility.read_config()
+            policy = eligibility.linux_only_policy(config, repository, repo_root, package)
+            results.append(ExcludedTarget(target, policy.reason) if isinstance(policy, eligibility.IneligibleMacStep)
+                           else EligibleTarget(target))
     return tuple(results)
 
 
@@ -234,10 +230,10 @@ def ssh_target_state(target: SshTarget) -> TargetState:
 def ssh_target_snapshot(target: SshTarget) -> TargetSnapshot:
     """Read remote claim, block and backoff records once, without probing the target."""
     from scripts.build_hold import build_hold
-    from scripts.mac_test import mac_test, offload
+    from scripts.mac_test import eligibility, mac_test
 
     claims: tuple[mac_test.HeldClaim, ...] = ()
-    backoff: offload.BackoffState = offload.NO_BACKOFF
+    backoff: eligibility.BackoffState = eligibility.NO_BACKOFF
 
     def snapshot(state: TargetState) -> TargetSnapshot:
         return TargetSnapshot(target, (state,), claims, backoff)
@@ -246,20 +242,20 @@ def ssh_target_snapshot(target: SshTarget) -> TargetSnapshot:
         paths = mac_test.state_paths(target.name)
         claims = tuple(mac_test.read_claims(paths))
         block = mac_test.read_claim_block(paths)
-        backoff = offload.read_backoff(utc_now().timestamp(), target.name, strict=True)
+        backoff = eligibility.read_backoff(utc_now().timestamp(), target.name, strict=True)
         if not isinstance(block, mac_test.NoMacBlock):
             block_end = ExpiresAt(block.expires) if block.expires > utc_now() else AwaitingBlockRemoval(block.expires)
             session = (HolderSession(block.delivery.name)
                        if isinstance(block.delivery, mac_test.RecordedSession) else NO_HOLDER_SESSION)
             return snapshot(Held(mac_test.holder_name(block.holder), block.reason, block.since, block_end, session))
-        if isinstance(offload.read_failed_probe(target.name), offload.FailedProbe):
+        if isinstance(eligibility.read_failed_probe(target.name), eligibility.FailedProbe):
             return snapshot(Unreachable("failed probe"))
         jobs = tuple(running_job(claim) for claim in claims if mac_test.run_is_live(claim.record))
         if jobs:
             return snapshot(Running(jobs))
-        if isinstance(backoff, offload.UnreadableBackoff):
+        if isinstance(backoff, eligibility.UnreadableBackoff):
             return snapshot(StateUnreadable("retry backoff: " + backoff.reason))
-        if isinstance(backoff, offload.ActiveBackoff):
+        if isinstance(backoff, eligibility.ActiveBackoff):
             return snapshot(Unreachable("retry backoff"))
         return snapshot(Free())
     except build_hold.ReleaseRecordReadError as error:
@@ -270,9 +266,9 @@ def ssh_target_snapshot(target: SshTarget) -> TargetSnapshot:
 
 def target_snapshots() -> tuple[TargetSnapshot, ...]:
     """Read coordination evidence once for one page reading."""
-    from scripts.mac_test import offload
+    from scripts.mac_test import eligibility
 
-    return tuple(TargetSnapshot(target, local_hold_states(), (), offload.NO_BACKOFF)
+    return tuple(TargetSnapshot(target, local_hold_states(), (), eligibility.NO_BACKOFF)
                  if isinstance(target, LocalTarget) else ssh_target_snapshot(target)
                  for target in read_targets())
 

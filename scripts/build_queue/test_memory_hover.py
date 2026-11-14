@@ -232,10 +232,24 @@ class MemoryHoverTests(unittest.TestCase):
 
     def test_pressure_percent_uses_one_decimal_and_rounds_down(self) -> None:
         hover = self.page_expression("[tipText('g-some', data), tipText('g-full', data), tipText('g-swap', data)]", {
-            "psi": {"some": 1.29, "full": 0.09}, "limits": {"some": 25, "full": 5, "swap": 85},
+            "psi": {"some": 1.29, "full": 0.09}, "limits": {"some": 25, "full": 5},
             "swap_used": 1, "swap_total": 3})
-        for expected in ("1.2%", "0.0%", "33.3%", "25.0%", "5.0%", "85.0%"):
+        for expected in ("1.2%", "0.0%", "33.3%", "25.0%", "5.0%"):
             self.assertIn(expected, str(hover))
+        self.assertIn("Swap use alone does not hold the queue.", str(hover))
+
+    def test_pressure_level_uses_stalls_without_a_swap_limit(self) -> None:
+        for some, full, used, pressure, expected in (
+            (0, 0, 8, "none", "ok"),
+            (15, 0, 0, "none", "warn"),
+            (0, 3, 0, "none", "warn"),
+            (26, 0, 0, "memory pressure: some avg10 26.0", "hold"),
+        ):
+            with self.subTest(some=some, full=full, swap_used=used):
+                result = self.page_expression("level(data)", {
+                    "psi": {"some": some, "full": full}, "limits": {"some": 25, "full": 5},
+                    "pressure": pressure, "swap_used": used, "swap_total": 8})
+                self.assertEqual(result, expected)
 
     def test_step_table_uses_the_first_column_for_stage_and_waiting_place(self) -> None:
         for waiting in (False, True):
@@ -445,7 +459,7 @@ function fitLabels() {}
     def test_missing_pressure_keeps_the_other_limit_readings(self) -> None:
         result = self.page_expression("[level(data), tipText('g-full', data), tipText('cap', data)]", {
             "psi":{"some":{"kind":"PressureNotRecorded", "reason":"private PSI is missing"}, "full":1},
-            "limits":{"some":25,"full":5,"swap":85}, "pressure":"none", "cap":20,
+            "limits":{"some":25,"full":5}, "pressure":"none", "cap":20,
             "swap_used":0,"swap_total":8,"cap_text":"fixture room"})
         self.assertIn("neutral", str(result))
         self.assertIn("1.0", str(result))

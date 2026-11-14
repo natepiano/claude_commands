@@ -118,6 +118,11 @@ The command shares that group through the systemd scope prefix.
 The supervisor installs no signal handler.
 The orphan reaper finishes a dead supervisor's record and delivers its result during start, restore, or explicit recovery.
 Results return to the worker or its current holder. Callers do not poll.
+Finished runs are deleted with their logs and lock files when no reader needs them.
+A worker's pass end deletes the folder's finished runs, and so does each start.
+A run stays while its worker's pass is open and the run started in that pass.
+A run of another owner stays until that owner starts a newer run.
+A run whose owner has no staff row goes at once.
 
 ### Channels and user decisions
 
@@ -125,7 +130,7 @@ Results return to the worker or its current holder. Callers do not poll.
 | --- | --- |
 | Session discovery | `scripts/message/roster.py` reads local and peer evidence. |
 | One recipient | `scripts/message/send.py` resolves staff identity before selecting transport. |
-| Groups | `scripts/production/broadcast.py` selects roles or a unit's workers. |
+| Groups | `scripts/production/broadcast.py` selects roles, a production's unit directors, or a unit's workers. |
 | Assignment status | `scripts/direct/board.sh` records worker status for the director. |
 | Native completion | `scripts/herdr/turn_end.py` saves the reply and sends its result notice. |
 | User question | `scripts/production/update_registration.py` records the question and its asker. |
@@ -143,8 +148,11 @@ The [messaging contract](session-roster.md) defines peer lookup and delivery out
 `change_review.change_queue(path, scope, below=False) -> ChangeQueue` supplies both `/next change` and `change_review.py show`.
 `ChangeQueue` carries the pin name and ordered entries.
 Scoped lookup includes earlier production lists and routes their rows through current staff ownership.
-Current-list rows retain plain ids. Other lists qualify their ids, such as `sdlc/C9`.
-Their prerequisites receive the same qualification.
+Displayed IDs use the responsible showrunner, such as `sdlc/C9`, through the page's shared staff resolver.
+The queue retains plain keys for current-list rows and list-qualified keys for other rows.
+Prerequisites retain that list qualification.
+Row commands accept both displayed IDs and existing list-based IDs.
+An ambiguous displayed ID requires `--list <path>`.
 Saved pins therefore survive attachment changes without copying or renumbering rows.
 
 `record_verdict` returns `VerdictRecorded`, `VerdictAlreadyRecorded`, or `VerdictConflict`.

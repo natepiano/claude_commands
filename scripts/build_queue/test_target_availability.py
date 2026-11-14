@@ -9,7 +9,7 @@ from scripts.build_queue import target_availability
 from scripts.build_queue.admission_records import PackageNotRecorded
 from scripts.build_targets import build_targets, targets
 from scripts.build_targets.target_config import ConfigError, ExcludedTarget, LocalTarget, SshTarget
-from scripts.mac_test import offload
+from scripts.mac_test import eligibility
 from scripts.message import unit_labels
 
 MAC = SshTarget("mac", "macos", Path("/fixture/mac.conf"))
@@ -29,7 +29,7 @@ def held(holder: str, session: str, *, since: datetime | targets.StartNotRecorde
 
 
 def snapshot(target: SshTarget | LocalTarget, *states: targets.TargetState,
-             backoff: offload.BackoffState = offload.NO_BACKOFF) -> targets.TargetSnapshot:
+             backoff: eligibility.BackoffState = eligibility.NO_BACKOFF) -> targets.TargetSnapshot:
     return targets.TargetSnapshot(target, states, (), backoff)
 
 
@@ -98,7 +98,7 @@ class MacRouteTests(unittest.TestCase):
         )
         for state, expected in cases:
             with self.subTest(expected=expected), \
-                 mock.patch.object(build_targets, "step_policy", return_value=offload.KnownRepository("hana", "/r")):
+                 mock.patch.object(build_targets, "step_policy", return_value=eligibility.KnownRepository("hana", "/r")):
                 routes = self.routes(state)
                 self.assertEqual(routes.line("nextest", "/fixture/hana", "hana"), expected)
                 self.assertEqual(routes.blocked(), isinstance(state, targets.Held))

@@ -14,6 +14,7 @@ import fcntl
 import json
 import os
 import errno
+import re
 import secrets
 import shutil
 import signal
@@ -25,7 +26,6 @@ import time
 from typing import TYPE_CHECKING, Literal, cast, override
 
 from scripts.lib.boot_identity import boot_identity
-from scripts.lib.cancellation import CANCELLATION_SIGNALS
 
 if TYPE_CHECKING:
     from scripts.lib.conf import ConfigRead
@@ -224,6 +224,8 @@ def _folder_parent(path: Path, root: Path, *, create: bool) -> Generator[int]:
 
 
 _locks: dict[int, Path] = {}
+# A folder's lock file, lease record, or unfinished lease record.
+_METADATA = re.compile(r"(.+)\.(?:lock|lease\.json(?:\.[0-9a-f]{16}\.tmp)?)")
 
 def _open_lock(path: Path, directory: int, *, create: bool) -> int:
     flags = os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK
@@ -469,11 +471,65 @@ def _folder_exists(path: Path, directory: int) -> bool:
 
 
 def _unlink_metadata(path: Path, directory: int) -> None:
+    temporary = re.compile(re.escape(path.name) + r"\.lease\.json\.[0-9a-f]{16}\.tmp")
+    for name in os.listdir(directory):
+        if temporary.fullmatch(name):
+            try:
+                os.unlink(name, dir_fd=directory)
+            except FileNotFoundError:
+                pass
     for suffix in (".lease.json", ".lock"):
         try:
             os.unlink(path.name + suffix, dir_fd=directory)
         except FileNotFoundError:
             pass
+
+
+def _hold_free_lease(path: Path, directory: int, stack: ExitStack) -> bool:
+    """Hold path's lease lock when it is free. A missing lock file means no lease."""
+    try:
+        descriptor = _open_lock(path, directory, create=False)
+    except FileNotFoundError:
+        return True
+    _ = stack.callback(os.close, descriptor)
+    return _take_lock(descriptor, fcntl.LOCK_EX) and _lock_current(path, directory, descriptor)
+
+
+def _hold_child_leases(path: Path, stack: ExitStack) -> bool:
+    """Hold every lease lock below path without following links. False when an owner holds one."""
+    def unreadable(error: OSError) -> None:
+        if not isinstance(error, FileNotFoundError):
+            raise error
+
+    for top, folders, files, directory in os.fwalk(path, follow_symlinks=False, onerror=unreadable):
+        for name in files:
+            stem = name.removesuffix(".lock")
+            if stem != name and (stem in folders or stem + ".lease.json" in files):
+                if not _hold_free_lease(Path(top) / stem, directory, stack):
+                    return False
+    return True
+
+
+@contextmanager
+def collector_lease(path: Path, *, children: bool = False) -> Generator[bool]:
+    """Hold a managed folder's lease lock while a collector judges and removes it.
+
+    Yield False when an owner holds the lease. A folder without a lock file has no lease.
+    A lock file or lease record is judged by its folder's lease. With children, also hold every lease below the folder; a held one, or an unreadable
+    folder, is busy.
+    """
+    metadata = _METADATA.fullmatch(path.name)
+    folder = path.with_name(metadata[1]) if metadata else path
+    with ExitStack() as stack:
+        try:
+            directory = stack.enter_context(_folder_parent(folder, folder.parent, create=False))
+            free = (_hold_free_lease(folder, directory, stack)
+                    and (metadata is not None or not children or _hold_child_leases(folder, stack)))
+        except FileNotFoundError:
+            free = True
+        except (OSError, ValueError):
+            free = False
+        yield free
 
 
 def remove_build_folder(path: Path, cleanup: Callable[[], object], *, temporary: bool = True,
@@ -508,6 +564,30 @@ def _finish_temporary(path: Path, directory: int, allocated: os.stat_result, *,
                             temporary=temporary, dir_fd=directory)
 
 
+def sweep_temporary_build_folders(parent: Path) -> None:
+    """Remove free allocations in a parent reserved for temporary maker folders."""
+    try:
+        with _folder_parent(parent / "entry", parent, create=False) as directory:
+            names: set[str] = set()
+            for entry in os.listdir(directory):
+                match = _METADATA.fullmatch(entry)
+                if match is not None:
+                    names.add(match[1])
+            for name in sorted(names):
+                path = parent / name
+
+                def cleanup() -> None:
+                    try:
+                        allocated = os.stat(path.name, dir_fd=directory, follow_symlinks=False)
+                    except FileNotFoundError:
+                        return
+                    _remove_folder(path, directory, allocated)
+
+                _ = remove_build_folder(path, cleanup, dir_fd=directory)
+    except FileNotFoundError:
+        pass
+
+
 @contextmanager
 def temporary_build_folder(request: UniqueBuildFolder | BuildFolderSpec) -> Generator[Path]:
     """Remove private work after the caller ends, including interrupted callers."""
@@ -524,7 +604,6 @@ def run_build(owner: str, name: str, command: Sequence[str], *, showrunner: str 
     import json
     import subprocess
     from scripts.lib.descendants import adopt_descendants
-    from scripts.lib.process_group import send_process_group
 
     if not command:
         raise ValueError("run needs a command after --")
@@ -537,67 +616,36 @@ def run_build(owner: str, name: str, command: Sequence[str], *, showrunner: str 
                            owner=owner, purpose=name, suffix_length=settings.whole("names.suffix_length"),
                            showrunner=showrunner, unit=unit, work=work)
 
-    class CommandSignal(BaseException):
-        def __init__(self, number: int) -> None:
-            super().__init__(number)
-            self.number: int = number
-
-    def interrupted(number: int, frame: object) -> None:
-        del frame
-        raise CommandSignal(number)
-
-    watched = CANCELLATION_SIGNALS
-    previous = {number: signal.signal(number, interrupted) for number in watched}
-    try:
-        with temporary_build_folder(spec) as path:
-            pid = os.getpid()
-            start_time = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[19]
-            marker = {"owner": owner, "pid": pid, "start_time": start_time,
-                      "boot_id": boot_identity()}
-            _ = (path / OWNER_MARKER).write_text(json.dumps(marker) + "\n")
-            blocked = signal.pthread_sigmask(signal.SIG_BLOCK, watched)
-
-            def child_signals() -> None:
-                _ = signal.pthread_sigmask(signal.SIG_SETMASK, blocked)
-
+    with temporary_build_folder(spec) as path:
+        pid = os.getpid()
+        start_time = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[19]
+        marker = {"owner": owner, "pid": pid, "start_time": start_time,
+                  "boot_id": boot_identity()}
+        _ = (path / OWNER_MARKER).write_text(json.dumps(marker) + "\n")
+        descriptor = build_folder_lock_fd(path)
+        child = subprocess.Popen(command, cwd=path,
+                                 env={**os.environ, "BUILD_FOLDER": str(path), "BUILD_FOLDER_LOCK_FD": str(descriptor)},
+                                 pass_fds=(descriptor,), process_group=os.getpgrp())
+        try:
+            status = child.wait()
+        finally:
             try:
-                descriptor = build_folder_lock_fd(path)
-                child = subprocess.Popen(command, cwd=path,
-                                         env={**os.environ, "BUILD_FOLDER": str(path), "BUILD_FOLDER_LOCK_FD": str(descriptor)},
-                                         pass_fds=(descriptor,), start_new_session=True, preexec_fn=child_signals)
-            except BaseException:
-                _ = signal.pthread_sigmask(signal.SIG_SETMASK, blocked)
-                raise
-            try:
-                _ = signal.pthread_sigmask(signal.SIG_SETMASK, blocked)
-                status = child.wait()
-            except CommandSignal as error:
-                status = -error.number
-            finally:
-                for number in watched:
-                    _ = signal.signal(number, signal.SIG_IGN)
-                try:
-                    send_process_group(child.pid, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
-                _ = child.wait()
-                while True:
-                    children = Path(f"/proc/{pid}/task/{pid}/children").read_text().split()
-                    for descendant in children:
-                        try:
-                            os.kill(int(descendant), signal.SIGKILL)
-                        except ProcessLookupError:
-                            pass
+                child.kill()
+            except ProcessLookupError:
+                pass
+            _ = child.wait()
+            while True:
+                children = Path(f"/proc/{pid}/task/{pid}/children").read_text().split()
+                for descendant in children:
                     try:
-                        _ = os.waitpid(-1, 0)
-                    except ChildProcessError:
-                        break
-            return status if status >= 0 else 128 - status
-    except CommandSignal as error:
-        return 128 + error.number
-    finally:
-        for number, handler in previous.items():
-            _ = signal.signal(number, handler)
+                        os.kill(int(descendant), signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                try:
+                    _ = os.waitpid(-1, 0)
+                except ChildProcessError:
+                    break
+        return status if status >= 0 else 128 - status
 
 
 def main(argv: Sequence[str]) -> int:

@@ -39,6 +39,16 @@ def transcript_paths(root: Path, pattern: str = "**/*.jsonl") -> list[Path]:
     return sorted(found.values(), key=str)
 
 
+def transcript_stems(root: Path) -> list[str]:
+    """Name each plain or compressed transcript under root once, without a path for each file."""
+    stems: dict[str, None] = {}
+    for _, _, names in os.walk(root):
+        for name in names:
+            if (logical := name.removesuffix(".zst")).endswith(".jsonl"):
+                stems[logical.removesuffix(".jsonl")] = None
+    return list(stems)
+
+
 def distinct_files(paths: Iterable[Path]) -> list[Path]:
     """Merge aliases in a small list of transcript matches."""
     return sorted({path.resolve() for path in paths})

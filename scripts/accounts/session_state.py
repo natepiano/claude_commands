@@ -10,7 +10,7 @@ from typing import Literal, cast
 from scripts.lib.unit_runs import LauncherRunDirectories
 from scripts.production import staff
 
-SessionState = Literal["busy", "starting", "waiting", "idle", "paused", "exited"]
+SessionState = Literal["busy", "idle", "paused", "exited"]
 StaffState = Literal["active", "paused", "exited"]
 
 
@@ -51,39 +51,45 @@ NO_DETACHED_WORK = RunningDetachedWork()
 
 
 def running_detached_work(record: staff.StaffSnapshot, *, additional_runs: Sequence[Path] = ()) -> RunningDetachedWork:
-    """Read each run folder once for the complete display."""
+    """Read each run folder once and only the records that live supervisors name."""
     from scripts.agents.worker_lifecycle import DETACHED_RUNS_DIR
 
-    live_runs = cast(Callable[[Path, frozenset[staff.StaffId]], Sequence[Mapping[str, object]]],
-                     import_module("scripts.agents.detached_runs").live_runs_for_staff)
+    live_runs = cast(Callable[[Mapping[Path, frozenset[staff.StaffId]]], Sequence[Mapping[str, object]]],
+                     import_module("scripts.agents.detached_runs").live_runs_in_folders)
     worker_directories = cast(Callable[[staff.StaffSnapshot], LauncherRunDirectories],
                               import_module("scripts.herdr.worker_panes").worker_run_directories)
+
+    # Workers of one parent share folders; resolve each folder once.
+    resolved: dict[Path, Path] = {}
+
+    def owned(folder: Path) -> set[staff.StaffId]:
+        real = resolved.get(folder)
+        if real is None:
+            real = resolved[folder] = folder.resolve()
+        return owners.setdefault(real, set())
 
     owners: dict[Path, set[staff.StaffId]] = {}
     for row in record.rows:
         if isinstance(row.run, staff.OpenRun):
-            owners.setdefault(row.run.path.resolve(), set()).add(row.id)
+            owned(row.run.path).add(row.id)
     directories = worker_directories(record)
     for identity, folders in directories.by_worker.items():
         for folder in folders:
-            owners.setdefault(folder.resolve(), set()).add(identity)
+            owned(folder).add(identity)
     identities = {row.id for row in record.find(kind="worker")}
     for folder in additional_runs:
-        owners.setdefault(folder.resolve(), set()).update(identities)
+        owned(folder).update(identities)
     busy: set[staff.StaffId] = set()
     labels: dict[staff.StaffId, list[str]] = {}
-    inputs: set[Path] = set()
-    for folder, identities in owners.items():
-        directory = folder / DETACHED_RUNS_DIR
-        inputs.add(directory)
-        inputs.update(directory.glob("*.json"))
-        for run in live_runs(directory, frozenset(identities)):
-            row = record.by_id(staff.StaffId(str(run.get("staff_id", ""))))
-            if row is not None:
-                busy.add(row.id)
-                label = run.get("label")
-                if isinstance(label, str):
-                    labels.setdefault(row.id, []).append(label)
+    # A start or a finish adds or renames a record, so each folder's change shows on the folder.
+    inputs = {folder / DETACHED_RUNS_DIR for folder in owners}
+    for run in live_runs({folder: frozenset(identities) for folder, identities in owners.items()}):
+        row = record.by_id(staff.StaffId(str(run.get("staff_id", ""))))
+        if row is not None:
+            busy.add(row.id)
+            label = run.get("label")
+            if isinstance(label, str):
+                labels.setdefault(row.id, []).append(label)
     return RunningDetachedWork(frozenset(busy), tuple(sorted(inputs)),
                                {identity: tuple(items) for identity, items in labels.items()}, directories)
 
@@ -91,17 +97,14 @@ def running_detached_work(record: staff.StaffSnapshot, *, additional_runs: Seque
 def classify(member: staff.StaffRow | UnrecordedStaff,
              activity: LiveActivity | NoLiveSession, *,
              detached: RunningDetachedWork = NO_DETACHED_WORK) -> SessionState:
-    """Staff exit and pause records take precedence over observed activity."""
+    """Staff exit and pause records take precedence; a start or a detached run counts as busy."""
     hold = staff_state(member)
     if hold != "active":
         return hold
-    if isinstance(activity, LiveActivity):
-        if activity.status == "busy":
-            return "busy"
-        if activity.status == "starting":
-            return "starting"
+    if isinstance(activity, LiveActivity) and activity.status in ("busy", "starting"):
+        return "busy"
     if isinstance(member, staff.StaffRow) and member.id in detached.staff_ids:
-        return "waiting"
+        return "busy"
     if isinstance(activity, NoLiveSession):
         return "exited"
     return "idle"

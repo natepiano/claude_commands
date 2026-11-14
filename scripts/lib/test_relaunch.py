@@ -21,12 +21,17 @@ from unittest.mock import patch
 from scripts.lib.process_group import send_process_group
 from scripts.agents.test_support import ShutdownTestCase
 from scripts.lib import relaunch
+from scripts.lib.state_home_test_support import isolate_state_home
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.production import staff, worker
 from scripts.production.staff_test_support import StaffTestCase, fixture_member, fixture_runtime_id
 from scripts.lib.resume_message import AccountMove, ResumeWorkers, resume_message
 
 SUPERVISOR = Path(__file__).with_name("relaunch.py")
+
+
+def setUpModule() -> None:
+    isolate_state_home()
 
 
 class RelaunchObservation(TypedDict):
@@ -71,6 +76,27 @@ class UnitResumeCommandTests(StaffTestCase):
             arguments, _ = relaunch.restored_launch(["claude", "--resume", str(row.current_session)], environment)
         self.assertIn("/unit:merge", arguments[-1])
         self.assertNotIn("/unit:direct", arguments[-1])
+
+    def test_relaunch_in_no_worker_mode_gives_the_notice_and_no_worker_lines(self) -> None:
+        from scripts.agents import pane_record
+        from scripts.production.staff_test_support import fixture_session
+        from scripts.whoami import quota_alert
+
+        runner = fixture_member("showrunner", name="demo")
+        row = staff.ensure("unit", name="held", parent=staff.ReportsTo(runner.id),
+            runtime_id=fixture_runtime_id("held"), unit_type="direct")
+        fixture_session(row.current_session, staff.ClaudeBackend())
+        entry = pane_record.launch("w1:p2", str(row.current_session), str(self.root), {}, ["claude"])
+        environment = {"HERDR_ENV": "1", "HERDR_SESSION": "agents", "HERDR_PANE_ID": "w1:p2"}
+        notice = "Codex workers have no capacity. Send no assign."
+        with (patch.object(pane_record, "matching_launch", return_value=entry),
+              patch.object(quota_alert, "no_worker_mode", return_value=True),
+              patch.object(quota_alert, "no_worker_notice", return_value=notice),
+              patch.object(worker, "resume_workers", return_value=ResumeWorkers()) as listed):
+            arguments, _ = relaunch.restored_launch(["claude", "--resume", str(row.current_session)], environment)
+        listed.assert_not_called()
+        self.assertIn(notice, arguments[-1])
+        self.assertNotIn("Resume your workers", arguments[-1])
 
 
 class RelaunchTests(ShutdownTestCase):
