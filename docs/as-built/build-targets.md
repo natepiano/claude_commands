@@ -472,6 +472,8 @@ They create the mark when absent and retain it through deletion.
 A folder with a maker lock beside it (`<name>.lock`) is a managed folder.
 `scratch.removal_lock` and `scratch.judgment_lock` first take its lease lock without waiting and hold it through judgment and deletion.
 A held lease is busy, even when no busy mark is held. The collector then creates no busy mark.
+`scratch.removal_lock` also walks the folder without following links and holds every lease lock below it through deletion.
+A held lease below the folder, or an unreadable folder, is busy. `judgment_lock` does not walk, so status reads stay fast; removal makes the final call.
 Every collector that uses these locks (scratch end, the folder audit, the tmp sweep, the floor sweep and copy removal) gets this guard.
  A holder checks the present mark and removal evidence before it starts work. Shared holders can run together; a process exit releases its lock. Hana can set the same mark in a target with `flock`, without importing these scripts. `scratch.py hand-over <path> --to <unit> --task <new-task>` replaces owner and the complete task atomically and keeps the path, so child alternates and recovery records retain valid paths. One task-field function clears the old end evidence, run directory, phase id and land target; a phase hand-over supplies `--run-dir` and derives its phase id from the new task, and a landed task can supply `--land-target`.
 

@@ -340,15 +340,17 @@ def directory_record_lock(path: Path, *, wait: bool,
 
 @contextmanager
 def removal_lock(path: Path) -> Generator[bool]:
-    """Claim the lease lock and the busy mark, even when absent, and hold them through removal.
-    A held lease is busy, and the busy mark is then not created."""
-    with collector_lease(path) as free, busy_locks(path, create=free) as idle:
+    """Claim the lease locks and the busy mark, even when absent, and hold them through removal.
+    A held lease on the folder or on any folder below it is busy, and the busy mark is then
+    not created."""
+    with collector_lease(path, children=True) as free, busy_locks(path, create=free) as idle:
         yield free and idle
 
 
 @contextmanager
 def judgment_lock(path: Path) -> Generator[bool]:
-    """Check the lease lock and existing busy marks without creating metadata during a scan or dry run."""
+    """Check the folder's lease lock and existing busy marks without creating metadata during a scan or dry run.
+    Leases below the folder are checked only at removal, so status reads do not walk the tree."""
     with collector_lease(path) as free, busy_locks(path, create=False) as idle:
         yield free and idle
 

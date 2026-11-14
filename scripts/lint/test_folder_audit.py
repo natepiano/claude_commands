@@ -15,7 +15,7 @@ import sys
 import time
 import unittest
 from collections.abc import Generator, Iterator
-from contextlib import contextmanager, redirect_stderr, redirect_stdout
+from contextlib import AbstractContextManager, contextmanager, redirect_stderr, redirect_stdout
 from pathlib import Path
 from scripts.lib.transcript_test_support import compressed_copy
 from typing import cast, override
@@ -77,12 +77,13 @@ class FolderAuditTests(unittest.TestCase):
         self.recorded_ctimes = {}
         scan = os.scandir
 
+        def recorded_scan(path: str | int | os.PathLike[str]) -> AbstractContextManager[Iterator[os.DirEntry[str]]]:
+            # A descriptor scan (os.fwalk) iterates the real scanner without a with block.
+            return scan(path) if isinstance(path, int) else recorded_path_scan(path)
+
         @contextmanager
-        def recorded_scan(path: str | int | os.PathLike[str]) -> Generator[Iterator[os.DirEntry[str]]]:
+        def recorded_path_scan(path: str | os.PathLike[str]) -> Generator[Iterator[os.DirEntry[str]]]:
             with scan(path) as entries:
-                if isinstance(path, int):
-                    yield entries
-                    return
                 recorded: list[os.DirEntry[str]] = []
                 for entry in entries:
                     info = entry.stat(follow_symlinks=False)
@@ -442,6 +443,22 @@ class FolderAuditTests(unittest.TestCase):
         outcomes = self.judge_clones([clone], mac=True, free_space=0)
         self.assertEqual(outcomes[clone], folder_audit.REMOVED)
         self.assertFalse(clone.exists())
+
+    def test_a_held_lease_below_a_folder_keeps_the_folder(self) -> None:
+        parent = folder(self.temp / "test-runs", 3 / 24)
+        _ = write_config_fixture(self.root / "config/lint.conf", "folder_remove_after_seconds=7200\n")
+        ended = parent / "test-run-ended"
+        ended.mkdir()
+        (parent / "test-run-ended.lock").touch()
+        request = build_folders.UniqueBuildFolder("test-run-", build_folders.ExplicitBuildParent(parent))
+        with build_folders.temporary_build_folder(request) as held:
+            age(parent, 3 / 24)
+            self.assertEqual(self.judge_clones([parent])[parent], scratch.BUSY_REASON)
+            self.assertTrue(held.is_dir())
+            self.assertTrue(ended.is_dir())
+        age(parent, 3 / 24)
+        self.assertEqual(self.judge_clones([parent])[parent], folder_audit.REMOVED)
+        self.assertFalse(parent.exists())
 
     def test_config_failure_keeps_an_active_hold_and_its_clone(self) -> None:
         clone = self.clone_folder("config-held", 3)

@@ -717,6 +717,22 @@ print(scratch.target('gate:proof', 'tree', False))
             self.assertFalse(scratch.busy_path(path).exists())
             self.assertEqual(build_folders.build_folder_state(path), "held")
 
+    def test_removal_finds_a_held_lease_below_the_folder_but_judgment_does_not_walk(self) -> None:
+        parent = self.base / "runs"
+        nested = parent / "a" / "b"
+        nested.mkdir(parents=True)
+        request = build_folders.UniqueBuildFolder("run-", build_folders.ExplicitBuildParent(nested))
+        with build_folders.temporary_build_folder(request) as held:
+            with scratch.removal_lock(parent) as idle:
+                self.assertFalse(idle)
+            self.assertFalse(scratch.busy_path(parent).exists())
+            with scratch.judgment_lock(parent) as idle:
+                self.assertTrue(idle)
+            self.assertEqual(build_folders.build_folder_state(held), "held")
+        (nested / "unrelated.lock").touch()
+        with scratch.removal_lock(parent) as idle:
+            self.assertTrue(idle)
+
     def test_removal_holds_a_free_lease_until_it_ends(self) -> None:
         path = self.base / "free-lease"
         path.mkdir()
