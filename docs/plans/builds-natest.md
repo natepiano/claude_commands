@@ -3857,3 +3857,23 @@ Checkpoint 2cfdd87f1. Changed `scripts/message/test_notifier.py` (launcher stubs
 - The fake `systemd-run` is one `/bin/sh` stub: `set -m` starts the command in its own process group, and the stub writes `run-exit-<pid>` and the launch pid marker. The Mac has no `setsid`; `/bin/sh set -m` works on both machines. The drain test's stub writes one argument per line.
 - The fake `launchctl` is one `zsh -f` stub with the same submit, kickstart, loop and remove behavior. Kickstart starts the loop through `/bin/sh set -m`, because zsh cannot start a job group without a terminal.
 - AWS pair (c7a.8xlarge, 3 rounds): median 7.22 → 6.59 CPU s. Most of the rest is the production helpers `sessions.py member-socket` and `update_registration.py delivery`; their import cost went to sdlc as a proposal.
+
+### Phase 262 — The unit move tests copy a class-built Git seed and read snapshots faster  · status: done
+**Depends on:** none
+**Owner:** builds gave the go 2026-11-13.
+
+#### Work Order
+
+**Goal:** `production/test_unit_move.py` uses less CPU in aws pairs; every behavior check stays.
+
+**Spec:**
+- Profile: 17.9 local CPU s. `FolderRenameFixture.setUp` runs nine git commands per test (69 tests here); `file_versions` takes 2.6 s in 283 calls.
+- `FolderRenameFixture` builds the checkout, bare origin and unit worktree once per class (`setUpClass`, keyed by the class `old_name`). Each test copies them. The copy rewrites the three files that hold the seed path: the checkout config (origin URL, as `str(self.root)`), the worktree `gitdir` and the worktree `.git` file (resolved root). No copied file holds the seed path.
+- `file_versions` and `final_files` walk with `os.scandir` and keep the same filters: symlinked folders are not followed, a symlink to a file is read through, and the same names and folders are left out.
+- Test-support files only. `agents/test_shutdown_cli.py` and `production/test_rename_unit_style.py` share both helpers, so the pair and the land run all three modules.
+
+**Files:** `scripts/production/rename_unit_test_support.py`, `scripts/production/rename_rerun_test_support.py`.
+
+**Workers:** director only (no-worker mode).
+
+**Acceptance gate:** the three modules pass; basedpyright reports zero errors and warnings; the aws pair shows a CPU gain.

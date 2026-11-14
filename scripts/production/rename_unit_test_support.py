@@ -276,6 +276,53 @@ class UnitRenameFixture(StaffTestCase):
         return worktree, plan, database
 
 
+def folder_repositories(root: Path, old_name: str) -> tuple[Path, Path, Path]:
+    """Return the checkout, bare origin and unit worktree of a folder rename fixture."""
+    return root / "repository", root / "origin.git", root / "home/rust" / f"cargo-liner-{old_name}"
+
+
+def build_folder_repositories(root: Path, old_name: str) -> None:
+    """Build the fixture's checkout, bare origin and unit worktree once for a test class."""
+    checkout, origin, source = folder_repositories(root, old_name)
+    checkout.mkdir()
+    source.parent.mkdir(parents=True)
+    environment = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
+    environment.update({"HOME": str(root / "home"), "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1",
+                        "GIT_OPTIONAL_LOCKS": "0", "GIT_TERMINAL_PROMPT": "0"})
+
+    def git(*arguments: str) -> None:
+        _ = subprocess.run(["git", "-C", str(checkout), *arguments], env=environment, capture_output=True,
+                           text=True, check=True, timeout=TEST_HANG_GUARD_SECS)
+
+    git("init", "-b", "main")
+    git("init", "--bare", str(origin))
+    git("remote", "add", "origin", str(origin))
+    git("config", "user.name", "Folder Rename Test")
+    git("config", "user.email", "rename@example.invalid")
+    git("config", "gc.auto", "0")
+    _ = (checkout / "kept.txt").write_text("Keep this work.\n")
+    git("add", ".")
+    git("commit", "-m", "fixture")
+    git("worktree", "add", "-b", f"cargo-liner-{old_name}", str(source))
+
+
+def copy_folder_repositories(seed: Path, root: Path, old_name: str) -> None:
+    """Copy the class repositories into root as if Git had made them there.
+
+    The origin URL keeps root as given; Git writes the worktree links with the resolved path.
+    """
+    for copied, destination in zip(folder_repositories(seed, old_name), folder_repositories(root, old_name)):
+        _ = shutil.copytree(copied, destination, symlinks=True)
+    checkout, _, source = folder_repositories(root, old_name)
+    for path, location in ((checkout / ".git/config", root),
+                           (checkout / ".git/worktrees" / source.name / "gitdir", root.resolve()),
+                           (source / ".git", root.resolve())):
+        text = path.read_text()
+        if str(seed) not in text:
+            raise AssertionError(f"{path} does not name the Git seed {seed}")
+        _ = path.write_text(text.replace(str(seed), str(location)))
+
+
 class FolderRenameFixture(StaffTestCase):
     """Keep folder rename inputs in one private staff record and Git repository."""
 
@@ -288,6 +335,16 @@ class FolderRenameFixture(StaffTestCase):
     records: Path = Path()
     configuration: Path = Path()
     env: dict[str, str] = {}
+    git_seed: ClassVar[Path]
+
+    @classmethod
+    @override
+    def setUpClass(cls) -> None:
+        super().setUpClass()
+        directory = tempfile.TemporaryDirectory(prefix="folder-rename-seed-")
+        cls.addClassCleanup(directory.cleanup)
+        cls.git_seed = Path(directory.name).resolve()
+        build_folder_repositories(cls.git_seed, cls.old_name)
 
     @property
     def owner(self) -> staff.StaffRow:
@@ -321,19 +378,9 @@ class FolderRenameFixture(StaffTestCase):
         _ = self.enterContext(fake_unit_host.private_process_registry())
         self.home.mkdir(exist_ok=True)
         (self.root / "proc").mkdir()
-        self.checkout.mkdir()
         self.source.parent.mkdir(parents=True)
         self.records.mkdir()
-        _ = self.git("init", "-b", "main")
-        _ = self.git("init", "--bare", str(self.root / "origin.git"))
-        _ = self.git("remote", "add", "origin", str(self.root / "origin.git"))
-        _ = self.git("config", "user.name", "Folder Rename Test")
-        _ = self.git("config", "user.email", "rename@example.invalid")
-        _ = self.git("config", "gc.auto", "0")
-        _ = (self.checkout / "kept.txt").write_text("Keep this work.\n")
-        _ = self.git("add", ".")
-        _ = self.git("commit", "-m", "fixture")
-        _ = self.git("worktree", "add", "-b", f"cargo-liner-{self.old_name}", str(self.source))
+        copy_folder_repositories(self.git_seed, self.root, self.old_name)
         owner = fixture_member("showrunner", name="folder-production",
             doc=staff.LiveDoc(remote.local_machine(), self.checkout / "production.md"))
         row = fixture_member("unit", name=self.old_name, parent=owner.id,
