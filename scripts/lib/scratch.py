@@ -79,7 +79,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import TypedDict, cast
 
-from scripts.lib import cargo_output, conf, copy_record  # noqa: E402
+from scripts.lib import cargo_output, conf, copy_record, git_files  # noqa: E402
 from scripts.lib.conf import UseConfiguredValue
 
 from scripts.lib.build_folders import BuildFolderSpec, build_folder_path, collector_lease, inherited_temporary_parent  # noqa: E402
@@ -210,21 +210,13 @@ class NoGitDirectory:
 
 
 def git_directory(repo: Path) -> GitDirectory | NoGitDirectory:
-    """Resolve the checkout's Git metadata, including a linked worktree's pointer."""
-    marker = repo / ".git"
-    if marker.is_dir() and not marker.is_symlink():
-        return GitDirectory(marker)
+    """Resolve the checkout's Git metadata, including a linked worktree's pointer; a linked .git is refused."""
+    if (repo / ".git").is_symlink():
+        return NoGitDirectory()
     try:
-        line = marker.read_text(encoding="utf-8").strip()
-    except (OSError, UnicodeError):
+        return GitDirectory(git_files.at(repo).git_dir)
+    except git_files.GitFilesError:
         return NoGitDirectory()
-    if not line.startswith("gitdir:"):
-        return NoGitDirectory()
-    pointer = line.removeprefix("gitdir:").strip()
-    if not pointer or "\n" in pointer:
-        return NoGitDirectory()
-    found = repo / pointer
-    return GitDirectory(found) if found.is_dir() else NoGitDirectory()
 
 
 def busy_path(path: Path) -> Path:

@@ -534,16 +534,16 @@ class RemoteCopiesTests(unittest.TestCase):
         self.assertTrue((self.mirror / ".mac-test-mirror").exists())
 
     def test_remote_kind_covers_mac_linux_and_named_peer(self) -> None:
-        from scripts.mac_test import offload
+        from scripts.mac_test import eligibility, offload
         from scripts.build_targets import target_config
         targets: tuple[tuple[str, target_config.Platform], ...] = (("mac", "macos"), ("linux", "linux"), ("peer", "linux"))
         for name, platform in targets:
-            with self.subTest(target=name), mock.patch.object(offload, "configured_ssh_target",
+            with self.subTest(target=name), mock.patch.object(eligibility, "configured_ssh_target",
                 return_value=target_config.SshTarget(name, platform, self.root / "settings")):
                 request = offload.OffloadRequest(self.source, "package", "call", offload.NO_RESULT_FILE, (),
                                                 target=name, owner="alpha", holder_session="session")
-                config = offload.OffloadConfig(True, offload.SshConnectionSettings("host", 1, 1), 1, 1, 1, "1", {})
-                mirror = offload.request_mirror(config, request, offload.KnownRepository("repository"))
+                config = eligibility.OffloadConfig(True, eligibility.SshConnectionSettings("host", 1, 1), 1, 1, 1, "1", {})
+                mirror = offload.request_mirror(config, request, eligibility.KnownRepository("repository"))
                 self.assertEqual(mirror.owner, "alpha")
                 self.assertEqual(mirror.repository, copies.SelectedRepository("repository"))
                 self.assertEqual(mirror.session, "session")

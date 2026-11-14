@@ -956,6 +956,7 @@ sys.exit(7)
         saved = remote.read_record(self.state / 'gate-deployment.json')
         self.assertEqual([row['region'] for row in ledger.rows(saved, 'regions')], ['us-east-2', 'us-west-2'])
         self.assertEqual(ledger.rows(saved, 'regions')[1], west)
+        self.assertEqual(saved['instance_types'], ['m7a.8xlarge', 'm7a.4xlarge'])
 
     def test_prices_lists_all_region_type_zone_combinations_without_ids(self) -> None:
         subject = self.deployment()

@@ -59,17 +59,26 @@ def running_detached_work(record: staff.StaffSnapshot, *, additional_runs: Seque
     worker_directories = cast(Callable[[staff.StaffSnapshot], LauncherRunDirectories],
                               import_module("scripts.herdr.worker_panes").worker_run_directories)
 
+    # Workers of one parent share folders; resolve each folder once.
+    resolved: dict[Path, Path] = {}
+
+    def owned(folder: Path) -> set[staff.StaffId]:
+        real = resolved.get(folder)
+        if real is None:
+            real = resolved[folder] = folder.resolve()
+        return owners.setdefault(real, set())
+
     owners: dict[Path, set[staff.StaffId]] = {}
     for row in record.rows:
         if isinstance(row.run, staff.OpenRun):
-            owners.setdefault(row.run.path.resolve(), set()).add(row.id)
+            owned(row.run.path).add(row.id)
     directories = worker_directories(record)
     for identity, folders in directories.by_worker.items():
         for folder in folders:
-            owners.setdefault(folder.resolve(), set()).add(identity)
+            owned(folder).add(identity)
     identities = {row.id for row in record.find(kind="worker")}
     for folder in additional_runs:
-        owners.setdefault(folder.resolve(), set()).update(identities)
+        owned(folder).update(identities)
     busy: set[staff.StaffId] = set()
     labels: dict[staff.StaffId, list[str]] = {}
     inputs: set[Path] = set()

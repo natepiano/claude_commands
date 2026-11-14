@@ -86,6 +86,7 @@ HELD_FOR_TICKET = "held_for_ticket"
 WORKTREE = "worktree"
 # Lifecycles of a released reservation; `protected_tip` names the commit it was released at.
 CHECKPOINT_RELEASED = frozenset({"outstanding", "released_after_checkpoint"})
+RELEASED_WITHOUT_CHECKPOINT = "released_without_checkpoint"
 HOLDS_RESERVATION = frozenset({ACTIVE, PENDING})
 # A checkpoint's display form.
 SHORT_COMMIT = 7
@@ -586,7 +587,8 @@ def clear(phase_dir: Path, released: str = "", repo: Path = WORKING_DIRECTORY) -
     A state that owns no reservation clears at once. The pending release state clears only with
     `released`, the checkpoint commit whose release was confirmed: the recorded string itself, or any
     name `repo` resolves to the recorded commit. The recorded commit remains in the release marker
-    until enrollment restores the phase. `Active` never clears here."""
+    until enrollment restores the phase. `Active` clears only when berth's board in `repo` shows its
+    reservation released without a checkpoint; that clear writes no release marker."""
     state = read_state(phase_dir)
     kind = _string(state.get("kind"))
     if not kind:
@@ -596,6 +598,8 @@ def clear(phase_dir: Path, released: str = "", repo: Path = WORKING_DIRECTORY) -
         if not released or (released != commit and commit_id(repo, released) != commit):
             raise StateRefused(f"the pending release names checkpoint {commit}; pass --released {commit} after its release")
         released = commit
+    elif kind == ACTIVE and lifecycle(repo, _recorded(state)) == RELEASED_WITHOUT_CHECKPOINT:
+        released = ""
     elif kind not in BOARD_STATES.values():
         raise StateRefused(f"the phase is {kind}; commit its checkpoint and confirm the release first")
     if released:
