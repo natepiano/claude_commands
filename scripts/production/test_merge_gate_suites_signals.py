@@ -339,6 +339,11 @@ merge_gate.start_gate_job = stop_after_start
                 self.write(self.state / "hold-module", "hold")
                 self.write(self.state / "leak-child", "leak")
                 self.write(self.state / "detached-child", "detached")
+                # Each signal gets its own pool, so a failed subtest leaves no token for the next.
+                pool = self.root / f"jobserver-{sig.name}"
+                os.mkfifo(pool)
+                self.addCleanup(os.close, os.open(pool, os.O_RDWR | os.O_NONBLOCK))
+                self.environment["BUILDLOG_JOBSERVER_FIFO"] = str(pool)
                 self.supply_jobserver(b"Q")
                 parent = self.root / f"interrupted-{sig.name}"
                 parent.mkdir()

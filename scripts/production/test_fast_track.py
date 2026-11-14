@@ -1217,7 +1217,7 @@ signal.pause()
         def exited() -> bool:
             try:
                 return Path(f"/proc/{pid}/stat").read_text().split(")", 1)[1].split()[0] == "Z"
-            except FileNotFoundError:
+            except (FileNotFoundError, ProcessLookupError):
                 return True
 
         if not exited():

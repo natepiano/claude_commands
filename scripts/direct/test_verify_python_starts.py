@@ -46,6 +46,9 @@ class VerifyPythonStartsTests(VerifyLintCacheFixture):
         # Maker cleanup adds three recorded calls for the two temporary folders.
         self.assertEqual(counts["build_folders.py"], 6, rows)
         self.assertEqual(len(rows), 27, counts)
+        # The per-run helper reads the dev features; no Python process of its own starts.
+        in_helper = Counter(line.split("\t")[0] for line in Path(str(trace) + ".calls").read_text().splitlines())
+        self.assertEqual((counts["dev_features.py"], in_helper["dev_features.py"]), (1, 1), rows)
         for target, mode in (("unknown", "passed"), ("linux", "disk")):
             with self.subTest(target=target, mode=mode):
                 routing = VerifySshTargetsFixture()

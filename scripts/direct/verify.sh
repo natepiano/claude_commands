@@ -923,38 +923,6 @@ run_step() {
     done
 }
 
-DEV_FEATURES_PY='
-from pathlib import Path
-import sys
-import tomllib
-
-try:
-    with Path(sys.argv[1]).open("rb") as source:
-        value = tomllib.load(source)
-    for key in ("workspace", "metadata", "dev"):
-        if not isinstance(value, dict):
-            raise ValueError("expected a table")
-        value = value.get(key, {})
-    if not isinstance(value, dict):
-        raise ValueError("expected a table")
-    features = value.get("features", [])
-    if not isinstance(features, list) or any(not isinstance(name, str) for name in features):
-        raise ValueError("expected a list of strings")
-except FileNotFoundError:
-    features = []
-except (OSError, ValueError):
-    print("verify.sh: workspace.metadata.dev.features must be a list of strings", file=sys.stderr)
-    sys.exit(2)
-print(",".join(features))
-if len(sys.argv) > 2 and sys.argv[2] in ("test", "final"):
-    with open(Path(sys.argv[3]).resolve().parents[2] / "scripts/lib/package_root.py") as package_root: exec(package_root.read(), {"__file__": package_root.name})
-    from scripts.direct.result_environment import read_policy
-    policy = read_policy()
-    print(" ".join(policy.forwarded_names))
-    print(" ".join(policy.prefixes))
-    print(" ".join(name + "=" + value for name, value in policy.fixed))
-'
-
 # Workspace members with a file that differs from HEAD: staged, unstaged,
 # deleted, or new and not ignored. A phase commits nothing before its
 # checkpoint, so HEAD is where the phase started and this is the whole phase's
@@ -1434,7 +1402,7 @@ if [[ "$CMD" == final && -z "$VERIFY_PACKAGE" && -z "$PINNED_TARGET" && "$MAC_ON
     FINAL_PASS_START="$("$PY" "$FINAL_PASS_SCRIPT" start "${BASH_SOURCE[0]}")"
     trap 'final_status=$?; finish_verify_run "$final_status"; exit "$final_status"' EXIT
 fi
-VERIFY_SETUP="$(VERIFY_PY_HELPER=DEV_FEATURES_PY "$PY" -c "$DEV_FEATURES_PY" "$(git rev-parse --show-toplevel 2>/dev/null || pwd)/Cargo.toml" "$CMD" "$VERIFY_START_DIR/result_environment.py")" || exit 2
+VERIFY_SETUP="$(verify_helper "$VERIFY_START_DIR/dev_features.py" "$(git rev-parse --show-toplevel 2>/dev/null || pwd)/Cargo.toml" "$CMD")" || exit 2
 DEV_FEATURES="${VERIFY_SETUP%%$'\n'*}"
 VERIFY_TEST_ENVIRONMENT=()
 VERIFY_USER_ENVIRONMENT=( ${VERIFY_MAC_ENVIRONMENT[@]+"${VERIFY_MAC_ENVIRONMENT[@]}"} )
