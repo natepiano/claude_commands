@@ -3355,7 +3355,9 @@ class WorkerCommandTests(unittest.TestCase):
             def supervises(pid: int, path: Path) -> bool:
                 del path
                 return alive and pid == 101
-            with patch.object(detached_run_process, "supervises", side_effect=supervises):
+            supervisors = {path.resolve(): frozenset({101}) for path in directory.glob("*.json")} if alive else {}
+            with (patch.object(detached_run_process, "supervises", side_effect=supervises),
+                  patch.object(detached_run_process, "supervisor_records", return_value=supervisors)):
                 for scope in ((), ("--all-parents",)):
                     with (self.subTest(alive=alive, hold=hold, scope=scope, location=location, activity=activity),
                           patch.dict(os.environ, {"UNIT_RUN_DIR": "", "PLAN_DELEGATE_BOARD_DIR": ""}),
@@ -3367,8 +3369,9 @@ class WorkerCommandTests(unittest.TestCase):
                         self.assertEqual(cells[opened.row.name][-1], "TEST suite, TEST build continued" if alive else "-")
                         self.assertEqual(cells[other.row.name][-1], "-")
                         self.assertEqual(cells[opened.row.name][5], expected)
+                        # Only records that a live supervisor names are read, each once.
                         for path in directory.glob("*.json"):
-                            self.assertEqual(sum(call.args == (path,) for call in reads.call_args_list), 1, str(path))
+                            self.assertEqual(sum(call.args == (path,) for call in reads.call_args_list), int(alive), str(path))
 
     def test_list_all_sorts_open_panes_first_and_preserves_each_group_order(self) -> None:
         closed = [self.fixture.worker(name) for name in ("alpha", "gamma")]

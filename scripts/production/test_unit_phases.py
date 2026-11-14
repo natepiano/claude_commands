@@ -24,17 +24,14 @@ from typing import cast, override
 from unittest.mock import Mock, patch
 
 
-from scripts.production import claude_table_layout, display_cells, live_units, unit_queue
+from scripts.production import census, claude_table_layout, display_cells, live_units, unit_queue
 from scripts.accounts import session_state
-from scripts.agents.detached_runs import RunRecord
-from scripts.agents.worker_lifecycle import DETACHED_RUNS_DIR
 from scripts.lib import conf, unit_runs
 from scripts.lib import names as display_names
 from scripts.lib.terminal_cells import terminal_width
 from scripts.message import sessions
 from scripts.production import showrunners
 from scripts.production import unit_lookup
-from scripts.herdr import herdr, worker_panes
 from scripts.herdr.herdr import HerdrPlace
 from scripts.production import unit_phases
 from scripts.production.production_doc import read_production
@@ -42,9 +39,9 @@ from scripts.production import style_units
 from scripts.style import style_ledger
 from scripts.style.ledger_test_support import write_style_units
 from scripts.production import staff
-from scripts.production.staff_test_support import isolated_staff_file, fixture_member, fixture_runtime_id, fixture_worker, recorded_unit
+from scripts.production.staff_test_support import isolated_staff_file, fixture_member, fixture_runtime_id, recorded_unit
 
-from scripts.direct import phase_table, worker_runs
+from scripts.direct import phase_table
 from scripts.direct import plan_history
 
 
@@ -95,6 +92,34 @@ def event(kind: str, **fields: str) -> str:
     return json.dumps({"event_type": kind, **fields})
 
 
+LOCAL = census.Census((census.CensusMachine("natedev", True),), (), ())
+
+
+def session_of(member: staff.StaffRow, status: str | None) -> census.CensusSession:
+    return census.CensusSession(member.current_session, status)
+
+
+def census_worker(name: str, parent: staff.StaffId, *, status: str | None = "busy", activity: str | None = None,
+                  phase: str = "", runs: Sequence[census.CensusRun] = ()) -> census.CensusWorker:
+    assignment = census.CensusPass("impl", phase) if phase else census.NoPass()
+    return census.CensusWorker(staff.StaffId(f"{name}-id"), name, parent, status, activity, assignment, tuple(runs))
+
+
+def tiles(*, sessions: Sequence[census.CensusSession] = (),
+          workers: Sequence[census.CensusWorker] = ()) -> census.Census:
+    return LOCAL._replace(sessions=tuple(sessions), workers=tuple(workers))
+
+
+def census_for(units: Sequence[live_units.LiveUnit]) -> census.Census:
+    """List each recorded unit that is not exited, with the status word of its live classification."""
+    return tiles(sessions=[session_of(selected.member, selected.status) for selected in units
+                           if isinstance(selected.member, staff.StaffRow) and selected.status != "exited"])
+
+
+def table_of(units: list[live_units.LiveUnit], records: dict[str, object]) -> str:
+    return unit_phases.table(units, records, census_read=census_for(units))
+
+
 class UnitPhasesTests(unittest.TestCase):
     root: Path = Path()
 
@@ -114,6 +139,7 @@ class UnitPhasesTests(unittest.TestCase):
                                                     "UNIT_HISTORY_DIR": str(self.root / "history"),
                                                     "UNIT_QUEUE_STATE_DIR": str(self.root / "queue")}))
         _ = self.enterContext(patch.object(process_table, "snapshot", return_value={}))
+        _ = self.enterContext(patch.object(census, "read", return_value=LOCAL))
 
     def test_unit_count_cache_filters_sources_and_retries_failed_reads(self) -> None:
         from scripts.statusline import counts_row
@@ -173,7 +199,7 @@ class UnitPhasesTests(unittest.TestCase):
         for session in (None, live("another-session"), unit_lookup.ClaudeNotRunning(),
                         unit_lookup.ClaudeUnknown("no records")):
             with self.subTest(session=session):
-                rendered = unit_phases.table([unit("namecheck", session)], {})
+                rendered = table_of([unit("namecheck", session)], {})
                 expected = "idle" if isinstance(session, unit_lookup.LiveClaude) else "exited"
                 self.assertEqual(rendered.splitlines()[0], "| Unit | Status |")
                 self.assertEqual(rendered.splitlines()[2], f"| namecheck | {expected} |")
@@ -362,20 +388,20 @@ class UnitPhasesTests(unittest.TestCase):
         selected = unit("messaging", live("messaging"))
         records: dict[str, object] = {"messaging": {"current": None, "phases": phase_rows("todo")}}
         with self.subTest(run="newest unfinished"):
-            rendered = unit_phases.table([selected], records)
+            rendered = table_of([selected], records)
             self.assertIn("| messaging | idle | ⬜ | 0/1 |", rendered)
             self.assertIn("| messaging | not started | outside-b: impl: write newest | Review delivery +1 more · plan: phase 1: Delivery 1 |",
                           rendered)
         _ = run("finished", member, "finished", 3, event("run_finished", summary="x" * 32_000))
         with self.subTest(run="newest finished"):
-            rendered = unit_phases.table([selected], records)
+            rendered = table_of([selected], records)
             self.assertIn("| messaging | idle | ⬜ | 0/1 |", rendered)
             self.assertIn("| messaging | not started | Review delivery +1 more · plan: phase 1: Delivery 1 |",
                           rendered)
         former = replace(member, current_session=staff.StaffId(fixture_runtime_id("previous-director")))
         _ = run("former", former, "previous-session", 4, use_timestamp=True)
         with self.subTest(run="newest from a previous session"):
-            rendered = unit_phases.table([selected], records)
+            rendered = table_of([selected], records)
             self.assertIn("| messaging | idle | ⬜ | 0/1 |", rendered)
             self.assertIn("| messaging | not started | previous-session: impl: write former | Review delivery +1 more · plan: phase 1: Delivery 1 |",
                           rendered)
@@ -390,7 +416,7 @@ class UnitPhasesTests(unittest.TestCase):
         records["messaging"] = {"plan": str(plan), "current": {"phase": "1", "of": 1, "title": "Planned work"},
                                 "phases": phase_rows("running")}
         with patch.object(plan_history, "read_run_events", wraps=plan_history.read_run_events) as whole_reads:
-            rendered = unit_phases.table([selected], records)
+            rendered = table_of([selected], records)
         self.assertEqual([call.args[0] for call in whole_reads.call_args_list], [newest])
         self.assertIn("| messaging | idle | 🟨 | 0/1 |", rendered)
         self.assertIn("| messaging | phase 1 — impl: planned task | outside-b: impl: write newest +1 more | Review delivery +1 more |", rendered)
@@ -400,7 +426,7 @@ class UnitPhasesTests(unittest.TestCase):
         for sample, notes in notes_cases:
             with self.subTest(notes=notes):
                 records["messaging"] = sample
-                rendered = unit_phases.table([selected], records)
+                rendered = table_of([selected], records)
                 self.assertIn("| messaging | idle |", rendered)
                 self.assertIn(f"| messaging | {notes} | 1: impl: planned task +2 more | Review delivery +1 more |",
                               rendered)
@@ -420,14 +446,14 @@ class UnitPhasesTests(unittest.TestCase):
             event("activity_finished", phase_id="outside-c", activity_instance_id="a0"),
             event("activity_started", phase_id="outside-c", activity_instance_id="a1",
                   activity_label="Verification", activity_text="check " + "x" * 150))
-        work = unit_phases.table([selected], records).split("\n\n")[-1]
+        work = table_of([selected], records).split("\n\n")[-1]
         cells = [cell.strip() for cell in work.splitlines()[2].split("|")[1:-1]]
         self.assertEqual(cells[2], "outside-c: Verification: check " + "x" * 150 + " +3 more")
         queue = cells[3].split(" · ", 1)[0]
         self.assertEqual(queue, long_text + " +1 more")
         _ = config.write_text(configured)
         wide_records: dict[str, object] = {"messaging": typed_record(self.root / "plan.md", *(["todo"] * 20))}
-        fitted = unit_phases.table([selected], wide_records)
+        fitted = table_of([selected], wide_records)
         for section in (fitted.split("\n\n")[0], fitted.split("\n\n")[-1]):
             lines = section.splitlines()
             headings = tuple(cell.strip() for cell in lines[0].split("|")[1:-1])
@@ -453,7 +479,7 @@ class UnitPhasesTests(unittest.TestCase):
         _ = path.write_text("not json")
         errors = io.StringIO()
         with contextlib.redirect_stderr(errors):
-            rendered = unit_phases.table([selected, unit("another-unit", None)], records)
+            rendered = table_of([selected, unit("another-unit", None)], records)
         self.assertIn("| queue unreadable |", rendered)
         self.assertIn("| another-unit | exited |", rendered)
         self.assertIn("| another-unit | — | another-phase: impl: write unrelated | — |", rendered)
@@ -468,7 +494,7 @@ class UnitPhasesTests(unittest.TestCase):
             with self.subTest(columns=columns, queued=queued):
                 _ = config.write_text(configured.replace("units_table_floor_columns=120", f"units_table_floor_columns={columns}"))
                 _ = path.write_text(json.dumps([queued]))
-                work = unit_phases.table([selected], records).split("\n\n")[-1]
+                work = table_of([selected], records).split("\n\n")[-1]
                 lines = work.splitlines()
                 headings = tuple(cell.strip() for cell in lines[0].split("|")[1:-1])
                 rows = [tuple(cell.strip() for cell in line.split("|")[1:-1]) for line in lines[2:]]
@@ -646,7 +672,7 @@ class UnitPhasesTests(unittest.TestCase):
                     self.assertIsInstance(sample.phases[0], phase_table.OpenPhase)
                     assert isinstance(sample.current, phase_table.OpenPhase)
                     self.assertEqual(sample.current.phase, "outside-new")
-                rendered = unit_phases.table([unit("promises", None)], {"promises": sample}, pane_rows={},
+                rendered = unit_phases.table([unit("promises", None)], {"promises": sample}, census_read=LOCAL,
                                             now=now.timestamp(), zone=ZoneInfo("UTC"))
                 headers = [cell.strip() for cell in rendered.splitlines()[0].split("|")[1:-1]]
                 table_rows = [[cell.strip() for cell in line.split("|")[1:-1]]
@@ -694,7 +720,7 @@ class UnitPhasesTests(unittest.TestCase):
                 _ = (history / "promises.jsonl").write_text("\n".join(map(json.dumps, current_events)) + "\n")
                 with patch.object(plan_history, "now_epoch", return_value=now.timestamp()):
                     sample = phase_table.build_plan(running.plan)
-                rendered = unit_phases.table([unit("promises", None)], {"promises": sample}, pane_rows={},
+                rendered = unit_phases.table([unit("promises", None)], {"promises": sample}, census_read=LOCAL,
                                             now=now.timestamp(), zone=ZoneInfo("UTC"))
                 lines = rendered.split("\n\n")[0].splitlines()
                 headers = [cell.strip() for cell in lines[0].split("|")[1:-1]]
@@ -706,19 +732,58 @@ class UnitPhasesTests(unittest.TestCase):
                 self.assertIn("| promises | between phases", rendered)
 
     def test_workers_show_run_results_before_working_workers_and_count_idle_workers(self) -> None:
-        rows: list[dict[str, object]] = [
-            {"slot": "d", "state": "working"}, {"slot": "idle", "state": "idle"},
-            {"slot": "closed", "state": "closed"},
-            {"slot": "a", "state": "waiting on run", "run": {"label": "x", "started_at": 1000}},
-            {"slot": "b", "state": "result queued", "run": {"label": "y", "started_at": 900}},
-            {"slot": "c", "state": "run gone", "run": {"label": "z", "started_at": 800}},
+        parent = staff.StaffId("parent")
+        workers = [
+            census_worker("d", parent), census_worker("idle", parent, status="idle"),
+            census_worker("unread", parent, status=None), census_worker("held", parent, status="paused"),
+            census_worker("a", parent, status="idle", runs=[census.CensusRun("x", 1000, "running")]),
+            census_worker("b", parent, runs=[census.CensusRun("y", 900, "finished_queued")]),
+            census_worker("c", parent, runs=[census.CensusRun("z", 800, "missing")]),
         ]
-        cases: list[tuple[list[dict[str, object]], str]] = [(rows, "a waiting on run: x 1m · b result queued: y · c run gone: z · d working +1 idle"),
-                 ([{"slot": "idle", "state": "idle"}], "—"),
-                 ([{"slot": "closed", "state": "closed"}], "—"), ([], "—")]
+        cases: list[tuple[Sequence[census.CensusWorker] | census.CensusFailed, str]] = [
+            (workers, "a waiting on run: x 1m · b result queued: y · c run gone: z · d working +1 idle"),
+            ([census_worker("a", parent, runs=[census.CensusRun("w", None, "running")]),
+              census_worker("q", parent, activity="impl · waiting"), census_worker("s", parent, activity="starting"),
+              census_worker("t", parent, activity="impl · thinking"), census_worker("j", parent, activity="verify test")],
+             "a waiting on run: w · q waiting · s starting · t working · j working"),
+            ([census_worker("idle", parent, status="idle")], "—"),
+            ([census_worker("held", parent, status="paused")], "—"), ([], "—"),
+            (census.CensusFailed("census took longer than 10 s"), "—")]
         for sample, expected in cases:
             with self.subTest(expected=expected):
                 self.assertEqual(unit_phases.workers_cell(sample, now=1060), expected)
+
+    def test_status_comes_from_the_census_session_or_the_scanned_machines(self) -> None:
+        owner = fixture_member("showrunner", name="status-owner")
+        member = fixture_member("unit", name="listed", parent=owner.id,
+            worktree=staff.PresentWorktree(remote.local_machine(), self.root))
+        listed = unit("listed", live("listed"))
+        mac = listed._replace(machine="mac")
+        unrecorded = unit("unrecorded", live("unrecorded"))
+        failed = census.CensusFailed("census exited 2: bad config")
+        cases: list[tuple[census.Census | census.CensusFailed, live_units.LiveUnit, str]] = [
+            (tiles(sessions=[session_of(member, "busy")]), listed, "busy"),
+            (tiles(sessions=[session_of(member, "paused")]), mac, "paused"),
+            (tiles(sessions=[session_of(member, None)]), listed, "—"),
+            (tiles(sessions=[census.CensusSession("listed-id", "busy")]), listed, "exited"),
+            (tiles(sessions=[census.CensusSession("unrecorded-id", "idle")]), unrecorded, "idle"),
+            (LOCAL, unrecorded._replace(session=None), "exited"),
+            (LOCAL, listed, "exited"),
+            (LOCAL, listed._replace(machine=""), "exited"),
+            (LOCAL, mac, "—"),
+            (LOCAL._replace(machines=(census.CensusMachine("natedev", False),)), listed, "—"),
+            (failed, listed, "—")]
+        for read, selected, expected in cases:
+            with self.subTest(read=read, machine=selected.machine):
+                view = unit_phases.census_view(read)
+                self.assertEqual(unit_phases.census_status(view, selected), expected)
+        workers = [census_worker("first", member.id, phase="one"), census_worker("second", member.id),
+                   census_worker("other", staff.StaffId("other-unit"))]
+        view = unit_phases.census_view(tiles(workers=workers))
+        self.assertEqual(unit_phases.census_workers(view, member), tuple(workers[:2]))
+        self.assertEqual(unit_phases.census_workers(view, member, "one"), (workers[0],))
+        self.assertEqual(unit_phases.census_workers(view, member, "two"), ())
+        self.assertEqual(unit_phases.census_workers(unit_phases.census_view(failed), member, "one"), failed)
 
     def test_each_open_phase_has_its_work_eta_wait_and_recorded_workers(self) -> None:
         owner = fixture_member("showrunner", name="parallel-owner")
@@ -821,7 +886,9 @@ class UnitPhasesTests(unittest.TestCase):
                 with patch.object(plan_history, "now_epoch", return_value=now):
                     record = phase_table.build_plan(plan)
                 rendered = unit_phases.table([unit("parallel", live("parallel"))._replace(machine="mac")], {"parallel": record},
-                                            now=now, zone=ZoneInfo("UTC"), pane_rows={})
+                    now=now, zone=ZoneInfo("UTC"), census_read=tiles(sessions=[session_of(member, "idle")], workers=[
+                        census_worker("repair", member.id, phase="eight"),
+                        census_worker("verifier", member.id, phase="ten")]))
                 sections = rendered.split("\n\n")
                 rows: list[list[dict[str, str]]] = []
                 for section in (sections[0], sections[-1]):
@@ -899,7 +966,9 @@ class UnitPhasesTests(unittest.TestCase):
                     record = phase_table.build_plan(plan)
                 rendered = unit_phases.table([unit("parallel", live("parallel"))], {"parallel": record},
                     now=now, zone=ZoneInfo("UTC"),
-                    pane_rows={member.id: [{"slot": "pane-reader", "state": "working"}]})
+                    census_read=tiles(workers=[census_worker("pane-reader", member.id)] if between else [
+                        census_worker("verifier", member.id, phase="ten"),
+                        census_worker("writer", member.id, phase="ten")]))
                 sections = rendered.split("\n\n")
                 status_lines = sections[0].splitlines()
                 headers = [cell.strip() for cell in status_lines[0].split("|")[1:-1]]
@@ -913,52 +982,37 @@ class UnitPhasesTests(unittest.TestCase):
                 self.assertNotIn("side-worker", rendered)
                 self.assertNotIn("Phase 10 —", rendered)
 
-    def test_table_uses_staff_worker_rows_and_shares_detached_run_observations(self) -> None:
+    def test_table_shows_census_workers_with_their_runs(self) -> None:
         owner = fixture_member("showrunner", name="workers-owner")
         member = fixture_member("unit", name="workers", parent=owner.id,
             worktree=staff.PresentWorktree(remote.local_machine(), self.root))
-        worker = fixture_worker("reader", member.id)
         outside = fixture_member("unit", name="outside", parent=owner.id,
             worktree=staff.PresentWorktree(remote.local_machine(), self.root / "outside"))
-        _ = fixture_worker("outside-reader", outside.id)
-        requested: list[staff.StaffId] = []
-
-        def observe(parents: Sequence[staff.StaffRow], snapshot: staff.StaffSnapshot
-                    ) -> dict[staff.StaffId, list[worker_panes.WorkerPane]]:
-            requested.extend(parent.id for parent in parents)
-            self.assertEqual({row.id for row in snapshot.rows}, {member.id, worker.id})
-            return {parent.id: [worker_panes.OpenWorker(
-                worker, "reader-pane", "terminal", herdr.AgentStatus.IDLE)] for parent in parents}
-
         history = self.root / "history" / "runs"
         history.mkdir(parents=True)
         _ = (history / "active.jsonl").write_text(json.dumps({"event_type": "run_started",
             "owner_staff_id": str(member.id), "working_dir": str(self.root), "plan_doc": "missing.md",
             "run_started_at": 1000}) + "\n")
-        directory = self.root / "active" / DETACHED_RUNS_DIR
-        directory.mkdir(parents=True)
-        record: RunRecord = {"run_id": "check", "status": "running", "session_dir": str(directory.parent),
-            "worker": "old-slot", "staff_id": str(worker.id), "label": "Tests", "command": ["true"],
-            "log": str(directory / "check.log"), "started_at": 1000, "pid": 120,
-            "director_dir": "", "done_message_file": ""}
-        _ = (directory / "check.json").write_text(json.dumps(record))
+        active = self.root / "active"
+        active.mkdir()
+
+        def reader(label: str, started: float) -> census.Census:
+            return tiles(workers=[census_worker("reader", member.id, status="idle",
+                                                runs=[census.CensusRun(label, started, "running")]),
+                                  census_worker("outside-reader", outside.id)])
+
         names_config = self.root / "table-conf/names.toml"
         configured_names = names_config.read_text()
         load_names = display_names.load_names
         self.addCleanup(display_names.runtime_names.cache_clear)
-        pane_cases: list[tuple[dict[staff.StaffId, list[dict[str, object]]] | None, str]] = [
-            ({member.id: [{"slot": "reader", "state": "idle"}]}, "workers"), (None, "workers"),
-            ({member.id: [{"slot": "reader", "state": "idle"}]}, "progress")]
-        for panes, heading in pane_cases:
+        for heading in ("workers", "progress"):
             _ = names_config.write_text(configured_names.replace('workers = ["workers"]', f'workers = ["{heading}"]'))
             display_names.runtime_names.cache_clear()
-            with (self.subTest(injected=panes is not None, heading=heading),
+            with (self.subTest(heading=heading),
                   patch.object(display_names, "load_names", side_effect=lambda: load_names(names_config)),
-                  patch.object(unit_runs, "run_roots", return_value=(self.root,)),
-                  patch.object(worker_panes, "observe_parents", side_effect=observe)):
+                  patch.object(unit_runs, "run_roots", return_value=(self.root,))):
                 rendered = unit_phases.table([unit("workers", None)], {}, now=1060, zone=ZoneInfo("UTC"),
-                    snapshot=staff.snapshot(), pane_rows=panes,
-                    runs_reader=worker_runs.WorkerRuns(1060, process_reader=lambda: {120}))
+                    snapshot=staff.snapshot(), census_read=reader("Tests", 1000))
             self.assertEqual(rendered.splitlines()[2],
                 "| workers | exited | reader waiting on run: Tests 1m |")
             self.assertEqual(rendered.splitlines()[0], f"| Unit | Status | {heading.capitalize()} |")
@@ -968,7 +1022,6 @@ class UnitPhasesTests(unittest.TestCase):
                 "| workers |",
             ])
             self.assertNotIn("Progress:", rendered)
-        self.assertEqual(requested, [member.id])
         display_names.runtime_names.cache_clear()
 
         planned = typed_record(self.root / "plan.md", "running", *(["todo"] * 19))
@@ -976,23 +1029,19 @@ class UnitPhasesTests(unittest.TestCase):
         planned = planned._replace(phases=[*planned.phases[:-1], replace(planned.phases[-1],
             times=phase_table.PredictedPhaseTiming(start=planned.updated, finish=planned.updated + timedelta(hours=1)))])
         now = planned.updated.timestamp()
-        record["started_at"] = now - 60
         for label_size, other in ((60, False), (20, True)):
             with self.subTest(label_size=label_size, non_phase=other):
-                record["label"] = "Check " + "x" * label_size
-                _ = (directory / "check.json").write_text(json.dumps(record))
                 if other:
                     run = history / "active.jsonl"
                     _ = run.write_text(run.read_text() + event("phase_started", phase_id="outside",
                         phase_instance_id="outside") + "\n" + event("pass_started", phase_id="outside",
                         pass_instance_id="outside-pass", pass_kind="impl", pass_activity="other work") + "\n")
-                    _ = (directory.parent / unit_runs.STATE_FILE).write_text(json.dumps({"owner_staff_id": member.id}))
-                    _ = staff.set_run(member.id, staff.OpenRun(directory.parent))
+                    _ = (active / unit_runs.STATE_FILE).write_text(json.dumps({"owner_staff_id": member.id}))
+                    _ = staff.set_run(member.id, staff.OpenRun(active))
                 with patch.object(unit_runs, "run_roots", return_value=(self.root,)):
                     rendered = unit_phases.table([unit("workers", None)], {"workers": planned}, now=now,
                         zone=ZoneInfo("UTC"), snapshot=staff.snapshot(),
-                        pane_rows={member.id: [{"slot": "reader", "state": "idle"}]},
-                        runs_reader=worker_runs.WorkerRuns(now, process_reader=lambda: {120}))
+                        census_read=reader("Check " + "x" * label_size, now - 60))
                 values: dict[str, str] = {}
                 for section in (rendered.split("\n\n")[0], rendered.split("\n\n")[-1]):
                     headers = [cell.strip() for cell in section.splitlines()[0].split("|")[1:-1]]
@@ -1111,7 +1160,7 @@ class UnitPhasesTests(unittest.TestCase):
                     newest.unlink()
                 with (patch.object(plan_history, "read_run_events", wraps=plan_history.read_run_events) as reads,
                       patch.object(plan_history, "now_epoch", return_value=now)):
-                    rendered = unit_phases.table([unit("fallback", None)], records, pane_rows={},
+                    rendered = unit_phases.table([unit("fallback", None)], records, census_read=LOCAL,
                                                 now=now, zone=ZoneInfo("UTC"))
                 values: dict[str, str] = {}
                 for section in (rendered.split("\n\n")[0], rendered.split("\n\n")[-1]):
@@ -1147,11 +1196,11 @@ class UnitPhasesTests(unittest.TestCase):
                 separator = " --- |" if machine == "mac" else ""
                 first_machine = " natedev |" if machine == "mac" else ""
                 second_machine = " mac |" if machine == "mac" else ""
-                self.assertEqual(unit_phases.table(units, records), "\n".join([
+                self.assertEqual(table_of(units, records), "\n".join([
                     f"| Unit | Status |{column} Progress | Phase | ETA Next |",
                     f"| --- | --- |{separator} --- | --- | --- |",
                     f"| one | idle |{first_machine} 🟨⬜ | 0/2 | no ETA stated |",
-                    f"| two | exited |{second_machine} — | — | — |",
+                    f"| two | {'—' if machine == 'mac' else 'exited'} |{second_machine} — | — | — |",
                     "",
                     legend,
                     "",
@@ -1165,28 +1214,28 @@ class UnitPhasesTests(unittest.TestCase):
         configured = config.read_text()
         _ = config.write_text(configured.replace("kind.natedev=local", "kind.natedev=ssh\nkind.fixture-home=local"))
         selected = unit("one", live("a|b"))._replace(machine="fixture-home")
-        self.assertEqual(unit_phases.table([selected], records).splitlines()[0],
+        self.assertEqual(table_of([selected], records).splitlines()[0],
                          "| Unit | Status | Progress | Phase | ETA Next |")
         _ = config.write_text(configured)
 
         records = {"one": typed_record(self.root / "plan.md", "todo")}
         self.assertIn("| one | idle | ⬜ | 0/1 |",
-                      unit_phases.table([unit("one", live("a|b"))], records))
+                      table_of([unit("one", live("a|b"))], records))
         self.assertIn("| one | not started | plan: phase 1: Delivery 1 |",
-                      unit_phases.table([unit("one", live("a|b"))], records))
+                      table_of([unit("one", live("a|b"))], records))
         for sample, expected in ((typed_record(self.root / "plan.md", "done"),
                                  "| Unit | Status | Progress | Phase |"),
                                 (typed_record(self.root / "plan.md"), "| Unit | Status |"),
                                 (None, "| Unit | Status |")):
             with self.subTest(finished_or_absent=sample):
-                rendered = unit_phases.table([unit("one", live("a|b"))], {"one": sample})
+                rendered = table_of([unit("one", live("a|b"))], {"one": sample})
                 self.assertEqual(rendered.splitlines()[0], expected)
                 if "| Progress |" in expected:
                     self.assertIn("\n\n" + legend + "\n\n| Unit | Notes |\n", rendered)
                 else:
                     self.assertNotIn("Progress:", rendered)
                 self.assertEqual(rendered.count("| Unit |"), 2)
-        self.assertNotIn("Progress:", unit_phases.table([], {}))
+        self.assertNotIn("Progress:", table_of([], {}))
 
     def test_plain_table_reads_live_activity_and_staff_holds_even_when_gone(self) -> None:
         owner = fixture_member("showrunner", name="table-owner")
@@ -1207,7 +1256,7 @@ class UnitPhasesTests(unittest.TestCase):
                   patch.object(sessions, "running_sessions", return_value=[sessions.SessionRecord(
                       sessionId=first.current_session, pid=1, name="first", status="idle",
                       messagingSocketPath="", updatedAt=1, tmux="", formerNames=[])])):
-                return unit_phases.table(live_units.units_in(owner.name, every), {})
+                return table_of(live_units.units_in(owner.name, every), {})
 
         initial = render()
         self.assertIn("| Unit | Status |", initial)
@@ -1240,7 +1289,6 @@ class UnitPhasesTests(unittest.TestCase):
                       patch.object(session_state, "classify", wraps=session_state.classify) as states):
                     units = live_units.units_in(owner.name, every)
                     self.assertEqual(units[0].status, expected)
-                    self.assertIn(f"| first | {expected} |", unit_phases.table(units, {}, snapshot=snapshot, pane_rows={}))
                     staff_read.assert_called_once_with()
                     self.assertEqual(states.call_count, len(units))
         _ = staff.resume(first.id)
@@ -1267,7 +1315,8 @@ class UnitPhasesTests(unittest.TestCase):
                     units = live_units.units_in(owner.name, listing)
                     self.assertEqual(units[0].status, expected)
                     self.assertEqual(units[0].machine, machine)
-                    output = unit_phases.table(units, {}, snapshot=snapshot, pane_rows={})
+                    output = unit_phases.table(units, {}, snapshot=snapshot,
+                                               census_read=tiles(sessions=[session_of(member, expected)]))
                     if machine == "mac":
                         self.assertIn("| Unit | Status | Machine |", output)
                         self.assertIn(f"| first | {expected} | mac |", output)
@@ -1364,6 +1413,28 @@ class UnitPhasesTests(unittest.TestCase):
         sender.assert_not_called()
         self.assertEqual(staff.by_id(member.id), member)
 
+    def test_census_failure_shows_no_status_or_workers_and_one_anomaly(self) -> None:
+        doc = self.root / "production.md"
+        _ = doc.write_text(f"# Production\n- **Merge branch:** main\n- **Showrunner checkout:** {self.root}\n- **Log:** log.md\n")
+        owner = fixture_member("showrunner", name="failed-owner", doc=staff.LiveDoc("natedev", doc))
+        _ = fixture_member("unit", name="member", parent=owner.id)
+        from scripts.production import session_staff
+
+        output = io.StringIO()
+        sender = Mock(return_value=subprocess.CompletedProcess(["send.py"], 0, "", ""))
+        with (patch.object(unit_lookup, "observed_session_labels", return_value=()),
+              patch.object(unit_lookup, "member_sources", return_value=session_staff.MemberSources(())),
+              patch.object(unit_phases, "production_records", return_value={}),
+              patch.object(census, "read", return_value=census.CensusFailed("census took longer than 10 s")),
+              patch.object(unit_phases, "subprocess", SimpleNamespace(run=sender)), contextlib.redirect_stdout(output)):
+            result = unit_phases.main(["--production", owner.name])
+        self.assertEqual(result, 0)
+        lines = output.getvalue().splitlines()
+        self.assertEqual(lines[:3], ["| Unit |", "| --- |", "| member |"])
+        self.assertEqual([line for line in lines if line.startswith("anomaly:")],
+                         ["anomaly: census took longer than 10 s"])
+        sender.assert_called_once()
+
     def production_document(self, doc: Path) -> None:
         _ = doc.write_text(doc.read_text() + f"\n- **Merge branch:** main\n"
                            + f"- **Showrunner checkout:** {self.root}\n- **Log:** log.md\n")
@@ -1385,12 +1456,14 @@ class UnitPhasesTests(unittest.TestCase):
             calls.append("records")
             return {}
 
-        def render(_units: list[live_units.LiveUnit], _records: dict[str, object], *, zone: ZoneInfo, columns: int | None) -> str:
+        def render(_units: list[live_units.LiveUnit], _records: dict[str, object], *, zone: ZoneInfo,
+                   census_read: census.Census | census.CensusFailed, columns: int | None) -> str:
             self.assertIs(plan_history.run_started_event, headers)
             self.assertIs(plan_history.resolve_plan_path, paths)
             self.assertIs(plan_history.plan_runs, scans)
             self.assertIsInstance(zone, ZoneInfo)
             self.assertIsNone(columns)
+            self.assertIs(census_read, LOCAL)
             calls.append("table")
             return "phase table"
 
@@ -1473,6 +1546,7 @@ class UnitPhasesTests(unittest.TestCase):
         with (patch.dict("os.environ", {"CLAUDE_CODE_SESSION_ID": "caller"}),
               patch.object(showrunners, "own_name", return_value="show") as found,
               patch.object(live_units, "read_units", return_value=live_units.UnitListing([unit("a", live("a"))], ())),
+              patch.object(census, "read", return_value=census_for([unit("a", live("a"))])),
               patch.object(unit_phases, "production_records", return_value={}),
               contextlib.redirect_stdout(out)):
             self.assertEqual(unit_phases.main([]), 0)
@@ -1547,7 +1621,8 @@ class UnitPhasesTests(unittest.TestCase):
               patch.object(style_units, "table", return_value="ticket table") as tickets,
               contextlib.redirect_stdout(output)):
             self.assertEqual(unit_phases.main(["--production", "show"]), 0)
-        phases.assert_called_once_with([product_unit], {}, zone=read_production("show").zone, columns=None)
+        phases.assert_called_once_with([product_unit], {}, zone=read_production("show").zone,
+                                                 census_read=LOCAL, columns=None)
         tickets.assert_called_once_with([style_unit], {}, doc=doc, ledger_paths={})
         self.assertEqual(doc.read_bytes(), before)
         self.assertEqual(output.getvalue(), "product table\n\nticket table\n")
@@ -1563,6 +1638,7 @@ class UnitPhasesTests(unittest.TestCase):
                 units = [unit("a", live("a"))]
                 output = io.StringIO()
                 with (patch.object(live_units, "read_units", return_value=live_units.UnitListing(units, ())),
+                      patch.object(census, "read", return_value=census_for(units)),
                       patch.object(unit_phases, "production_records", return_value={}),
                       patch.object(style_units, "table") as tickets, contextlib.redirect_stdout(output)):
                     self.assertEqual(unit_phases.main(["--production", "show"]), 0)
@@ -1582,9 +1658,9 @@ class UnitPhasesTests(unittest.TestCase):
                 self.assertEqual(output.getvalue().splitlines(), [
                     "| Unit | Status | Machine |",
                     "| --- | --- | --- |",
-                    "| alpha | idle | natedev |",
-                    "| Beta | idle | mac |",
-                    "| zulu | idle | natedev |",
+                    "| alpha | exited | natedev |",
+                    "| Beta | — | mac |",
+                    "| zulu | exited | natedev |",
                     "",
                     "| Unit |",
                     "| --- |",
