@@ -3893,3 +3893,26 @@ Checkpoint 2cfdd87f1. Changed `scripts/message/test_notifier.py` (launcher stubs
 - `refresh_remotes` deletes the stale `refs/remotes/<remote>/HEAD` refs in one `update-ref --no-deref --stdin` call before the fetch. It still reads two ref lists, one for each repository.
 - AWS pair (c7a.8xlarge, 3 rounds): `copies/test_copies.py` 26.56 -> 24.83 CPU s; `style/test_crate_run.py` 55.97 -> 55.26; `production/test_fast_track.py` 57.56 -> 56.93.
 - Commit b1c950141. Production change with the sdlc go; the land runs the full gate.
+
+### Phase 265 — copies.py reads the main checkout with one git call  · status: done
+**Depends on:** Phase 264
+**Owner:** sdlc asked for this cut 2026-11-13, after phase 264 ("measure them before the lazy-import cuts").
+
+#### Work Order
+
+**Goal:** `main_checkout` reads a non-bare work tree with one `git rev-parse` call, not two.
+
+**Spec:**
+- Add `--show-cdup` to the first `rev-parse` call in `main_checkout`.
+- In a work tree, `--show-cdup` prints the path from `source` to the top. Return `(source / cdup).resolve()`.
+- With no cdup line (inside `.git`), keep the `--show-toplevel` call, so the old error still raises.
+- Bare, linked and separate-metadata repositories keep their current path.
+
+**Files:** `scripts/copies/copies.py` (`main_checkout`).
+
+**Workers:** director only (no-worker mode).
+
+**Acceptance gate:**
+- Old and new `main_checkout` give the same result for: top, subfolder, symlink path, linked worktree, bare, separate metadata, the metadata folder and `.git`.
+- Local: the five copies modules, `style/test_crate_run.py` and `production/test_fast_track.py` pass.
+- AWS pair on `copies/test_copies.py`, `style/test_crate_run.py` and `production/test_fast_track.py`. Every behavior check stays.

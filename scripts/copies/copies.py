@@ -489,9 +489,12 @@ def origin_url(source: Path) -> str | None:
 
 def main_checkout(source: Path) -> Path:
     """Read the main checkout, including repositories with separate Git metadata."""
-    common, current, bare = git(source, "rev-parse", "--path-format=absolute",
-                                "--git-common-dir", "--git-dir", "--is-bare-repository").decode().splitlines()
+    # --show-cdup prints a line only inside a work tree: the path from source to its top.
+    common, current, bare, *cdup = git(source, "rev-parse", "--path-format=absolute", "--git-common-dir",
+                                       "--git-dir", "--is-bare-repository", "--show-cdup").decode().splitlines()
     if common == current and bare == "false":
+        if cdup:
+            return (source / cdup[0]).resolve()
         return Path(git(source, "rev-parse", "--show-toplevel").decode().strip())
     first = git(source, "worktree", "list", "--porcelain").decode().splitlines()[0]
     checkout = Path(first.removeprefix("worktree "))
