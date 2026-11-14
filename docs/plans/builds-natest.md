@@ -592,13 +592,13 @@ The feedback: verify's Phase 41 cut `test_verify_mac_arguments.py` from 56.0 to 
 #### As-built
 
 - `build_targets.py platform` answers from `target_config` before any coordination import (`targets`, `build_hold`, the admission service, `roster`, `memory_admit`, `offload`). One start takes 0.094 s in place of 1.05 s, and `verify.sh` `target_platform` pays the lower cost on each call. The other commands import the coordination modules as before, and every module-level name that tests import from `build_targets` stays.
-- `target_config.require_target_name(target)` holds the SSH target name check. `ssh_target_state_directory` and `configured_ssh_target` call it, and `offload.configured_ssh_target` delegates to `target_config`. The "unknown SSH target" message and its precedence are unchanged.
+- `target_config.require_target_name(target)` holds the SSH target name check. `ssh_target_state_directory` and `configured_ssh_target` call it, and `eligibility.configured_ssh_target` delegates to `target_config`. The "unknown SSH target" message and its precedence are unchanged.
 - Same-load pairs: the module drops from 117.6 s to 81.6 s (-31%). The floor is the Python start-up of `eligible` (24 runs) and `reserve` (11 runs). Both import `build_hold`, which imports `admission_service` and `memory_admit` at once (`build_hold.py:40-46`); `build_targets.py` and `targets.py:21` import `build_hold` directly.
 
 **Files:**
 - `scripts/build_targets/build_targets.py` — the light `platform` route before the coordination imports
 - `scripts/build_targets/target_config.py` — `require_target_name`, `configured_ssh_target`
-- `scripts/mac_test/offload.py` — `configured_ssh_target` delegates to `target_config`
+- `scripts/mac_test/eligibility.py` — `configured_ssh_target` delegates to `target_config`
 
 **Gotchas:**
 - A cut at `sweep.py` alone does not remove `memory_admit` from `eligible`, `reserve`, `register-local`, `wait-local` or `check-local`; the cut is the module-level `admission_service` import in `build_hold.py` (owner resources; queue-unit takes it after the `build_hold.py` freeze, measured 9.6 s here).

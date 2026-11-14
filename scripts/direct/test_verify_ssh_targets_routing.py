@@ -191,15 +191,15 @@ printf 'free_gib=1000\\nhost=test-mac\\nrc=0\\n'
                 self.assertEqual(self.attempts()[-1]["reason"], reason)
 
     def test_pinned_toolchain_mismatch_records_a_repository_decline(self) -> None:
-        from scripts.mac_test import offload
+        from scripts.mac_test import eligibility, offload
 
         self.configure("natedev,linux")
         state = self.target_state("linux")
         _ = (state / "box-tools.json").write_text(json.dumps({"versions": {"rustc": "rustc other"}}))
         reason = ("linux version mismatch: rustc box=rustc other natedev=rustc fixture; "
                   "move the box pins in nixos hosts/linux-build.nix")
-        with mock.patch.object(offload, "state_directory", return_value=state):
-            path = offload.linux_version_decline_path("linux", self.root.name)
+        with mock.patch.object(eligibility, "state_directory", return_value=state):
+            path = eligibility.linux_version_decline_path("linux", self.root.name)
             self.assertFalse(path.exists())
             result = self.verify("test", "sample", "--target", "linux")
             self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
