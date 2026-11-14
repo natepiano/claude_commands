@@ -17,16 +17,20 @@ class StepNames:
     def prose(self, step: str) -> str:
         return self.settings.get(f"prose.{step}", self.shown(step))
 
-    def for_owner(self, step: str, unit: str, role: OwnerRole) -> str:
+    def for_owner(self, step: str, unit: str, role: OwnerRole, *,
+                  ci: bool = False, current_name: str = "") -> str:
         """Use the configured owner template when the owner is known."""
-        if role is OwnerRole.SHOWRUNNER:
-            key = f"owned.showrunner-{step}"
+        fallback = current_name or self.shown(step)
+        if ci:
+            prefix = "owned.ci-"
+        elif role is OwnerRole.SHOWRUNNER:
+            prefix = "owned.showrunner-"
         elif role is OwnerRole.UNIT and unit:
-            key = f"owned.{step}"
+            prefix = "owned."
         else:
-            return self.shown(step)
-        template = self.settings.get(key)
-        return template.format(unit=unit) if template is not None else self.shown(step)
+            return fallback
+        template = self.settings.get(prefix + step, self.settings.get(prefix + "default"))
+        return template.format(unit=unit, step=self.shown(step)) if template is not None else fallback
 
 
 # Show each step as the queue records it, for a caller that reads no configuration.

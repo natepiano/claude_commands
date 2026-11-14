@@ -3,6 +3,7 @@
 // Add --queued as the fourth argument for the queued-section comparison.
 // Add --console as the fourth argument for the Builds title comparison.
 // Add --step-names as the fourth argument for owner-based step names.
+// Add --owners as the fourth argument for machine owners and table spacing.
 import assert from 'node:assert/strict';
 import {readFile, writeFile, mkdtemp, rm, mkdir} from 'node:fs/promises';
 import {createServer} from 'node:http';
@@ -27,6 +28,7 @@ try {
   const queuedComparison = process.argv[4] === '--queued';
   const consoleComparison = process.argv[4] === '--console';
   const stepNamesComparison = process.argv[4] === '--step-names';
+  const ownersComparison = process.argv[4] === '--owners';
   const readings = JSON.parse(await readFile(join(folder, 'fixtures.json'), 'utf8'));
   const now = Date.now() / 1000;
   for (const reading of Object.values(readings)) {
@@ -303,9 +305,9 @@ try {
               };
               return metrics;
             })()`);
-            assert.deepEqual(proof.headings, ['Stage','Done','Step','Duration','Unit','Pid','Machine','vCPU']);
+            assert.deepEqual(proof.headings, ['Stage','Done','Step','Dur','Unit','Pid','Target','vCPU']);
             assert.equal(proof.answer,'Next step room');
-            assert.deepEqual(proof.queueHeaders,['#','Done','Step','Waiting','Unit','Pid','Machine','vCPU']);
+            assert.deepEqual(proof.queueHeaders,['#','Done','Step','Waiting','Unit','Pid','Target','vCPU']);
             assert.equal(proof.queueHeaderHeight,proof.queueSpacerHeight);
             assert.ok(proof.stages.includes('testing'));
             assert.ok(proof.stages.every(stage => ['building','testing','—'].includes(stage)));
@@ -517,7 +519,7 @@ try {
                 slots:tipText('wait:'+latest.waiters.findIndex(row=>row.head_text),latest).join(' '),
                 scroll:document.documentElement.scrollWidth,client:document.documentElement.clientWidth};
             })()`);
-            assert.deepEqual(cloudProof.headings,['Stage','Done','Step','Duration','Unit','Pid','Machine','vCPU']);
+            assert.deepEqual(cloudProof.headings,['Stage','Done','Step','Dur','Unit','Pid','Target','vCPU']);
             assert.ok(cloudProof.statusInTable,'Cloud work is absent from the main table.');
             assert.equal(cloudProof.machine,'aws');
             assert.equal(cloudProof.vcpus,'32');
@@ -656,7 +658,7 @@ try {
             const macLabels=await evaluate(`latest.walk.map((row,index)=>({row,index})).filter(({row})=>row.kind==='mac-build').map(({index})=>({
               repository:document.querySelector('.wrow[data-run="'+index+'"] .owner').textContent,
               jobs:document.querySelector('tr[data-tip="row:'+index+'"] .vcpus').textContent}))`);
-            assert.deepEqual(macLabels.map(row=>row.repository),['hana','hana','cargo-liner']);
+            assert.deepEqual(macLabels.map(row=>row.repository),['','hana','']);
             assert.deepEqual(macLabels.map(row=>row.jobs),['—','12','6']);
             for(const row of macProof) {
               assert.equal(row.stage,'building');
@@ -817,6 +819,7 @@ try {
           assert.ok(!states[name].stale && !states[name].unavailable);
         }
         const capture = async (name, selector) => {
+          await evaluate(`document.querySelector(${JSON.stringify(selector)}).scrollIntoView({block:'center'})`);
           const clip=await evaluate(`(() => {
             const r=document.querySelector(${JSON.stringify(selector)}).getBoundingClientRect();
             return {x:Math.max(0,r.left+scrollX),y:r.top+scrollY,width:r.width,height:r.height,scale:1};
@@ -825,6 +828,115 @@ try {
           await writeFile(join(folder,`${name}.png`),Buffer.from(shot.data,'base64'));
         };
         const comparisons = [];
+        if (ownersComparison) {
+          assert.ok(beforePage, 'The owner comparison needs the previous page.');
+          await call('Emulation.setEmulatedMedia', {features:[{name:'prefers-color-scheme',value:'dark'}]});
+          await call('Emulation.setDeviceMetricsOverride', {width:1600,height:1200,deviceScaleFactor:1,mobile:false});
+          for (const version of ['before','after']) {
+            await navigate(version==='before' ? 'before.html' : 'memory_live.html');
+            const reading=structuredClone(readings.step_ci);
+            const mac=reading.walk.find(row=>row.kind==='mac-build');
+            if(version==='before') {
+              mac.name='hana nextest';mac.unit='—';mac.showrunner='—';delete mac.ci_label;
+              for(const row of [...reading.walk,...reading.waiters]) if(row.kind==='cloud') row.name='nextest';
+            }
+            await show(reading);
+            const state=await evaluate(`(() => {
+              const index=latest.walk.findIndex(row=>row.kind==='mac-build');
+              const chart=document.querySelector('.wrow[data-run="'+index+'"]');
+              const headers=[...document.querySelectorAll('.walk-table thead th')].map(cell=>cell.textContent);
+              const waiting=[...document.querySelectorAll('.walk-table tr.queue-head th')].map(cell=>cell.textContent);
+              const spacings=[...document.querySelectorAll('.walk-table thead th,.walk-table tr.queue-head th')]
+                .filter(cell=>getComputedStyle(cell).display!=='none' && cell.nextElementSibling)
+                .map(cell=>parseFloat(getComputedStyle(cell).paddingRight));
+              const table=document.querySelector('tr[data-tip="row:'+index+'"]');
+              return {index,name:chart.querySelector('.name').textContent,small:chart.querySelector('.owner').textContent,
+                unit:table.querySelector('.unit').textContent,
+                waitingUnit:document.querySelector('tr[data-tip="wait:0"] .unit').textContent,
+                headers,waiting,spacings,scroll:document.documentElement.scrollWidth,client:innerWidth,
+                tip:tooltipHtml('row:'+index,latest)};
+            })()`);
+            if(version==='after') {
+              assert.equal(state.name,'CI nextest');
+              assert.equal(state.unit,'CI');
+              assert.equal(state.waitingUnit,'CI');
+              assert.match(state.small,/hana CI.*hana-mac-1.*test-hana/);
+              assert.deepEqual(state.headers,['Stage','Done','Step','Dur','Unit','Pid','Target','vCPU']);
+              assert.deepEqual(state.waiting,['#','Done','Step','Waiting','Unit','Pid','Target','vCPU']);
+              assert.ok(state.spacings.every(gap=>gap===12), JSON.stringify(state.spacings));
+              assert.ok(state.tip.includes('CI') && state.tip.includes('hana-mac-1'));
+              assert.ok(state.scroll<=state.client, 'The owner table overflows.');
+            }
+            await capture(version+'-running-queued','#walk');
+            await capture(version+'-table-columns','.walk-table');
+            await capture(version+'-mac-ci','.wrow[data-run="'+state.index+'"]');
+            await evaluate(`showTip('row:'+${state.index},700,420)`);
+            if(version==='after') {
+              const ciTip=await evaluate(`document.querySelector('#tip').textContent`);
+              assert.match(ciTip,/hana CI/);
+            }
+            await capture(version+'-mac-ci-tooltip','#tip');
+            const owners=structuredClone(readings.step_owners);
+            if(version==='before') owners.walk.find(row=>row.kind==='mac-build').name='hana nextest';
+            await show(owners);
+            const key=await evaluate(`'row:'+latest.walk.findIndex(row=>row.kind==='mac-build')`);
+            await evaluate(`showTip(${JSON.stringify(key)},700,420)`);
+            if(version==='after') {
+              const tips=await evaluate(`[...latest.walk.map((row,index)=>'row:'+index),...latest.waiters.map((row,index)=>'wait:'+index)].map(key=>tooltipHtml(key,latest))`);
+              for(const tip of tips) {
+                assert.match(tip,/Showrunner/);assert.match(tip,/hana/);
+                assert.match(tip,/Unit/);assert.match(tip,/research/);
+              }
+              const allTips=await evaluate(`(() => {
+                const keys=[...new Set([...document.querySelectorAll('[data-tip]')].map(node=>node.dataset.tip))];
+                return keys.map(key=>({key,html:tooltipHtml(key,latest)}));
+              })()`);
+              for(const tip of allTips) assert.ok(/Showrunner/.test(tip.html) && /Unit/.test(tip.html) || /CI/.test(tip.html), tip.key);
+              const nativeTips=await evaluate(`[...document.querySelectorAll('[title],svg title')].map(node=>node.localName==='title'?node.textContent:node.getAttribute('title'))`);
+              assert.ok(nativeTips.length>0);
+              for(const tip of nativeTips) {assert.match(tip,/Showrunner/);assert.match(tip,/Unit/);}
+              const swap=await evaluate(`tooltipHtml('swap:'+latest.swap_by.findIndex(row=>row.unit==='research'),latest)`);
+              assert.match(swap,/hana/);assert.match(swap,/research/);
+            }
+            await capture(version+'-owner-tooltip','#tip');
+            comparisons.push({version,...state});
+          }
+          for(const width of [600,800,1200,1600]) {
+            await call('Emulation.setDeviceMetricsOverride',{width,height:1200,deviceScaleFactor:1,mobile:false});
+            await show(readings.step_unknown);
+            const unitCells=await evaluate(`(() => {
+              const cells=[...document.querySelectorAll('.walk-table .unit .cell-text')].filter(cell=>cell.textContent==='owner not recorded');
+              return cells.map(cell=>({text:cell.textContent,scroll:cell.scrollWidth,width:cell.clientWidth}));
+            })()`);
+            assert.ok(unitCells.length>0);
+            for(const cell of unitCells) assert.ok(cell.scroll<=cell.width, 'The Unit cell cuts its text. '+JSON.stringify({width,cell}));
+          }
+          await call('Emulation.setDeviceMetricsOverride',{width:600,height:1200,deviceScaleFactor:1,mobile:false});
+          await show(readings.step_ci);
+          await capture('after-narrow-owner-ci','#walk');
+          const live=await readFile(join(folder,'live-mac-ci.json'),'utf8').then(JSON.parse).catch(error=>{
+            if(error.code==='ENOENT') return {row:null};
+            throw error;
+          });
+          if(live.row) {
+            const reading=structuredClone(readings.step_ci);
+            reading.walk=[live.row];reading.waiters=[];
+            await call('Emulation.setDeviceMetricsOverride',{width:1600,height:1200,deviceScaleFactor:1,mobile:false});
+            await show(reading);
+            const displayed=await evaluate(`({pid:latest.walk[0].pid,
+              name:document.querySelector('.wrow[data-run="0"] .name').textContent,
+              small:document.querySelector('.wrow[data-run="0"] .owner').textContent,
+              unit:document.querySelector('tr[data-tip="row:0"] .unit').textContent,
+              tooltip:tooltipHtml('row:0',latest)})`);
+            assert.match(displayed.name,/^CI /);assert.match(displayed.small,/hana CI/);
+            assert.equal(displayed.unit,'CI');assert.match(displayed.tooltip,/hana CI/);
+            await writeFile(join(folder,'live-mac-ci-page.json'),JSON.stringify(displayed,null,2));
+            await capture('live-mac-ci','#walk');
+            await evaluate(`showTip('row:0',700,420)`);
+            await capture('live-mac-ci-tooltip','#tip');
+            console.log('LIVE_MAC_CI:',JSON.stringify(displayed));
+          }
+        }
         if (stepNamesComparison) {
           await call('Emulation.setEmulatedMedia', {features:[{name:'prefers-color-scheme',value:'dark'}]});
           await call('Emulation.setDeviceMetricsOverride', {width:1400,height:1200,deviceScaleFactor:1,mobile:false});
@@ -925,7 +1037,9 @@ try {
                     }),beside:walk.classList.contains('beside')};
                 })()`);
                 assert.equal(state.title,title);
-                assert.equal(state.hover,title);
+                assert.ok(state.hover.startsWith(title+'\n'));
+                assert.match(state.hover,/Showrunner:/);
+                assert.match(state.hover,/Unit:/);
                 assert.equal(state.font,state.runningFont);
                 assert.equal(state.headerHeight,30);
                 assert.equal(state.nextGap,0);
@@ -973,7 +1087,7 @@ try {
             }
           }
         }
-        if (beforePage && !queuedComparison && !consoleComparison) {
+        if (beforePage && !queuedComparison && !consoleComparison && !ownersComparison) {
           const review = structuredClone(readings.spacing);
           review.priority_text = "queue priority: port (the user's bump)";
           review.head_text = 'Head: free 8.5 GiB; reserve 3.0 GiB; need 1.9 GiB · cloud 2 of 9 slots';
@@ -988,7 +1102,8 @@ try {
             started_at:now-60,unit:'hana CI',machine:'natedev',pid:701,vcpus:32,
             progress:{kind:'NoProgress',reason:'no counter'},ci_runners:[{state:'busy',job:'doctests'}]};
           review.walk = [local, mac, aws, ci];
-          review.waiters = [{...review.waiters[0],name:'hana CI doctests',unit:'hana CI',detail:'hana CI',reason:'free memory',
+          review.waiters = [{...review.waiters[0],name:'CI doctests',unit:'',showrunner:'',
+            ci_label:'hana CI · fixture-runner · doctests',detail:'',reason:'free memory',
             head_text:review.head_text,priority_text:review.priority_text}];
           review.ci_ram = 0.125;
           review.taken = review.used + review.ci_ram + review.reserved;
@@ -1025,7 +1140,7 @@ try {
                 assert.deepEqual(comparison.machineColors,['natedev','mac','aws'].map(machine=>rgb(review.colors[theme].machines[machine])));
                 assert.equal(new Set(comparison.machineColors).size,3);
                 assert.equal(comparison.ciVisible,false);
-                assert.equal(comparison.waiting,'hana CI');
+                assert.equal(comparison.waiting,'CI');
                 assert.equal(comparison.pageOverflow,false);
               } else {
                 assert.equal(comparison.ciVisible,true);

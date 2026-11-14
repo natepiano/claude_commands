@@ -1355,14 +1355,17 @@ From builds (not the user), 2026-11-13, urgent: phase 69 broke the Mac reading a
 3. No folder rule and no config key: the phase 69 ancestry rule alone marks the CI row as CI. From builds (not the user), 2026-11-13.
 4. Landed alone as 4c434349d, on main as f3e703de9, ahead of the phase 70 repair. The live Mac reading has the CI row and no error.
 
-### Phase 71 — Every row names its unit and showrunner · status: todo
+### Phase 71 — Every row names its unit and showrunner · status: done
 
-From the user (via builds), 2026-11-13: "it's working but i can't tell who is the showrunner for hana nextest running on the mac - it needs to show the showrunner in small text underneath and it should show the {unit} {step} above - if it is a showrunner run thing then it should say showrunner nextest and still show the name of the showrunner before it. the showrunner and the unit should be on every hoverable tooltip so i don't have to guess". Screenshot: /tmp/claude/scratch/user-shot-mac-showrunner-names.png. <!-- allow-banned: user quote --> From builds (not the user), 2026-11-13: items 1-5.
+From the user (via builds), 2026-11-13, with screenshots /tmp/claude/scratch/user-shot-mac-showrunner-names.png, user-shot-done-duration-gap.png and user-shot-mac-ci-unattributed.png: show the unit and step on top and the showrunner in small text under it, name both in every tooltip, make the column gaps equal, and rename Machine to Target and Duration to Dur. From builds (not the user): the item list and the Mac CI case.
 
-1. Every row on every machine (natedev, Mac, AWS), Running and Queued, has the top line "{unit} {step}". A showrunner run reads "showrunner {step}".
-2. The small text under it is the showrunner name, for example "hana".
-3. A CI row has no unit or showrunner: the top line is "CI {step}", and the small text is the current ci_label (hana CI · runner · job).
-4. Every hover tooltip on the page names the showrunner and the unit, or CI.
-5. Proof: before and after shots of the Mac CI row (pid 90082 in the shot) and one tooltip.
-6. From the user (via builds), 2026-11-13: "space between columns Done and Duration should be consistent - there is too much space between these two column headers that could be used". Screenshot: /tmp/claude/scratch/user-shot-done-duration-gap.png. From builds (not the user): every column gap in the Running and Queued tables has the same width, the Waiting header included. The freed space goes to the Unit column, so "owner not recorded" shows in full. Proof: before and after shots of both tables.
-7. From the user (via builds), 2026-11-13: "rename Machine column header to Target - rename Duration to Dur - this should give a couple of chars back in many circumstances". From builds (not the user): rename both headers in the Running and Queued tables and anywhere else the page uses them. The freed space goes to Unit.
+#### As-built
+
+- New `owned.*` keys in `config/build_steps.conf`: `owned.default={unit} {step}`, `owned.showrunner-default=showrunner {step}` and `owned.ci-default=CI {step}`. `StepNames.for_owner` reads them through the one phase 70 naming path. An unknown owner keeps its current name.
+- Every Running and Queued row on natedev, the Mac and AWS uses these names. The small text is the showrunner name, or the CI label for a CI row.
+- A CI row's Unit cell reads "CI" (director decision). A missing CI field (runner, job) is left out, so a live Mac CI row reads "hana CI": the Mac script cannot read the runner environment (director decision).
+- Every tooltip, swap tooltips included, names the showrunner and the unit, or CI. The custom and native tooltips share one owner field list.
+- Column gaps are equal in both tables. The headers read Target and Dur, and the freed space goes to Unit.
+- Proof: before and after shots of both tables, a Mac CI row and its tooltip, an owner tooltip and a 600px view. A live read rendered Mac CI pid 69040 as "CI nextest" over "hana CI".
+
+**Files:** `config/build_steps.conf`; `scripts/lib/build_steps.py`; `scripts/build_queue/memory_feed.py`, `memory_live.html`, `memory_page_proof.mjs`, `queue_view.py`, `test_memory_feed.py`, `test_queue_view.py`.
