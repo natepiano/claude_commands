@@ -3862,18 +3862,10 @@ Checkpoint 2cfdd87f1. Changed `scripts/message/test_notifier.py` (launcher stubs
 **Depends on:** none
 **Owner:** builds gave the go 2026-11-13.
 
-#### Work Order
+#### As-built
 
-**Goal:** `production/test_unit_move.py` uses less CPU in aws pairs; every behavior check stays.
-
-**Spec:**
-- Profile: 17.9 local CPU s. `FolderRenameFixture.setUp` runs nine git commands per test (69 tests here); `file_versions` takes 2.6 s in 283 calls.
-- `FolderRenameFixture` builds the checkout, bare origin and unit worktree once per class (`setUpClass`, keyed by the class `old_name`). Each test copies them. The copy rewrites the three files that hold the seed path: the checkout config (origin URL, as `str(self.root)`), the worktree `gitdir` and the worktree `.git` file (resolved root). No copied file holds the seed path.
-- `file_versions` and `final_files` walk with `os.scandir` and keep the same filters: symlinked folders are not followed, a symlink to a file is read through, and the same names and folders are left out.
-- Test-support files only. `agents/test_shutdown_cli.py` and `production/test_rename_unit_style.py` share both helpers, so the pair and the land run all three modules.
-
-**Files:** `scripts/production/rename_unit_test_support.py`, `scripts/production/rename_rerun_test_support.py`.
-
-**Workers:** director only (no-worker mode).
-
-**Acceptance gate:** the three modules pass; basedpyright reports zero errors and warnings; the aws pair shows a CPU gain.
+- `FolderRenameFixture.setUpClass` builds the Git seed once per class with `build_folder_repositories`. Each `setUp` calls `copy_folder_repositories`, which copies the checkout, the bare origin and the unit worktree with symlinks kept.
+- The copy rewrites the seed path in three files: the checkout config (`root` as given), the worktree `gitdir` and the worktree `.git` file (`root.resolve()`). It raises AssertionError when a file does not name the seed.
+- `final_files` and `file_versions` share one `os.scandir` walker, `_files`, with the old filters. Symlinked folders are not followed; a symlink to a file is read through.
+- AWS pair (c7a.8xlarge, 3 rounds): `production/test_unit_move.py` 17.30 -> 15.29 CPU s; `agents/test_shutdown_cli.py` 34.51 -> 34.01 CPU s; `production/test_rename_unit_style.py` no change.
+- Commit 10c48884a. The land runs all three modules.
