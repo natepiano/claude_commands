@@ -522,6 +522,11 @@ def _refresh_phase_table(session_dir: Path) -> None:
     except (OSError, UnicodeError, SystemExit) as error:
         print(f"phase table not written: {error}", file=sys.stderr)
         return
+    from scripts.direct import phase_table
+
+    # Without a vault the refresh writes nothing; skip its process start.
+    if not phase_table.vault_present():
+        return
 
     command = [
         sys.executable,
