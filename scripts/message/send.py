@@ -36,13 +36,12 @@ An absent staff recipient keeps its queue without selecting a session family.
 One staff snapshot selects each staff recipient.
 Unit names also accept the form from copies.unit_owner. Ambiguous staff names stop delivery.
 A staff recipient uses its current_session, including for an explicit address.
-A name without a staff row is refused without a relay or queue, except Morty's configured native identity.
+A name without a staff row is refused without a relay or queue.
 Explicit non-staff addresses keep their transport and queue behavior.
 Worker addresses use native IDs from the local or peer roster for staff lookup.
 Each message records its runtime sender ID separately from `--from`.
-Only the configured Morty ID adds `Authority: morty (speaks for the user)`.
 Queues and SSH forwarding retain the original sender ID.
-`--here` checks only this machine. `--machine` runs this script on HOST over ssh.
+`--here` checks only this machine. `--machine` accepts a configured alias or host name and uses its SSH alias.
 
 `--to user` requires a registered `--text-id`. The template supplies the title and action. `--need`
 says what they must do: `note` nothing, `decision` decide while work goes on,
@@ -142,13 +141,14 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Literal, NamedTuple, NoReturn, NotRequired, TypedDict, cast
 
 from scripts.herdr.place import HerdrPlace
+from scripts.agents import remote as machine_routes
 from scripts.herdr import herdr_types
 from scripts.lib import process_group
 from scripts.production import staff, unit_names
 from scripts.lib import conf, models_registry, process_start
 from scripts.lib.atomic_file import write_text_atomic as write_atomic
 from scripts.notify import decision_priority
-from scripts.message import morty_identity, send_budget
+from scripts.message import send_budget
 from scripts.message.send_result import (
     Outcome as Outcome, EXIT as EXIT, OUTCOME_HEADERS as OUTCOME_HEADERS,
     OutcomeHeader as OutcomeHeader, NoOutcomeHeader as NoOutcomeHeader, parse_outcome as parse_outcome,
@@ -199,7 +199,7 @@ PAID_CREDITS_QUEUED_TEXT = "quota.paid_credits_queued"
 PAID_CREDITS_QUEUED_CALL = ('~/.claude/scripts/lib/py ~/.claude/scripts/message/send.py --to user'
                             + ' --text-id quota.paid_credits_queued --value account=<account> --value machine=<machine>'
                             + ' --value credits=<paid credits left> --value "refill=<when its plan refills>"')
-PAID_CREDITS_REPORT = re.compile(r"\bpaid[\s-]+credits?\b|\buse_credits\b", re.IGNORECASE)
+PAID_CREDITS_REPORT = re.compile(r"\bpaid[\s-]+credits?\b|\bcodex_credit_accounts\b", re.IGNORECASE)
 PAID_CREDITS_HELD = ("not sent: this push reports paid credit use. Send it with the quota.paid_credits template: "
                      + PAID_CREDITS_CALL + ". When a workers move is queued, send quota.paid_credits_queued: "
                      + PAID_CREDITS_QUEUED_CALL)
@@ -2299,15 +2299,11 @@ def _staff_transport_matches(member: staff.StaffRow, entries: list[roster.Roster
 
 
 def _native_address_matches(to: str, entries: list[roster.RosterEntry]) -> list[roster.RosterEntry]:
-    """Match native addresses or Morty's configured native identity."""
     from scripts.message import roster
 
     if to.startswith(("session:", "worker:", "codex:")):
         return [entry for entry in entries
                 if isinstance(entry.reach, roster.Messageable) and entry.reach.address == to]
-    if to.casefold() == "morty":
-        return [entry for entry in entries
-                if isinstance(entry.reach, roster.Messageable) and morty_identity.matches(entry.reach.address)]
     return []
 
 
@@ -3075,7 +3071,7 @@ def parse(argv: list[str]) -> Options:
     _ = parser.add_argument("--repeat-minutes", type=float,
                            help="skip a delivered or kept send with --key inside this window; failed sends do not count")
     location = parser.add_mutually_exclusive_group()
-    _ = location.add_argument("--machine", help="deliver from this ssh host instead (mac)")
+    _ = location.add_argument("--machine", help="deliver from a configured machine alias or host name")
     _ = location.add_argument("--here", action="store_true", help="resolve and deliver only here")
     _ = parser.add_argument("--timeout", type=float, default=delivery_timeout(), help=f"delivery seconds (default {delivery_timeout():g})")
     body = parser.add_mutually_exclusive_group()
@@ -3178,6 +3174,11 @@ def parse(argv: list[str]) -> Options:
         action = parsed_action
     selection = RosterLookup(to)
     host = optional_str(attr(args, "machine"))
+    if host is not None:
+        mapped = machine_routes.machine_alias(host)
+        if isinstance(mapped, machine_routes.MachineNameRefused):
+            parser.error(mapped.reason)
+        host = mapped.alias
     forwarded_sender = optional_str(attr(args, "forwarded_shown_sender"))
     if forwarded_sender is not None and (attr(args, "here") is not True or not forwarded_sender):
         parser.error("--forwarded-shown-sender needs --here and nonempty sending-machine display text")
@@ -3302,19 +3303,6 @@ def read_sender_stamp(value: object) -> SenderStamp:
     raise ValueError("invalid sender native id")
 
 
-def morty_stamp(stamp: SenderStamp) -> bool:
-    if isinstance(stamp, UnavailableSender):
-        return False
-    return morty_identity.matches(sender_native_id(stamp))
-
-
-def sender_stamp_lines(stamp: SenderStamp) -> str:
-    text = f"\nSender native id: {sender_native_id(stamp)}"
-    if morty_stamp(stamp):
-        text += "\nAuthority: morty (speaks for the user)"
-    return text
-
-
 def shown_sender_line(sender: str, display: str) -> str:
     return f"\nShown sender: {display}" if display != sender else ""
 
@@ -3322,12 +3310,13 @@ def shown_sender_line(sender: str, display: str) -> str:
 def quote_sender_lines(text: str) -> str:
     """Separate caller text from generated sender metadata."""
     normalized = re.sub(r"\r\n|[\r\x0b\x0c\x1c-\x1e\x85\u2028\u2029]", "\n", text)
-    return re.sub(r"(?m)^([^\S\n]*(?:Authority:|Sender native id:))", r"> \1", normalized)
+    return re.sub(r"(?m)^([^\S\n]*Sender native id:)", r"> \1", normalized)
 
 
 def stamped_text(first: str, rest: str, stamp: SenderStamp) -> str:
     preview, separator, remainder = quote_sender_lines(first).partition("\n")
-    return preview + sender_stamp_lines(stamp) + separator + remainder + quote_sender_lines(rest)
+    return (preview + f"\nSender native id: {sender_native_id(stamp)}" + separator + remainder
+            + quote_sender_lines(rest))
 
 
 def agent_text(message: Message, *, via_relay: bool = False) -> str:
@@ -3476,8 +3465,6 @@ def _send(options: Options, *, membership: staff.StaffSnapshot) -> Result:
     key = user_emergency_key(sender, summary) if emergency and options.key is None else options.key
     display = (options.shown_sender.text if isinstance(options.shown_sender, ShownSender)
                else sender_shown_name(sender, stamp, observed) if options.to != USER else sender)
-    if sender.casefold() == "morty" and not morty_stamp(stamp):
-        print("send.py: sender 'morty' does not match MORTY_NATIVE_ID", file=sys.stderr)
     message = Message(destination, sender, summary, text, key, display, options.human, stamp)
     started = now()
     order = new_queue_order() if options.to != USER else LEGACY_QUEUE_ORDER

@@ -129,7 +129,8 @@ def private_ci_environment(root: Path) -> dict[str, str]:
     """Keep CI slice readings inside the private fixture."""
     ci = root / "ci.slice"
     ci.mkdir(exist_ok=True)
-    for name, value in (("memory.current", "0"), ("memory.stat", "anon 0\nshmem 0\ninactive_file 0\n"), ("memory.max", str(40 * 1024**3)), ("cgroup.procs", "")):
+    for name, value in (("memory.current", "0"), ("memory.stat", "anon 0\nshmem 0\ninactive_file 0\n"), ("memory.max", str(40 * 1024**3)),
+                        ("memory.swap.current", "0"), ("cgroup.procs", "")):
         path = ci / name
         if not path.exists():
             _ = path.write_text(value)

@@ -502,7 +502,7 @@ def judge(found: list[tuple[Path, float]], now: float, removing: bool, proc: str
             continue
         with scratch.removal_lock(path) if removing else scratch.judgment_lock(path) as idle:
             if not idle:
-                outcomes[path] = "busy: .claude-busy is locked"
+                outcomes[path] = scratch.BUSY_REASON
                 continue
             # This certificate was published only after the original Git check.
             # A partial deletion can no longer pass that check, but all live-use guards still apply.

@@ -36,7 +36,7 @@ from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.process_group import send_process_group
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lint.memory_test_support import write_config_fixture
-from scripts.mac_test import offload
+from scripts.mac_test import eligibility, offload
 from scripts.mac_test import mac_test, claim_state
 from scripts.mac_test import floor_claims
 from scripts.build_targets import target_config
@@ -427,9 +427,9 @@ assert Path(sys.argv[1]).read_text() == 'complete replacement'
                 authority = self.interrupt_mirror_removal(original, moment)
                 tree = Path(original.path)
                 with self.admission(free_gib=0) as (controller, config, request):
-                    def receive(current: offload.ProcessController, settings: offload.OffloadConfig,
+                    def receive(current: offload.ProcessController, settings: eligibility.OffloadConfig,
                                 selected: offload.OffloadRequest,
-                                repository: offload.KnownRepository) -> offload.CopiedTree:
+                                repository: eligibility.KnownRepository) -> offload.CopiedTree:
                         self.assertIs(current, controller)
                         self.assertEqual(settings.host, config.host)
                         mirror = offload.request_mirror(settings, selected, repository)
@@ -546,9 +546,9 @@ assert Path(sys.argv[1]).read_text() == 'complete replacement'
                 original = self.mirror_record(path=self.mirror.parent / "slot-1")
                 _ = self.interrupt_mirror_removal(original, moment)
                 with self.admission(free_gib=0) as (controller, config, request):
-                    def receive(current: offload.ProcessController, settings: offload.OffloadConfig,
+                    def receive(current: offload.ProcessController, settings: eligibility.OffloadConfig,
                                 selected: offload.OffloadRequest,
-                                repository: offload.KnownRepository) -> offload.CopiedTree:
+                                repository: eligibility.KnownRepository) -> offload.CopiedTree:
                         self.assertIs(current, controller)
                         mirror = offload.request_mirror(settings, selected, repository)
                         args = mirror_arguments(mirror, "mirror-receive")
@@ -648,11 +648,11 @@ with (mock.patch.object(linux_runner, 'prepare_shell', return_value=linux_runner
 
     @contextmanager
     def admission(self, *, free_gib: float = 200) -> Generator[tuple[offload.ProcessController,
-            offload.OffloadConfig, offload.OffloadRequest]]:
+            eligibility.OffloadConfig, offload.OffloadRequest]]:
         settings = self.root / "target.conf"
         _ = write_config_fixture(settings, "slots=2\n", template="mac_test")
         target = target_config.SshTarget("linux", "linux", settings)
-        config = offload.OffloadConfig(True, offload.SshConnectionSettings("host", 1, 1),
+        config = eligibility.OffloadConfig(True, eligibility.SshConnectionSettings("host", 1, 1),
                                       1, 1, 1, "1", {"slots": "2"})
         request = offload.OffloadRequest(self.source, "package", "call", offload.NO_RESULT_FILE, (),
                                         target="linux", owner="new-owner", holder_session="new-session")
@@ -687,13 +687,13 @@ with (mock.patch.object(linux_runner, 'prepare_shell', return_value=linux_runner
             self.assertEqual(copies.mirror_run(args), 0)
             return offload.ReportedMacStatus(0, offload.CleanupKept())
 
-        def mirror_path(repository: offload.KnownRepository, target: str = "mac", slot: int = 1) -> str:
+        def mirror_path(repository: eligibility.KnownRepository, target: str = "mac", slot: int = 1) -> str:
             self.assertEqual(repository.name, "repository")
             self.assertEqual(target, "linux")
             return str(self.mirror.parent / f"slot-{slot}")
 
         with (
-            mock.patch.object(offload, "mac_step_eligibility", return_value=offload.KnownRepository("repository")),
+            mock.patch.object(eligibility, "mac_step_eligibility", return_value=eligibility.KnownRepository("repository")),
             mock.patch.object(offload, "trusted_linux_source", return_value=True),
             mock.patch.object(target_config, "configured_ssh_target", return_value=target),
             mock.patch.object(offload, "remote_mirror", side_effect=mirror_path),
@@ -769,8 +769,8 @@ with (mock.patch.object(linux_runner, 'prepare_shell', return_value=linux_runner
                 "run", "--repo-root", str(self.source), "--package", "repository", "--call-id", "owner-chain",
             ], namespace=offload.CliArguments())
             request = offload.request_from_arguments(args)
-            config = offload.read_config()
-            mirror = offload.request_mirror(config, request, offload.KnownRepository("repository"))
+            config = eligibility.read_config()
+            mirror = offload.request_mirror(config, request, eligibility.KnownRepository("repository"))
             with copies.remote_lease(mirror):
                 copies.register_remote(mirror)
                 with self.assertRaisesRegex(copies.CopyError, f"busy; held by session {owner.current_session}"):
@@ -822,7 +822,7 @@ with (mock.patch.object(linux_runner, 'prepare_shell', return_value=linux_runner
             reservation, = mac_test.read_claims(paths)
             request = replace(request, admission=offload.MacClaimFromWait(
                 os.getpid(), claim_state.claim_identity(reservation.record), NoOwningSession()))
-            result = offload.claim_for_run(controller, config, request, offload.KnownRepository("repository"), (2,))
+            result = offload.claim_for_run(controller, config, request, eligibility.KnownRepository("repository"), (2,))
             self.assertIsInstance(result, offload.MacClaimNotConfirmed)
             claims = mac_test.read_claims(paths)
             self.assertEqual(len(claims), 1)

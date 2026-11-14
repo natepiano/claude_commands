@@ -7,6 +7,15 @@ Keep the normal scope, authorization, reservation, verification, and checkpoint 
 Use the existing run.
 Apply <PrepareSession/> when no run remains.
 
+The no-capacity broadcast stops every Codex worker on the machine; you stop none yourself.
+`worker_capacity.py` sends you one stop report when it changed a worker of yours.
+- `Stopped` names each worker whose process it stopped.
+- `Passes ended as canceled` names each worker whose open pass it ended. Continue that work from the worktree as a director activity; do not redispatch the pass.
+- `Pass stays open` names a pass that it could not end, with the cause. Tell your showrunner.
+- `Detached run continues` names a run that is not stopped, with its result file and its log. Its result comes to you when the run ends; it starts no worker.
+- `Not proved stopped` names a worker that can still run. Send it no work; your showrunner gets the same fault.
+Claude workers are not stopped. The workers-back notice starts no worker; your next assign starts it.
+
 Use `PY=~/.claude/scripts/lib/py` and `DIRECT=~/.claude/scripts/direct` in the commands below.
 Run them from `${WORKING_DIR}` with the normal phase ID and paths.
 

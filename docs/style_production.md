@@ -286,6 +286,8 @@ Use `style_plan.py checkpoint` under <StyleCheckpoint/> in `docs/direct/style_un
 It gates and publishes one ticket, records its checkpoint and confirms reservation release before another publication.
 With N=1 and one assigned ticket, verification uses the editing tree.
 Otherwise, verification uses the reused candidate copy while workers continue on their assigned paths.
+Verification runs check, lint and test for each package that the ticket's changed Rust or Cargo files touch.
+A change outside every package, such as the root `Cargo.lock`, verifies the whole workspace.
 With N above 1, a main change during assigned work makes sync pending until the workers finish.
 Otherwise, refill checks whether new branch-point commits touch the selected ticket's files or protected build inputs.
 Unrelated main changes permit work on the existing synced inputs.

@@ -9,7 +9,7 @@ import subprocess
 from typing import cast
 import unittest
 from unittest import mock
-from scripts.mac_test import offload
+from scripts.mac_test import eligibility, offload
 from scripts.mac_test.offload_test_commands import SELECTOR_STUB, write_shell
 from scripts.mac_test.offload_test_support import HANA_COMMAND_PATTERN, SelectorEvent
 from scripts.mac_test.offload_cleanup_test_support import SeededCleanupFixture
@@ -39,7 +39,7 @@ class OffloadCommandTests(SeededCleanupFixture):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assert_wire("passed", "")
         self.assertEqual(cleanup.call_count, 1)
-        connection = cast(offload.SshConnectionSettings, cleanup.call_args.args[0])
+        connection = cast(eligibility.SshConnectionSettings, cleanup.call_args.args[0])
         self.assertEqual(connection.leftover_timeout_s, 23)
         self.assertEqual(len(self.leftover_events()), 1)
         self.assertFalse(self.claim_file.exists())
@@ -58,8 +58,8 @@ class OffloadCommandTests(SeededCleanupFixture):
 
     def test_leftover_check_uses_connection_settings_and_the_recorded_host(self) -> None:
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, self.environment)))
-        connection = offload.SshConnectionSettings("current-host", 7, 19)
-        repository = offload.KnownRepository("hana")
+        connection = eligibility.SshConnectionSettings("current-host", 7, 19)
+        repository = eligibility.KnownRepository("hana")
         response = subprocess.CompletedProcess(["ssh"], 0, "leftovers=0\nrc=0\n", "")
         with mock.patch.object(subprocess, "run", return_value=response) as run:
             result = offload.check_leftovers(connection, "retained-host", repository)
@@ -78,14 +78,14 @@ class OffloadCommandTests(SeededCleanupFixture):
         self.config["connect_timeout_s"] = "7"
         self.config["leftover_timeout_s"] = "19"
         self.sync_config()
-        self.assertEqual(offload.read_connection_settings(self.config_path),
-                         offload.SshConnectionSettings("first-host", 7, 19))
+        self.assertEqual(eligibility.read_connection_settings(self.config_path),
+                         eligibility.SshConnectionSettings("first-host", 7, 19))
         self.config["host"] = "second-host"
         self.config["connect_timeout_s"] = "8"
         self.config["leftover_timeout_s"] = "21"
         self.sync_config()
-        self.assertEqual(offload.read_connection_settings(self.config_path),
-                         offload.SshConnectionSettings("second-host", 8, 21))
+        self.assertEqual(eligibility.read_connection_settings(self.config_path),
+                         eligibility.SshConnectionSettings("second-host", 8, 21))
 
     def test_unconfirmed_cleanup_checks_leftovers_before_release_and_keeps_test_result(self) -> None:
         self.fixture["run_cleanup_line"] = ""

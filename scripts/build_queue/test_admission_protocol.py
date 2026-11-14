@@ -338,15 +338,25 @@ printf '%s\\n' "$BUILDLOG_ADMISSION_CODE_VERSION"
             self.assertEqual(cast(dict[str, object], run_encoded["data"])["run"], codec.snapshot_value(run))
 
     def test_pressure_condition_variants_keep_their_meaning_through_the_codec(self) -> None:
-        conditions: tuple[records.PressureConditionNotRecorded | Literal["full", "swap"], ...] = (
-            "full", "swap", records.PressureConditionNotRecorded())
-        for condition in conditions:
-            with self.subTest(condition=condition):
+        conditions: tuple[tuple[str, records.PressureConditionNotRecorded | Literal["full", "some"]], ...] = (
+            ("full", "full"), ("some", "some"), ("swap", "some"), ("", records.PressureConditionNotRecorded()))
+        for saved, condition in conditions:
+            with self.subTest(condition=condition, saved=saved):
                 pressure = records.MemoryPressure(8, 15, 80, condition=condition)
                 reply = wait_reply(pressure)
                 reply = replace(reply, snapshot=replace(reply.snapshot,
-                    decision=replace(reply.snapshot.decision, pressure=pressure)))
-                self.assertEqual(wire.parse_reply(wire.encode_reply(reply)), reply)
+                    decision=replace(reply.snapshot.decision, pressure=pressure), head_reason=pressure))
+                encoded = wire.encode_reply(reply)
+                if saved == "swap":
+                    encoded = encoded.replace('"condition":"some"', '"condition":"swap"')
+                restored = wire.parse_reply(encoded)
+                self.assertEqual(restored, reply)
+                if saved == "swap":
+                    assert isinstance(restored, wire.Wait)
+                    self.assertEqual(client.wait_reasons(restored.snapshot), ("some memory pressure",))
+                    restored_pressure = restored.snapshot.decision.pressure
+                    assert isinstance(restored_pressure, records.MemoryPressure)
+                    self.assertEqual(records.pressure_text(restored_pressure), "memory pressure: some avg10 15.0")
 
 
     def test_every_request_round_trips_with_profiles_width_and_call_states(self) -> None:

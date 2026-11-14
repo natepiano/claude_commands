@@ -2,12 +2,53 @@
 """Run the shutdown CLI on the other workstation over Tailscale SSH."""
 
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import shlex
 import socket
 import subprocess
 import sys
+from dataclasses import dataclass
 from typing import Literal, TypedDict
+
+from scripts.lib import conf
+
+
+@dataclass(frozen=True)
+class Workstation:
+    alias: str
+    platform: str
+    host_names: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class MachineAlias:
+    alias: str
+
+
+@dataclass(frozen=True)
+class MachineNameRefused:
+    reason: str
+
+
+def _workstations() -> tuple[Workstation, ...]:
+    configured = conf.read("machines")
+    return tuple(Workstation(alias, configured.text(f"{alias}.platform"), configured.words(f"{alias}.hosts"))
+                 for alias in configured.words("aliases"))
+
+
+def machine_alias(name: str) -> MachineAlias | MachineNameRefused:
+    """Resolve a configured alias or host name without regard to case."""
+    workstations = _workstations()
+    for workstation in workstations:
+        if name.casefold() in {value.casefold() for value in (workstation.alias, *workstation.host_names)}:
+            return MachineAlias(workstation.alias)
+    accepted = dict.fromkeys(value for workstation in workstations
+                             for value in (workstation.alias, *workstation.host_names))
+    return MachineNameRefused(f"unknown machine {name!r}; accepted names: {', '.join(accepted)}")
 
 
 class TimeLimit(TypedDict):
@@ -29,9 +70,16 @@ def local_machine() -> str:
     return name or ("mac" if sys.platform == "darwin" else "natedev")
 
 
+def this_machine() -> str:
+    """Return the SSH alias of this workstation."""
+    platform = "darwin" if sys.platform == "darwin" else "linux"
+    return next(workstation.alias for workstation in _workstations() if workstation.platform == platform)
+
+
 def other_machine() -> str:
     """Return the SSH alias of the workstation other than this one."""
-    return "natedev" if sys.platform == "darwin" else "mac"
+    platform = "darwin" if sys.platform == "darwin" else "linux"
+    return next(workstation.alias for workstation in _workstations() if workstation.platform != platform)
 
 
 def run_remote(

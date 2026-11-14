@@ -18,6 +18,7 @@ This document describes the implementation and its constraints.
 | `scripts/accounts/role_map.py` | The shared role map, its transport, cache, locks, and change history. |
 | `scripts/accounts/next_moves.py` | Ordered moves, holds, positional edits, and validation. |
 | `scripts/accounts/refusal_watch.py` | Refusal detection, login renewal, queued moves, and automatic group moves. |
+| `scripts/accounts/login_sittings.py` | Weekly and safety reminders from stored Claude login end dates. |
 | `scripts/accounts/refusals.py` | Provider refusals and the freshness of usage readings. |
 | `scripts/accounts/moves.py` | Move outcomes, waits, assignment routing, and replay evidence. |
 | `scripts/accounts/unit_watchdog.py` | Recovery from pane launch records and fresh session liveness. |
@@ -31,11 +32,76 @@ This document describes the implementation and its constraints.
 Shared whoami modules use canonical `scripts.whoami` imports.
 Loading the same module under two names creates distinct runtime types and breaks state checks across callers.
 
-The agent-notes job runs notes, quota alerts, pacing, refusal moves, and unit recovery as separate parts.
+The agent-notes job runs these parts in separate processes:
+
+1. Notes.
+2. Quota alerts.
+3. Pacing.
+4. Refusal moves.
+5. Unit recovery.
+6. Login reminders.
+7. Phase note pruning.
+8. Vault commits.
+
 `scripts/maintenance/agent_notes_job.py` owns that job.
 `config/agent_notes.toml` supplies its schedules and process limits.
 Herdr producer recovery, layout saves, and detection rules belong to herdr-upkeep, with `config/herdr_upkeep.toml`.
 Neither job collects recovery snapshots or a desktop session note.
+
+## Preventive login reminders
+
+The `Part.LOGINS` timer part calls `login_sittings.run` in its own child process.
+It runs in parallel with the other independent parts.
+`parts.logins` in `config/agent_notes.toml` sets a 120-second interval and a 45-second process limit.
+The argument-free `agent_notes.main` path does not call this reminder.
+The Mac usage refresher does not call this reminder.
+The module sends only on `login_sitting_machine`.
+It reads local dates through `accounts.read_status(source=StoredUsageOnly())`.
+It uses the same numbered Claude rows and `login_ends_at` values that stored status exports.
+Removed accounts cannot retain a date through an old usage-store directory link.
+This shared status path inspects account readiness but does not refresh usage.
+The peer command is `accounts.py status --stored --json` through `ssh -o BatchMode=yes` and `remote.other_machine()`.
+An attempt time limits peer reads, including failed reads.
+The last successful peer read time and dates remain available after a failed attempt.
+
+`config/accounts.conf` supplies all reminder settings:
+
+| Key | Current value | Meaning |
+| --- | --- | --- |
+| `login_sitting_machine` | `natedev` | The machine that sends reminders. |
+| `login_sitting_first` | `2026-11-17T10:00:00-05:00` | The first sitting. |
+| `login_sitting_interval_days` | `7` | The interval between sittings. |
+| `login_sitting_window_days` | `10` | The selection window after a sitting. |
+| `login_safety_margin_days` | `3` | The immediate reminder margin. |
+| `login_peer_read_minutes` | `60` | The minimum interval between peer attempts. |
+| `login_peer_read_timeout_seconds` | `30` | The peer command limit. |
+
+Each pass reads these settings through `conf.read`.
+The earliest end on either machine selects the account for a sitting.
+The sitting push includes both known machine dates for that account.
+When no account is within the window, the push selects the account with the earliest end.
+No known dates means no sitting push.
+The latest sitting replaces any missed sittings.
+Safety pushes include only machine, account, and end-date combinations that no accepted push has named.
+An unknown date never enters either list.
+
+The atomic state file is `accounts_home()/.local/state/accounts/login_sittings.json`.
+It holds the latest completed sitting, named login dates, peer dates, and peer read and attempt times.
+Each save removes a named record only when the same machine and account have a different known end date.
+A missing date keeps the named record.
+Cached peer dates remain current evidence until the next successful peer read replaces them.
+The module saves each peer attempt and its result before it reads local dates.
+It contains no credential or login identity.
+`locked_history` holds the lock in `login_sittings/` beside the state file throughout each pass.
+The lock covers state reads, local and peer reads, sends, and saves.
+A busy pass performs no account reads or sends.
+The module records a sitting after an accepted push or an empty selection.
+A failed push leaves its sitting and named dates unrecorded for another attempt.
+The `accounts.login_sitting` catalog entry supplies both push kinds as normal notes.
+The `login-sitting` and `login-safety` keys replace older retained pushes of the same kind.
+Delivery uses `push_texts.user_send_argv` and checks `send_result.send_outcome`.
+It never sets `--through-silence`.
+The push formats dates in the user's zone.
 
 ## Account identity and storage
 
@@ -120,7 +186,7 @@ Units prefer the earliest weekly reset, then the most weekly allowance left.
 Showrunners prefer the most weekly allowance left.
 Labels provide a stable final ordering.
 Recorded provider refusals block a destination until the refusal resolves.
-Codex selection also checks allowance and the account's `use_credits` policy.
+Codex selection also checks allowance and whether `codex_credit_accounts` lets the account spend credits.
 
 `_exec_codex_account()` serves both `codex` and numbered Codex aliases.
 It recognizes `update` before account admission.
@@ -156,6 +222,7 @@ One `accounts-workers-move` unit serves every target.
 The runner reads the role before each worker and repeats after a changed final role.
 A run lock serializes worker moves, including the fallback without systemd.
 Direct Codex worker moves use this runner and read the selected role before each worker.
+A Codex worker move skips a target that may not spend credits and whose stored reading has no included usage left. The worker stays, its row records the reason, and the group request fails with the same reason.
 Both direct preview and execution refuse a Codex target that differs from the workers role.
 The refusal says `workers role is <role>; run accounts.py swap workers <codexN> to select it`.
 The swap preview shares the worker preview helper and can show a new target without changing the role.
@@ -226,6 +293,7 @@ Worker assignment fallback to Claude remains separate from the selected Codex ac
 Routing returns only when the selected Codex account can work and its refusal has resolved.
 An owned workers refusal with no account capacity enables `no_worker_mode` on the workers-role host, `role_map.ROLE_MAP_HOST`.
 The refusal handler sets this flag independently of the first `NoRoomMove` entry and the Claude assignment switch.
+A zero account with credits off enables the same flag when its workers stay on it: no other account has room, or the workers move failed.
 The saved flag triggers one broadcast to showrunners and unit directors on both machines.
 `config/accounts.conf` supplies `no_worker_mode_on` and `no_worker_mode_off`; `quota-alert` identifies the sender.
 The ON notice directs directors to write code, run tests, and do reviews without assigning workers.
@@ -233,6 +301,18 @@ Successful Codex recovery clears the flag and broadcasts OFF after the workers a
 Recovery also clears the flag when no Claude assignment fallback was saved.
 An unfinished Claude switch or failed restoration retains the flag until recovery can finish.
 The state context saves each flag change and releases the lock before it starts a separate broadcast unit.
+When the flag goes on, the same step starts `scripts/production/worker_capacity.py stop` as a second transient unit.
+That command stops each Codex worker of every local parent, busy or idle, under the worker's lock, and proves the stop from a new pane observation.
+It ends each open pass of a stopped worker as `canceled`, also for a Codex worker whose pane is already closed.
+It closes the pane of a stopped worker when the close checks permit. Claude workers are not touched.
+Each affected director gets one stop report. A worker that is not proved stopped, or a pass that is not canceled, also goes to `faults_to`.
+A live detached run of a stopped worker continues; the report names its result file and its log.
+Its result goes to the director: `send.deliver_worker_text` sends the text for a stopped or closed worker to the holder and starts no worker.
+No command starts workers when the flag goes off; the next assign of a director starts its worker.
+
+The credits setting of the hold owner releases a credits-off hold: when `codex_credit_accounts` names the owner again, routing can return before the hold time.
+An unresolved refusal does not block the return when credits are on for the selected account and a reading taken after the refusal shows a credit balance.
+This rule is local to the return; `accounts.pick` and the next-move target check still treat that account as refused.
 The start uses `systemd-run --user --collect --quiet --no-block` with the user manager's environment.
 The unit uses the repository working directory and `scripts/lib/py` to run `scripts/production/broadcast.py`.
 The quota pass waits only for the unit start, so slow peer delivery cannot consume its 30-second budget.
@@ -246,6 +326,10 @@ The flag survives state reloads and suppresses repeated ON notices during the sa
 Normal recovery takes about two to three minutes plus reading, restoration, and broadcast time.
 This interval is not a fixed reset-to-notice deadline; stale readings, failed moves, or interrupted jobs can delay OFF.
 Pane workers move under their dispatch lock with fresh pane evidence.
+A worker whose source account is the target returns `already on <target>` with exit 0; the move closes and starts nothing.
+`pane_moves._own_policy` keeps the worker's family from its staff backend and reads that family's role row with `worker_panes.launch_policy(role, family)`.
+`worker_panes.kept_settings` then keeps the model, effort and service tier of the saved launch. The resume and the rollback both use this policy.
+So a change of the role's assigned family never moves a worker to another family.
 An idle worker closes its pane through the shared `worker_panes.can_close` check.
 `worker_panes.close` repeats that check under its worker lock before it closes the pane.
 Held dispatch locks, live launchers, and unfinished submitted passes keep the pane open.
@@ -329,12 +413,10 @@ The usage reader takes the date from `claudeAiOauth.refreshTokenExpiresAt` in th
 Both live paths use this source, so the disk identity shortcut still avoids a Claude process start.
 The usage store and the timer cache preserve the date without storing other credential fields.
 An accepted reading without a date removes the stored date.
-Status classifies shared-home repairs before rendering.
-The text board keeps these repair lines.
-JSON omits these lines from `problems`, so cargo-handler and unit-board panes do not show them.
-All other problem lines remain in JSON.
+Both renderers use the same problem lines from `StatusReading.notes`, including shared-home repairs.
+JSON `problems` matches the text board's problem lines, with only the `* ` footnote prefix removed.
 Each account row exports `sessions` beside `role_counts`.
-Each entry has a native `session` ID and a classified `state`: `busy`, `starting`, `waiting`, `idle`, `paused`, or `exited`.
+Each entry has a native `session` ID and a classified `state`: `busy`, `idle`, `paused`, or `exited`.
 The list reuses local count observations and reads no pane again.
 Peer caches provide aggregate counts only; the session list contains local members.
 Named problem causes and repair steps preserve the subject, fault, evidence, and action.
@@ -344,17 +426,17 @@ This preserves visible off-target members during a move.
 Local role counts read the registry, staff, pane launches, and worker records without writing state.
 `session_state.classify` supplies the shared unit status for the accounts board and the units table.
 An exit record takes precedence over a pause record.
-A busy pane gives `busy`. A starting pane gives `starting`, including with a live detached run.
-The starting state shows that the pane has not reached an idle prompt.
-Other live detached work gives `waiting`.
+A busy or starting pane gives `busy`. Live detached work also gives `busy`.
+On Linux, live detached work comes from one /proc scan for `detached_runs.py supervise` processes.
+The read opens only the records that those supervisors name. Without /proc, it reads each record.
 Exit and pause records take priority over all activity states.
 Without a live detached run, a missing live session gives `exited`.
 Other live activity gives `idle`.
-Role counts include `starting` and `waiting` separately from `busy` and `idle`.
-Peer counts use zero for each missing `starting` or `waiting` field.
-Published counts include waiting within busy and starting within idle, so older peers retain valid totals.
-The new fields identify those subsets. The decoder separates them for display.
-The cache retains the published document to prevent repeated subtraction.
+Role counts are `busy`, `idle`, `paused`, `exited` and `total`.
+The accounts board has no activity column, the same as the cargo-handler accounts table.
+The activity of each session shows only in the cargo-handler tiles, from `cargo-handler census --json`.
+An older peer's document holds waiting within busy and starting within idle, with separate `starting` and `waiting` fields.
+The decoder moves that peer's `starting` count from idle to busy.
 Claude producers count under `showrunners` with the same hold and activity rules.
 Without a live session, they count on the selected showrunners account.
 `session-counts-read` prints the same live count document without publishing a file.

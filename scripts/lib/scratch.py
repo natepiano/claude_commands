@@ -79,10 +79,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import TypedDict, cast
 
-from scripts.lib import cargo_output, conf, copy_record  # noqa: E402
+from scripts.lib import cargo_output, conf, copy_record, git_files  # noqa: E402
 from scripts.lib.conf import UseConfiguredValue
 
-from scripts.lib.build_folders import BuildFolderSpec, build_folder_path, inherited_temporary_parent  # noqa: E402
+from scripts.lib.build_folders import BuildFolderSpec, build_folder_path, collector_lease, inherited_temporary_parent  # noqa: E402
 from scripts.lib.user_zone import user_zone  # noqa: E402
 
 VISIBLE_ROOT_ENV = "SCRATCH_VISIBLE_ROOT"
@@ -94,6 +94,7 @@ UNTIL_FORMAT = "%Y-%m-%dT%H%MZ"
 ROW_NAME = re.compile(r"[A-Za-z0-9_-]+-C[0-9]+")
 WORD = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]*")
 BUSY = ".claude-busy"
+BUSY_REASON = "busy: a lease or .claude-busy lock is held"
 RECORD_LOCKS: ContextVar[frozenset[tuple[int, int]]] = ContextVar("scratch_record_locks", default=frozenset())
 USE_STAMP = ".lint-sweep-used"
 CACHE_TAG = "CACHEDIR.TAG"
@@ -209,21 +210,13 @@ class NoGitDirectory:
 
 
 def git_directory(repo: Path) -> GitDirectory | NoGitDirectory:
-    """Resolve the checkout's Git metadata, including a linked worktree's pointer."""
-    marker = repo / ".git"
-    if marker.is_dir() and not marker.is_symlink():
-        return GitDirectory(marker)
+    """Resolve the checkout's Git metadata, including a linked worktree's pointer; a linked .git is refused."""
+    if (repo / ".git").is_symlink():
+        return NoGitDirectory()
     try:
-        line = marker.read_text(encoding="utf-8").strip()
-    except (OSError, UnicodeError):
+        return GitDirectory(git_files.at(repo).git_dir)
+    except git_files.GitFilesError:
         return NoGitDirectory()
-    if not line.startswith("gitdir:"):
-        return NoGitDirectory()
-    pointer = line.removeprefix("gitdir:").strip()
-    if not pointer or "\n" in pointer:
-        return NoGitDirectory()
-    found = repo / pointer
-    return GitDirectory(found) if found.is_dir() else NoGitDirectory()
 
 
 def busy_path(path: Path) -> Path:
@@ -339,16 +332,19 @@ def directory_record_lock(path: Path, *, wait: bool,
 
 @contextmanager
 def removal_lock(path: Path) -> Generator[bool]:
-    """Claim the busy mark even when absent, and hold it through removal."""
-    with busy_locks(path, create=True) as idle:
-        yield idle
+    """Claim the lease locks and the busy mark, even when absent, and hold them through removal.
+    A held lease on the folder or on any folder below it is busy, and the busy mark is then
+    not created."""
+    with collector_lease(path, children=True) as free, busy_locks(path, create=free) as idle:
+        yield free and idle
 
 
 @contextmanager
 def judgment_lock(path: Path) -> Generator[bool]:
-    """Check existing busy marks without creating metadata during a scan or dry run."""
-    with busy_locks(path, create=False) as idle:
-        yield idle
+    """Check the folder's lease lock and existing busy marks without creating metadata during a scan or dry run.
+    Leases below the folder are checked only at removal, so status reads do not walk the tree."""
+    with collector_lease(path) as free, busy_locks(path, create=False) as idle:
+        yield free and idle
 
 
 @contextmanager
@@ -950,7 +946,7 @@ def lifetime(path: Path, now: float | None = None, *,
 ) -> Live | Ended | Unknown:
     with judgment_lock(path) as idle:
         if not idle:
-            return Live("busy: .claude-busy is locked")
+            return Live(BUSY_REASON)
     return record_lifetime(path, time.time() if now is None else now, scratch_settings=scratch_settings)
 
 
