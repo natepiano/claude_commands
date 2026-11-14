@@ -476,6 +476,13 @@ class MemoryPage(TypedDict):
     room_source: Literal["free"]
     limit: str
     other: float
+    desktop_guarantee: float | None
+    agents_ram: float | None
+    agents_swap: float
+    shown_desktop: float
+    shown_agents: float
+    shown_agents_swap: float
+    slices_unavailable: str
     shown_reserved: float
     ci_name: str
     ci_ram: float
@@ -946,6 +953,44 @@ def swap_text(rows: Sequence[SwapRow]) -> str:
     return "\n".join(f"{row['name']}: {row['bytes']} B ({row['swap']:.6f} GiB) · {row['detail']}" for row in rows)
 
 
+class MemoryShares(TypedDict):
+    other: float
+    desktop_guarantee: float | None
+    agents_ram: float | None
+    agents_swap: float
+    shown_desktop: float
+    shown_agents: float
+    shown_agents_swap: float
+    slices_unavailable: str
+    shown_safety: float
+    shown_reserved: float
+
+
+def memory_shares(total: float, room: admission_records.MemoryRoom, safety: float, used: float,
+                  reserved: float) -> MemoryShares:
+    """Split memory outside builds into agents, the desktop guarantee and the rest, and place swapped demand in free memory."""
+    available = gib(room.available)
+    shown_safety = min(safety, used + available)
+    shown_reserved = max(0.0, min(reserved, available - safety))
+    outside = max(0.0, total - available - gib(room.cap_use))
+    agents = gate.agents_memory()
+    guarantee = gate.desktop_guarantee()
+    agents_ram = gib(agents.bytes) if isinstance(agents, admission_records.MeasuredMemory) else None
+    desktop = gib(guarantee) if isinstance(guarantee, int) else None
+    shown_agents = min(agents_ram or 0.0, outside)
+    shown_desktop = min(desktop or 0.0, outside - shown_agents)
+    agents_swap = gib(room.agent_swap_demand)
+    return {
+        "other": outside - shown_agents - shown_desktop,
+        "desktop_guarantee": desktop, "agents_ram": agents_ram, "agents_swap": agents_swap,
+        "shown_desktop": shown_desktop, "shown_agents": shown_agents,
+        "shown_agents_swap": max(0.0, min(agents_swap, available - shown_reserved - gib(room.room) - shown_safety)),
+        "slices_unavailable": "; ".join(reading.reason for reading in (agents, guarantee)
+                                        if isinstance(reading, admission_records.ReadingUnavailable)),
+        "shown_safety": shown_safety, "shown_reserved": shown_reserved,
+    }
+
+
 def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.UseConfiguredValue.CURRENT,
             report: ReportSections | charts.IndexUnavailable | ReportNotRead = ReportNotRead.VALUE) -> MemoryPage:
     if isinstance(configuration, conf.UseConfiguredValue):
@@ -1160,16 +1205,15 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
         pressure_label = admission_records.pressure_text(pressure)
     elif isinstance(pressure, admission_records.PressureUnavailable):
         pressure_label = "unavailable: " + pressure.reason
+    shares = memory_shares(total, captured, safety, used, reserved)
     return {
         "colors": configuration.colors,
         "ok": True, "read_at": explanation.now, "total": total, "available": gib(captured.available),
         "cap": cap, "floor": safety, "cap_text": room_text(captured),
         "shortfall": gib(captured.shortfall), "used": used, "reserved": reserved,
         "taken": gib(captured.cap_use) + reserved, "room": gib(captured.room), "room_source": "free", "limit": "room and head protection",
-        "other": max(0.0, total - gib(captured.available) - gib(captured.cap_use)),
+        **shares,
         "ci_name": ci_name, "ci_ram": ci_ram,
-        "shown_safety": min(safety, used + gib(captured.available)),
-        "shown_reserved": max(0.0, min(reserved, gib(captured.available) - safety)),
         "waiting": len(waiting_rows), "smallest_need": min((step.need / GIB for step in parsed.view.waiting), default=0.0),
         "pressure": pressure_label,
         "swap_used": gib(swap.used), "swap_total": gib(swap.total),

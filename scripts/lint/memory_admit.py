@@ -2542,9 +2542,33 @@ def inputs_after_reservations_end(inputs: QueueInputs, live_reservations: set[st
         running=tuple(step for step in inputs.running if not running_has_reservation(step) or id(step) in kept_steps))
 
 
+def user_manager_cgroup() -> Path:
+    return Path(os.environ.get("BUILDLOG_USER_CGROUP",
+        f"/sys/fs/cgroup/user.slice/user-{os.getuid()}.slice/user@{os.getuid()}.service"))
+
+
 def builds_slice_cgroup() -> Path:
-    return Path(os.environ.get("BUILDLOG_BUILDS_CGROUP",
-        f"/sys/fs/cgroup/user.slice/user-{os.getuid()}.slice/user@{os.getuid()}.service/builds.slice"))
+    return Path(os.environ.get("BUILDLOG_BUILDS_CGROUP", str(user_manager_cgroup() / "builds.slice")))
+
+
+def desktop_guarantee() -> int | ReadingUnavailable:
+    """Read the memory the desktop session keeps protected (session.slice memory.min)."""
+    path = user_manager_cgroup() / "session.slice" / "memory.min"
+    try:
+        check_memory_reading(path)
+        amount = int(path.read_text())
+    except (OSError, UnicodeError, ValueError) as error:
+        return ReadingUnavailable(f"{path}: desktop guarantee unavailable: {error}")
+    return amount if amount >= 0 else ReadingUnavailable(f"{path}: negative desktop guarantee")
+
+
+def agents_memory() -> MeasuredMemory | ReadingUnavailable:
+    """Read the agents' working set and swap (app.slice/app-agents.slice)."""
+    directory = user_manager_cgroup() / "app.slice" / "app-agents.slice"
+    try:
+        return slice_working_set(directory)
+    except (OSError, UnicodeError, ValueError) as error:
+        return ReadingUnavailable(f"{directory}: agents' memory unavailable: {error}")
 
 
 def slice_swap_current(directory: Path) -> int:
