@@ -22,7 +22,7 @@ from typing import TYPE_CHECKING, cast, final, override
 from unittest import mock
 from scripts.lint.memory_test_support import config_environment, write_config_fixture, write_config_fault, commit_config_fixture
 
-from scripts.mac_test import offload, claim_state
+from scripts.mac_test import eligibility, offload, claim_state
 if TYPE_CHECKING:
     from scripts.lib import copy_record, nix_env, scratch
     from scripts.build_targets import target_config
@@ -267,7 +267,7 @@ class CompletedRunSyncTests(unittest.TestCase):
 
     def check_finished_run(self, root: Path, target: str, status: int, fails: bool) -> None:
         configured = target_config.SshTarget(target, "linux" if target == "linux" else "macos", root / "target.conf")
-        config = offload.OffloadConfig(True, offload.SshConnectionSettings("linux-build", 1, 1), 1, 1, 1, "1", {})
+        config = eligibility.OffloadConfig(True, eligibility.SshConnectionSettings("linux-build", 1, 1), 1, 1, 1, "1", {})
         request = offload.OffloadRequest(root, "hana", "call", offload.NO_RESULT_FILE, (), owner="verify", target=target, holder_session="fixture-session")
         controller = offload.ProcessController()
         output = io.StringIO()
@@ -283,7 +283,7 @@ class CompletedRunSyncTests(unittest.TestCase):
 
         with (
             mock.patch.dict(os.environ, copies_environment(root)),
-            mock.patch.object(offload, "configured_ssh_target", return_value=configured),
+            mock.patch.object(eligibility, "configured_ssh_target", return_value=configured),
             mock.patch.object(offload, "expected_linux_parity", return_value={}),
             mock.patch.object(offload, "copy_tracked_scripts", return_value=True),
             mock.patch.object(offload, "copy_tree_with_key", return_value=offload.CopiedTree(offload.KnownTreeKey("tree"))),
@@ -304,7 +304,7 @@ class CompletedRunSyncTests(unittest.TestCase):
             mock.patch.object(subprocess, "Popen", side_effect=AssertionError("No child process expected")),
             redirect_stdout(output),
         ):
-            result = offload.claimed_run(controller, config, request, offload.KnownRepository("hana"), 1)
+            result = offload.claimed_run(controller, config, request, eligibility.KnownRepository("hana"), 1)
         expected = offload.PassedOnMac(4) if status == 0 else offload.FailedOnMac(status, 4)
         self.assertEqual(result, expected)
         released.assert_called_once_with(controller, target)
@@ -338,7 +338,7 @@ class LocalVersionPreflightTests(unittest.TestCase):
             if content is not None:
                 _ = (root / "box-tools.json").write_text(content)
             target = target_config.SshTarget("linux", "linux", root / "linux.conf")
-            config = offload.OffloadConfig(True, offload.SshConnectionSettings("dummy", 1, 1),
+            config = eligibility.OffloadConfig(True, eligibility.SshConnectionSettings("dummy", 1, 1),
                                           1, 1, 1, "1", {"version_pin_file": "box-pins.nix"})
             request = offload.OffloadRequest(root, "hana", "call", offload.NO_RESULT_FILE, (), owner="verify", target="linux", holder_session="fixture-session")
             controller = offload.ProcessController()
@@ -350,8 +350,8 @@ class LocalVersionPreflightTests(unittest.TestCase):
                 return offload.CommandOutput(0, versions[name], "")
 
             with (
-                mock.patch.object(offload, "mac_step_eligibility", return_value=HANA),
-                mock.patch.object(offload, "configured_ssh_target", return_value=target),
+                mock.patch.object(eligibility, "mac_step_eligibility", return_value=HANA),
+                mock.patch.object(eligibility, "configured_ssh_target", return_value=target),
                 mock.patch.object(offload, "trusted_linux_source", return_value=True),
                 mock.patch.object(target_config, "ssh_target_state_directory", return_value=root),
                 mock.patch.object(controller, "capture", side_effect=capture),
@@ -368,14 +368,14 @@ class LocalVersionPreflightTests(unittest.TestCase):
                     self.assertEqual(answer, offload.DeclinedMacRun("state", 4,
                         "linux version mismatch: rustc box=rustc 1.99.1 natedev=rustc 1.99.0; move the box pins in box-pins.nix"))
                     claim.assert_not_called()
-                    self.assertEqual(offload.linux_version_decline_path("linux", HANA.name), root / "version-decline-hana")
+                    self.assertEqual(eligibility.linux_version_decline_path("linux", HANA.name), root / "version-decline-hana")
                     self.assertTrue(offload.linux_version_declined_recently("linux", HANA.name, 60, 159))
                     self.assertFalse(offload.linux_version_declined_recently("linux", HANA.name, 60, 160))
                     if later_match:
                         _ = (root / "box-tools.json").write_text('{"versions":{"rustc":"rustc 1.99.0"}}')
                         _ = offload.run_offload(controller, config, request, 1)
                         claim.assert_called_once_with(controller, config, request, HANA, mock.ANY)
-                        self.assertFalse(offload.linux_version_decline_path("linux", HANA.name).exists())
+                        self.assertFalse(eligibility.linux_version_decline_path("linux", HANA.name).exists())
                 else:
                     claim.assert_called_once_with(controller, config, request, HANA, mock.ANY)
                     self.assertFalse(offload.linux_version_declined_recently("linux", HANA.name, 60, 100))
@@ -403,30 +403,30 @@ class OffloadSettingsTests(unittest.TestCase):
         _ = self.enterContext(mock.patch("subprocess.Popen", side_effect=AssertionError("No external command expected")))
 
     def test_mac_command_sends_repository_identity_only_when_nonempty(self) -> None:
-        config = offload.read_config(self.settings)
+        config = eligibility.read_config(self.settings)
         request = offload.OffloadRequest(self.root, "hana", "fixture-call", offload.NO_RESULT_FILE, (), owner="verify", holder_session="fixture-session")
         for key in ("https://example.com/team/hana", "git-root:/source with spaces/hana", ""):
             with self.subTest(key=key):
                 words = shlex.split(offload.remote_test_command(
-                    config, request, offload.KnownRepository("hana", key),
+                    config, request, eligibility.KnownRepository("hana", key),
                 ))
                 assignments = [word for word in words if word.startswith("BUILDLOG_REPO_IDENTITY=")]
                 self.assertEqual(assignments, [f"BUILDLOG_REPO_IDENTITY={key}"] if key else [])
 
     def test_ssh_target_state_path_needs_no_registry(self) -> None:
         with mock.patch.object(target_config, "read_targets", side_effect=AssertionError("No registry read expected")):
-            self.assertEqual(offload.ssh_target_state_directory("linux"), self.root / ".local/state/build-targets/linux")
-            self.assertEqual(offload.ssh_target_state_directory("mac"), self.root / "state")
+            self.assertEqual(eligibility.ssh_target_state_directory("linux"), self.root / ".local/state/build-targets/linux")
+            self.assertEqual(eligibility.ssh_target_state_directory("mac"), self.root / "state")
             with mock.patch.dict(os.environ, {"BUILD_TARGETS_STATE_DIR": str(self.root / "build-targets")}):
-                self.assertEqual(offload.ssh_target_state_directory("linux"), self.root / "build-targets/linux")
-                self.assertEqual(offload.ssh_target_state_directory("mac"), self.root / "state")
+                self.assertEqual(eligibility.ssh_target_state_directory("linux"), self.root / "build-targets/linux")
+                self.assertEqual(eligibility.ssh_target_state_directory("mac"), self.root / "state")
             with mock.patch.dict(os.environ, {"BUILD_TARGETS_STATE_DIR": "~/private-targets", "HOME": str(self.root)}):
-                self.assertEqual(offload.ssh_target_state_directory("linux"), self.root / "private-targets/linux")
+                self.assertEqual(eligibility.ssh_target_state_directory("linux"), self.root / "private-targets/linux")
 
     def test_ssh_target_state_path_refuses_invalid_names(self) -> None:
         for target in (".", "..", "../linux", "/tmp/linux", "linux/other"):
             with self.subTest(target=target), self.assertRaises(target_config.ConfigError):
-                _ = offload.ssh_target_state_directory(target)
+                _ = eligibility.ssh_target_state_directory(target)
 
     def test_explicit_settings_path_controls_every_offload_field(self) -> None:
         _ = write_config_fixture(self.settings, "mirror_busy_backoff_s=37\n", template="mac_test")
@@ -437,7 +437,7 @@ class OffloadSettingsTests(unittest.TestCase):
                 _ = write_config_fixture(settings, "offload=on\nhost=other-mac\nconnect_timeout_s=2\nprobe_timeout_s=3\n"
                     + f"unreachable_backoff_s=4\nfree_floor_gib=5\n{budget_key}=6\n"
                     + "mac_budget_gib.hana=7\nlinux_only.hana=local-package\nmirror_busy_backoff_s=91\n", template="mac_test")
-                config = offload.read_config(settings)
+                config = eligibility.read_config(settings)
                 self.assertTrue(config.enabled)
                 self.assertEqual(config.host, "other-mac")
                 self.assertEqual(config.connect_timeout_s, 2.0)
@@ -462,7 +462,7 @@ class OffloadSettingsTests(unittest.TestCase):
             return offload.CommandOutput(0, versions[name], "")
 
         with mock.patch.object(controller, "capture", side_effect=capture):
-            expected = offload.expected_linux_parity(controller, offload.read_config(self.settings))
+            expected = offload.expected_linux_parity(controller, eligibility.read_config(self.settings))
 
         self.assertNotIsInstance(expected, offload.UnavailableToolParity)
         if isinstance(expected, offload.UnavailableToolParity):
@@ -473,15 +473,15 @@ class OffloadSettingsTests(unittest.TestCase):
                          ("rustc fixture", "mend fixture", "fixture-commit"))
 
     def test_no_argument_config_reader_uses_the_file_values(self) -> None:
-        config = offload.read_config()
-        self.assertEqual(config, offload.read_config(self.settings))
+        config = eligibility.read_config()
+        self.assertEqual(config, eligibility.read_config(self.settings))
         self.assertTrue(config.enabled)
         self.assertEqual(config.free_floor_gib, 100)
         self.assertEqual(config.host, "mac")
 
     def test_no_argument_config_reader_uses_conf_dir(self) -> None:
         _ = write_config_fixture(self.settings, "host=environment-mac\nprobe_timeout_s=7\n", template="mac_test")
-        config = offload.read_config()
+        config = eligibility.read_config()
         self.assertEqual(config.host, "environment-mac")
         self.assertEqual(config.probe_timeout_s, 7)
         self.assertEqual(config.connect_timeout_s, 6)
@@ -494,7 +494,7 @@ class OffloadSettingsTests(unittest.TestCase):
             "connect_timeout_s=bad\nprobe_timeout_s=0\nunreachable_backoff_s=-1\nfree_floor_gib=nan\n")
         warning = io.StringIO()
         with redirect_stderr(warning):
-            config = offload.read_config(self.settings)
+            config = eligibility.read_config(self.settings)
         self.assertEqual(
             (config.connect_timeout_s, config.probe_timeout_s, config.unreachable_backoff_s, config.free_floor_gib),
             (6.0, 15.0, 300.0, 100.0),
@@ -505,11 +505,11 @@ class OffloadSettingsTests(unittest.TestCase):
         unknown = self.root / "uncommitted.conf"
         _ = unknown.write_text("offload=on\n")
         with redirect_stderr(io.StringIO()), self.assertRaises(conf.Unusable):
-            _ = offload.read_config(unknown)
+            _ = eligibility.read_config(unknown)
 
     def test_reachability_probe_runs_only_a_read_only_remote_command(self) -> None:
         _ = write_config_fixture(self.settings, "host=other-mac\nconnect_timeout_s=2\nprobe_timeout_s=3\n", template="mac_test")
-        config = offload.read_config(self.settings)
+        config = eligibility.read_config(self.settings)
         controller = offload.ProcessController()
         calls: list[tuple[list[str], offload.CommandDeadline]] = []
 
@@ -534,7 +534,7 @@ class OffloadSettingsTests(unittest.TestCase):
         self.assertFalse((self.root / "state").exists())
 
     def test_failed_reachability_command_reports_unreachable(self) -> None:
-        config = offload.read_config(self.settings)
+        config = eligibility.read_config(self.settings)
         failures: tuple[offload.CapturedCommandResult, ...] = (
             offload.CommandOutput(255, "", "connection refused"),
             offload.CommandOutput(1, "", "remote command failed"),
@@ -557,12 +557,12 @@ class OffloadSettingsTests(unittest.TestCase):
         self.assertEqual(offload.parse_probe("procs=12\n" + wire), expected)
         self.assertEqual(offload.parse_probe("procs=unreadable\n" + wire), expected)
         self.assertNotIn("processes", {field.name for field in fields(expected)})
-        script = offload.probe_script(offload.KnownRepository("hana"))
+        script = offload.probe_script(eligibility.KnownRepository("hana"))
         self.assertNotIn("pgrep", script)
         self.assertNotIn("procs", script)
 
     def test_leftover_check_requires_count_and_printed_success_on_the_named_host(self) -> None:
-        config = offload.read_config(self.settings)
+        config = eligibility.read_config(self.settings)
         for answer, expected in (("leftovers=0\nrc=0\n", offload.LeftoversEnded()),
                                  ("leftovers=4\nrc=0\n", offload.LeftoversRemain(4))):
             with self.subTest(answer=answer):
@@ -584,7 +584,7 @@ class OffloadSettingsTests(unittest.TestCase):
                     self.assertIn("answer could not be read", result.reason)
 
     def test_leftover_check_reports_timeout_start_failure_and_ssh_error(self) -> None:
-        config = offload.read_config(self.settings)
+        config = eligibility.read_config(self.settings)
         for error, expected in ((subprocess.TimeoutExpired("ssh", 10), "timed out after 10"),
                                 (FileNotFoundError("ssh missing"), "could not start")):
             with self.subTest(error=type(error).__name__):
@@ -605,7 +605,7 @@ class OffloadSettingsTests(unittest.TestCase):
     @mock.patch("subprocess.Popen", new=START_SUBPROCESS)
     def test_leftover_check_uses_configured_timeout_and_reports_it(self) -> None:
         _ = write_config_fixture(self.settings, "leftover_timeout_s=0.125\n", template="mac_test")
-        config = offload.read_config(self.settings)
+        config = eligibility.read_config(self.settings)
         with mock.patch.object(subprocess, "run", side_effect=subprocess.TimeoutExpired("ssh", 0.125)) as run:
             result = offload.check_leftovers(config.connection, "kept-host", HANA)
         self.assertEqual(run.call_args.kwargs["timeout"], 0.125)
@@ -618,13 +618,13 @@ class OffloadSettingsTests(unittest.TestCase):
                 _ = write_config_fixture(self.settings, f"leftover_timeout_s={value}\n", template="mac_test")
                 warning = io.StringIO()
                 with redirect_stderr(warning):
-                    self.assertEqual(offload.read_config(self.settings).leftover_timeout_s, 10)
+                    self.assertEqual(eligibility.read_config(self.settings).leftover_timeout_s, 10)
                 self.assertIn("leftover_timeout_s", warning.getvalue())
 
     def test_probe_mirror_lease_stays_under_the_temporary_root(self) -> None:
         request = offload.OffloadRequest(self.root, "hana", "probe-start", offload.NO_RESULT_FILE, (),
                                          owner="verify", holder_session="fixture-session")
-        mirror = offload.request_mirror(offload.read_config(self.settings), request, offload.KnownRepository("hana"))
+        mirror = offload.request_mirror(eligibility.read_config(self.settings), request, eligibility.KnownRepository("hana"))
         self.assertTrue(copies.remote_lease_path(mirror).is_relative_to(self.root))
 
     def test_probe_that_cannot_start_reports_its_limit_through_run(self) -> None:
@@ -642,7 +642,7 @@ class OffloadSettingsTests(unittest.TestCase):
 
         with mock.patch.object(sys, "argv", ["offload.py", "run", "--repo-root", str(self.root),
                                              "--package", "hana", "--call-id", "probe-start", "--result", str(destination)]), \
-             mock.patch.object(offload, "repository_identity", return_value=offload.KnownRepository("hana")), \
+             mock.patch.object(eligibility, "repository_identity", return_value=eligibility.KnownRepository("hana")), \
              mock.patch.object(offload.ProcessController, "complete_claim", autospec=True, side_effect=complete_claim), \
              mock.patch.object(offload.ProcessController, "capture", side_effect=responses) as capture, \
              redirect_stdout(io.StringIO()) as output, redirect_stderr(io.StringIO()) as errors:
@@ -654,7 +654,7 @@ class OffloadSettingsTests(unittest.TestCase):
         self.assertTrue((self.root / "state" / "unreachable_until").exists())
 
     def test_checked_in_settings_send_every_cargo_liner_member_to_the_mac(self) -> None:
-        config = offload.read_config(Path(__file__).resolve().parents[2] / "config" / "mac_test.conf")
+        config = eligibility.read_config(Path(__file__).resolve().parents[2] / "config" / "mac_test.conf")
         self.assertEqual(config.values["linux_only.cargo-liner"], "")
         self.assertEqual(config.default_target_budget_gib, "24")
         self.assertNotIn("mac_budget_gib.cargo-liner", config.values)
@@ -663,8 +663,8 @@ class OffloadSettingsTests(unittest.TestCase):
         for package, reason in expected.items():
             with self.subTest(package=package):
                 request = offload.OffloadRequest(self.root, package, "cargo-liner", offload.NO_RESULT_FILE, (), owner="verify", holder_session="fixture-session")
-                with mock.patch.object(offload, "repository_identity",
-                                       return_value=offload.KnownRepository("cargo-liner")):
+                with mock.patch.object(eligibility, "repository_identity",
+                                       return_value=eligibility.KnownRepository("cargo-liner")):
                     result = offload.run_offload(offload.ProcessController(), config, request, time.monotonic())
                 self.assertEqual(result.reason if isinstance(result, offload.DeclinedMacRun) else result, reason)
 
@@ -825,7 +825,7 @@ class OffloadCommandTests(OffloadCommandFixture):
                 options = ("--target", target) if target else ()
                 if target == "builder":
                     with (
-                        mock.patch.object(offload, "mac_step_eligibility", return_value=HANA),
+                        mock.patch.object(eligibility, "mac_step_eligibility", return_value=HANA),
                         mock.patch.object(offload, "trusted_linux_source", return_value=True),
                         mock.patch.object(offload, "recorded_linux_version_mismatch", return_value=""),
                         mock.patch.object(offload, "claim_for_run", return_value=offload.FreshMacClaim()),
@@ -860,7 +860,7 @@ class OffloadCommandTests(OffloadCommandFixture):
         self.assertEqual(self.events_for("rsync"), [])
 
     def test_battery_power_does_not_decline_mac_tests(self) -> None:
-        self.assertNotIn("pmset", offload.probe_script(offload.KnownRepository("hana")))
+        self.assertNotIn("pmset", offload.probe_script(eligibility.KnownRepository("hana")))
         self.fixture["probe_lines"] = ["power=battery", "free_gib=120", "host=Mac", "rc=0"]
         self.sync_fixture()
         result = self.command()
@@ -986,7 +986,7 @@ class OffloadCommandTests(OffloadCommandFixture):
         self.assertFalse(path.exists())
         self.fixture["rsync_status"] = 0
         self.sync_fixture()
-        config = offload.read_config(self.config_path)
+        config = eligibility.read_config(self.config_path)
         request = offload.OffloadRequest(self.repository, "hana", "busy", offload.NO_RESULT_FILE, (),
                                         owner="verify", target="mac", holder_session="fixture")
         mirror = offload.request_mirror(config, request, HANA)
@@ -1033,7 +1033,7 @@ class OffloadCommandTests(OffloadCommandFixture):
 
     def test_tracked_script_transfer_keeps_the_failed_command_error(self) -> None:
         controller = offload.ProcessController()
-        config = offload.read_config(self.config_path)
+        config = eligibility.read_config(self.config_path)
         commands: list[list[str]] = []
 
         def capture(arguments: Sequence[str],
@@ -1140,12 +1140,12 @@ class OffloadCommandTests(OffloadCommandFixture):
             _ = output.write('[dependencies]\nlinux-part={path="../linux-part"}\n')
         self.config["linux_only.hana"] = "linux-part"
         self.sync_config()
-        config = offload.read_config(self.config_path)
-        verbs: tuple[offload.MacVerb, ...] = ("nextest", "check", "clippy", "mend-check", "doc", "build")
+        config = eligibility.read_config(self.config_path)
+        verbs: tuple[eligibility.MacVerb, ...] = ("nextest", "check", "clippy", "mend-check", "doc", "build")
         for verb in verbs:
             with self.subTest(verb=verb):
-                self.assertIsInstance(offload.mac_step_eligibility(config, self.repository, "portable", verb),
-                                      offload.KnownRepository)
+                self.assertIsInstance(eligibility.mac_step_eligibility(config, self.repository, "portable", verb),
+                                      eligibility.KnownRepository)
                 self.assert_declined(self.command(verb=verb, package="linux-part"), "linux_only")
                 self.assert_declined(self.command("--workspace", verb=verb, package=""), "linux_only")
         self.assertEqual(self.events_for("ssh"), [])
@@ -1234,9 +1234,9 @@ class OffloadCommandTests(OffloadCommandFixture):
             holder_session="fixture-session", fetch=offload.FetchFolder("output"),
             environment=(("CLICOLOR", "call-value"),))
         with mock.patch.dict(os.environ, self.environment, clear=True):
-            config = offload.read_config(self.config_path)
-            remote = offload.remote_test_command(config, request, offload.KnownRepository("hana"))
-            mirror = self.root / offload.remote_mirror(offload.KnownRepository("hana"))
+            config = eligibility.read_config(self.config_path)
+            remote = offload.remote_test_command(config, request, eligibility.KnownRepository("hana"))
+            mirror = self.root / offload.remote_mirror(eligibility.KnownRepository("hana"))
         mirror.mkdir(parents=True, exist_ok=True)
         lint = self.root / ".claude/scripts/lint/lint"
         lint.parent.mkdir(parents=True, exist_ok=True)

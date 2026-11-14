@@ -194,6 +194,14 @@ The recorded action is `message_showrunner`.
 2026-11-11: Dailies and their Mac block footer were retired.
 Use `/build:mac status` to read the Mac block state.
 
+### Step eligibility — `scripts/mac_test/eligibility.py`
+
+This module holds the settings readers, `mac_step_eligibility`, and the readers for backoff, mirror-busy and failed-probe state.
+`build_targets.py` asks it first.
+It imports `offload.py` only for an eligible step: the probe, the disk floor and the reachability check.
+A refused step never imports the runner.
+`offload.py` calls these functions through the module, so one test patch covers both modules.
+
 ### The offload runner — `scripts/mac_test/offload.py`
 
 Nextest accepts repeated `--env NAME` arguments and one `--fetch FOLDER` argument.

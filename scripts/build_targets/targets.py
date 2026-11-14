@@ -145,23 +145,23 @@ def mac_policy_eligibility(
     repo_root: Path, package: str, routing: Routing, configured: tuple[Target, ...]
 ) -> tuple[EligibleTarget | ExcludedTarget, ...]:
     """Read repository policy when a configured target uses macOS."""
-    from scripts.mac_test import offload
+    from scripts.mac_test import eligibility
 
     results: list[EligibleTarget | ExcludedTarget] = []
-    repository = offload.repository_identity(repo_root)
+    repository = eligibility.repository_identity(repo_root)
     for target in configured:
         if target.platform == "linux":
             results.append(EligibleTarget(target))
         elif isinstance(routing, LocalRequired):
             results.append(ExcludedTarget(target, routing.reason))
-        elif isinstance(repository, offload.UnknownRepository):
+        elif isinstance(repository, eligibility.UnknownRepository):
             results.append(ExcludedTarget(target, "repo"))
         else:
-            config = offload.read_config(target.settings) if isinstance(target, SshTarget) else offload.read_config()
+            config = eligibility.read_config(target.settings) if isinstance(target, SshTarget) else eligibility.read_config()
             key = f"linux_only.{repository.name}"
             if key not in config.values:
                 results.append(ExcludedTarget(target, "repo"))
-            elif package in offload.comma_values(config.values[key]):
+            elif package in eligibility.comma_values(config.values[key]):
                 results.append(ExcludedTarget(target, "linux_only"))
             else:
                 results.append(EligibleTarget(target))
@@ -211,7 +211,7 @@ def local_hold_state() -> TargetState:
 def ssh_target_state(target: SshTarget) -> TargetState:
     """Read remote claim records without probing the target."""
     from scripts.build_hold import build_hold
-    from scripts.mac_test import mac_test, offload
+    from scripts.mac_test import eligibility, mac_test
 
     try:
         paths = mac_test.state_paths(target.name)
@@ -226,12 +226,12 @@ def ssh_target_state(target: SshTarget) -> TargetState:
             session = (HolderSession(block.delivery.name)
                        if isinstance(block.delivery, mac_test.RecordedSession) else NO_HOLDER_SESSION)
             return Held(mac_test.holder_name(block.holder), block.reason, block.since, block_end, session)
-        if isinstance(offload.read_failed_probe(target.name), offload.FailedProbe):
+        if isinstance(eligibility.read_failed_probe(target.name), eligibility.FailedProbe):
             return Unreachable("failed probe")
         jobs = tuple(running_job(claim) for claim in claims if mac_test.run_is_live(claim.record))
         if jobs:
             return Running(jobs)
-        if isinstance(offload.read_backoff(utc_now().timestamp(), target.name), offload.ActiveBackoff):
+        if isinstance(eligibility.read_backoff(utc_now().timestamp(), target.name), eligibility.ActiveBackoff):
             return Unreachable("retry backoff")
         return Free()
     except build_hold.ReleaseRecordReadError as error:

@@ -24,7 +24,7 @@ from scripts.mac_test import mac_test
 from scripts.lib import atomic_file
 from scripts.lib import process_start as process_identity
 
-from scripts.mac_test import offload
+from scripts.mac_test import eligibility, offload
 
 
 from scripts.build_hold.override_guard import require_checkout
@@ -254,7 +254,7 @@ class EligibilityTests(IsolatedTargetTest):
             + "kind.natedev=local\nplatform.natedev=linux\n"
         )
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {"CONF_DIR": str(Path(config).parent)})))
-        _ = self.enterContext(mock.patch.object(offload, "repository_identity", return_value=offload.KnownRepository("hana")))
+        _ = self.enterContext(mock.patch.object(eligibility, "repository_identity", return_value=eligibility.KnownRepository("hana")))
 
     def test_eligibility_table_keeps_linux_and_excludes_each_mac_constraint(self) -> None:
         mac = targets.SshTarget("mac", "macos", self.settings)
@@ -275,7 +275,7 @@ class EligibilityTests(IsolatedTargetTest):
                                  (expected, targets.EligibleTarget(local)))
 
     def test_unknown_repository_excludes_mac_without_excluding_linux(self) -> None:
-        with mock.patch.object(offload, "repository_identity", return_value=offload.UNKNOWN_REPOSITORY):
+        with mock.patch.object(eligibility, "repository_identity", return_value=eligibility.UNKNOWN_REPOSITORY):
             results = targets.target_eligibility(self.root, "hana", targets.AnyEligibleTarget())
         self.assertEqual(results[0], targets.ExcludedTarget(targets.SshTarget("mac", "macos", self.settings), "repo"))
         self.assertEqual(results[1], targets.EligibleTarget(targets.LocalTarget("natedev", "linux")))
@@ -634,7 +634,7 @@ class ReservationTests(IsolatedTargetTest):
                         mock.patch.object(build_hold, "owning_session", return_value=session), \
                         mock.patch.object(process_identity, "process_start", side_effect=process_start), \
                         mock.patch.object(mac_test, "target_claim_scope", return_value=mac_test.WHOLE_MAC), \
-                        mock.patch.object(offload, "repository_identity", return_value=offload.KnownRepository("hana")), \
+                        mock.patch.object(eligibility, "repository_identity", return_value=eligibility.KnownRepository("hana")), \
                         mock.patch.object(offload.ProcessController, "capture", return_value=offload.CommandOutput(0, "", "")):
                     with mock.patch.object(atomic_file, "write_text_atomic", side_effect=interrupted_write):
                         with self.assertRaisesRegex(OSError, "publication interrupted"):
