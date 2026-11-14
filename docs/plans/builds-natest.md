@@ -3898,21 +3898,10 @@ Checkpoint 2cfdd87f1. Changed `scripts/message/test_notifier.py` (launcher stubs
 **Depends on:** Phase 264
 **Owner:** sdlc asked for this cut 2026-11-13, after phase 264 ("measure them before the lazy-import cuts").
 
-#### Work Order
+#### As-built
 
-**Goal:** `main_checkout` reads a non-bare work tree with one `git rev-parse` call, not two.
-
-**Spec:**
-- Add `--show-cdup` to the first `rev-parse` call in `main_checkout`.
-- In a work tree, `--show-cdup` prints the path from `source` to the top. Return `(source / cdup).resolve()`.
-- With no cdup line (inside `.git`), keep the `--show-toplevel` call, so the old error still raises.
-- Bare, linked and separate-metadata repositories keep their current path.
-
-**Files:** `scripts/copies/copies.py` (`main_checkout`).
-
-**Workers:** director only (no-worker mode).
-
-**Acceptance gate:**
-- Old and new `main_checkout` give the same result for: top, subfolder, symlink path, linked worktree, bare, separate metadata, the metadata folder and `.git`.
-- Local: the five copies modules, `style/test_crate_run.py` and `production/test_fast_track.py` pass.
-- AWS pair on `copies/test_copies.py`, `style/test_crate_run.py` and `production/test_fast_track.py`. Every behavior check stays.
+- `main_checkout` adds `--show-cdup` to its first `rev-parse` call. In a work tree it returns `(source / cdup).resolve()` and runs no `--show-toplevel` call.
+- With no cdup line (inside `.git` or a metadata folder), the `--show-toplevel` call stays and raises as before.
+- Old and new agree on 8 layouts: top, subfolder, symlink, linked worktree, bare, separate metadata, metadata folder, `.git`.
+- AWS pair (c7a.8xlarge, 3 rounds): `copies/test_copies.py` 24.75 -> 24.32 CPU s; `style/test_crate_run.py` 55.16 -> 54.26; `production/test_fast_track.py` 56.82 -> 56.75.
+- Commit 5469f0791. Production change with the sdlc go; the land runs the full gate.
