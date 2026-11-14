@@ -529,6 +529,8 @@ The admission, scheduling caches, and rerun rules below apply to `SharedMachine`
 - Each job has its own `TMPDIR` under `/dev/shm/merge-gate-*` or `/dev/shm/targeted-test-*`.
   The runner reads the output and removes the temporary folder when the job ends.
   Outside gate jobs, the shared Python bootstrap gives direct unittest and timed runs a maker folder.
+  The bootstrap decides once, at interpreter startup, while `MERGE_GATE_PARENT_PID` marks a gate job.
+  A later `package_root.py` run inside an import selects the checkout only and starts no folder.
   `targeted_test.py` uses the same test-folder context for its outer run.
   These folders use `<inherited TMPDIR>/test-runs/test-run-*`.
   Child processes inherit TMPDIR, and each run holds its folder lock.

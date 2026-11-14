@@ -472,6 +472,7 @@ They create the mark when absent and retain it through deletion.
 A folder with a maker lock beside it (`<name>.lock`) is a managed folder.
 `scratch.removal_lock` and `scratch.judgment_lock` first take its lease lock without waiting and hold it through judgment and deletion.
 A held lease is busy, even when no busy mark is held. The collector then creates no busy mark.
+A collector judges a lock file, a lease record or an unfinished lease record by its folder's lease, so it never removes a live owner's records.
 `scratch.removal_lock` also walks the folder without following links and holds every lease lock below it through deletion.
 A held lease below the folder, or an unreadable folder, is busy. `judgment_lock` does not walk, so status reads stay fast; removal makes the final call.
 Every collector that uses these locks (scratch end, the folder audit, the tmp sweep, the floor sweep and copy removal) gets this guard.

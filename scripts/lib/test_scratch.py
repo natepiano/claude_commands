@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import errno
+import itertools
 import json
 import io
 import fcntl
@@ -716,6 +717,18 @@ print(scratch.target('gate:proof', 'tree', False))
                     self.assertFalse(idle)
             self.assertFalse(scratch.busy_path(path).exists())
             self.assertEqual(build_folders.build_folder_state(path), "held")
+
+    def test_a_held_folders_lock_and_lease_record_are_busy_until_the_lease_is_free(self) -> None:
+        request = build_folders.UniqueBuildFolder("leased-", build_folders.ExplicitBuildParent(self.base))
+        with build_folders.temporary_build_folder(request) as path:
+            records = [path.with_name(path.name + suffix) for suffix in (".lock", ".lease.json")]
+            for record, lock in itertools.product(records, (scratch.removal_lock, scratch.judgment_lock)):
+                with self.subTest(record=record.name, lock=lock.__name__), lock(record) as idle:
+                    self.assertFalse(idle)
+        residue = self.base / "ended-run.lease.json"
+        residue.touch()
+        with scratch.removal_lock(residue) as idle:
+            self.assertTrue(idle)
 
     def test_removal_finds_a_held_lease_below_the_folder_but_judgment_does_not_walk(self) -> None:
         parent = self.base / "runs"

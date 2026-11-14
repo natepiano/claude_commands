@@ -213,6 +213,7 @@ Do not add slots, rescue refs, or size limits during bf1.
 `scratch.removal_lock` and `scratch.judgment_lock` take it first and hold it through judgment and deletion; a held lease is busy.
 The folder audit, the tmp sweep, scratch end, the floor sweep and copy removal get the guard through these locks.
 **Held child leases (bf2p):** `removal_lock` also holds every lease lock below the folder through deletion; a held one keeps the parent.
+**Lease records (bf9r):** a lock file or lease record is judged by its folder's lease; a live owner's records are busy.
 `tmp_sweep.py` still reports the old busy reason; resources can use `scratch.BUSY_REASON`.
 **Estimate:** 8 worker hours.
 **Depends on:** bf1.
@@ -383,8 +384,9 @@ Run the existing complete gate after the final migration.
 
 ## Phase 9 — Test run folders
 
-**Status:** built in bf9 (609b743ff).
+**Status:** built in bf9 (609b743ff); bf9r moved the start to interpreter startup only.
 **Implementation:** Direct unittest and timed runs allocate through the shared Python bootstrap.
+The startup hook and the shim bootstrap start the folder; `package_root.py` selects the checkout only.
 `targeted_test.py` uses the same maker context.
 Each run holds its lock and sets TMPDIR for itself and its children.
 Normal exit removes the complete allocation.
