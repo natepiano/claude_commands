@@ -399,7 +399,7 @@ An accepted reading without a date removes the stored date.
 Both renderers use the same problem lines from `StatusReading.notes`, including shared-home repairs.
 JSON `problems` matches the text board's problem lines, with only the `* ` footnote prefix removed.
 Each account row exports `sessions` beside `role_counts`.
-Each entry has a native `session` ID and a classified `state`: `busy`, `starting`, `waiting`, `idle`, `paused`, or `exited`.
+Each entry has a native `session` ID and a classified `state`: `busy`, `idle`, `paused`, or `exited`.
 The list reuses local count observations and reads no pane again.
 Peer caches provide aggregate counts only; the session list contains local members.
 Named problem causes and repair steps preserve the subject, fault, evidence, and action.
@@ -409,17 +409,13 @@ This preserves visible off-target members during a move.
 Local role counts read the registry, staff, pane launches, and worker records without writing state.
 `session_state.classify` supplies the shared unit status for the accounts board and the units table.
 An exit record takes precedence over a pause record.
-A busy pane gives `busy`. A starting pane gives `starting`, including with a live detached run.
-The starting state shows that the pane has not reached an idle prompt.
-Other live detached work gives `waiting`.
+A busy or starting pane gives `busy`. Live detached work also gives `busy`.
 Exit and pause records take priority over all activity states.
 Without a live detached run, a missing live session gives `exited`.
 Other live activity gives `idle`.
-Role counts include `starting` and `waiting` separately from `busy` and `idle`.
-Peer counts use zero for each missing `starting` or `waiting` field.
-Published counts include waiting within busy and starting within idle, so older peers retain valid totals.
-The new fields identify those subsets. The decoder separates them for display.
-The cache retains the published document to prevent repeated subtraction.
+Role counts are `busy`, `idle`, `paused`, `exited` and `total`.
+An older peer's document holds waiting within busy and starting within idle, with separate `starting` and `waiting` fields.
+The decoder moves that peer's `starting` count from idle to busy.
 Claude producers count under `showrunners` with the same hold and activity rules.
 Without a live session, they count on the selected showrunners account.
 `session-counts-read` prints the same live count document without publishing a file.

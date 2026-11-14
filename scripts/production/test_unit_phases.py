@@ -1221,8 +1221,8 @@ class UnitPhasesTests(unittest.TestCase):
         self.assertIn("| second | exited |", resumed)
         for activity, hold, expected, detached in (("busy", "", "busy", False), ("shell", "", "idle", False),
                 ("busy", "pause", "paused", False), ("busy", "exit", "exited", False),
-                ("idle", "", "waiting", True), ("busy", "", "busy", True),
-                ("starting", "", "starting", False), ("starting", "", "starting", True),
+                ("idle", "", "busy", True), ("busy", "", "busy", True),
+                ("starting", "", "busy", False), ("starting", "", "busy", True),
                 ("starting", "pause", "paused", True), ("starting", "exit", "exited", True)):
             with self.subTest(activity=activity, hold=hold):
                 _ = staff.resume(first.id)
