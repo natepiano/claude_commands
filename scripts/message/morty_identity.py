@@ -1,20 +1,27 @@
-"""Match the configured Morty runtime identity."""
+"""Find the session that holds the producer row named morty."""
+from dataclasses import dataclass
 
-from scripts.lib import conf
 from scripts.production import staff
 
+NAME = "morty"
 
-def matches(native_id: str) -> bool:
-    config = conf.read("send")
-    # A recovered configuration value cannot grant authority after a missing live key.
-    if not isinstance(config.origin("MORTY_NATIVE_ID", str), conf.UsableLiveValue):
-        return False
+
+@dataclass(frozen=True)
+class MortyHolder:
+    """The native conversation on the live morty row."""
+
+    native: staff.StaffId
+
+
+@dataclass(frozen=True)
+class NoMortyHolder:
+    """No live record names one morty row."""
+
+
+def holder() -> MortyHolder | NoMortyHolder:
+    """Read the live record at each use; the retained local copy is never read."""
     try:
-        expected = config.text("MORTY_NATIVE_ID")
-        kind, _, identity = expected.partition(":")
-        if kind not in ("session", "codex"):
-            return False
-        _ = staff.native_id(identity)
-    except (conf.Unusable, staff.StaffRefused):
-        return False
-    return expected == native_id
+        rows = [row for row in staff.snapshot().find(kind="producer") if row.name == NAME]
+    except staff.StaffUnreadable:
+        return NoMortyHolder()
+    return MortyHolder(rows[0].current_session) if len(rows) == 1 else NoMortyHolder()

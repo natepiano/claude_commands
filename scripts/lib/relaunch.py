@@ -25,7 +25,7 @@ from scripts.agents import pane_record
 from scripts.agents.launch_names import LaunchNames
 from scripts.lib.agent_program import resolve_program
 from scripts.lib.models_registry import agent_environment, claude_arguments
-from scripts.lib.resume_message import NO_WORKERS, resume_message
+from scripts.lib.resume_message import NO_WORKERS, ResumeWorkers, WorkersHeld, resume_message, worker_mode
 from scripts.whoami.account import NAMED_ACCOUNT_VARIABLES
 
 HOLD_SECONDS = 300
@@ -48,13 +48,15 @@ def restored_launch(argv: list[str], environment: dict[str, str]) -> tuple[list[
     restored = {**environment, **LaunchNames.read().environment(entry)}
     restored.update({key: environment[key] for key in NAMED_ACCOUNT_VARIABLES if key in environment})
     if not parsed.has_prompt and environment.get("RELAUNCH_PROMPT_DELIVERY") != "pane":
-        workers = NO_WORKERS
+        workers: ResumeWorkers | WorkersHeld = NO_WORKERS
         row: staff.StaffRow | None = None
         try:
             record = staff.snapshot()
             row = record.by_current_session(identity)
             if row is not None:
-                workers = worker.resume_workers(row.id, record)
+                workers = worker_mode()
+                if not isinstance(workers, WorkersHeld):
+                    workers = worker.resume_workers(row.id, record)
         except (OSError, ValueError) as error:
             print(f"{identity}: workers anomaly: {error}", file=sys.stderr)
         argv = [*argv, resume_message("you were stopped and resumed", workers=workers, unit=row)]

@@ -103,7 +103,7 @@ It prints a `# set …` or `# cleared …` line, then `/default_models <function
 /default_models direct sol                         /unit:direct on the newest sol, efforts kept
 /default_models direct claude                      /unit:direct switches to the claude family
 /default_models direct.review sol:max              set agent and effort for one subtask
-/default_models cli.commit_prep sonnet              set agent, keep the CLI default effort
+/default_models cli.merge_branch sonnet             set agent, keep the CLI default effort
 /default_models direct fast                        every codex worker row on the fast tier
 /default_models direct.review inherit              review follows direct's tier again
 ```

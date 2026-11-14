@@ -142,10 +142,28 @@ Codex rows:
 
 `roster.py [--json] [--kind claude|codex] [--here]`. Without `--here` it reads `AllMachines`: `ssh -o BatchMode=yes <other machine> '"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/message/roster.py" --here --snapshot'`. The command has a 20 s timeout and removes session identity variables. It runs beside the local read and merges entries with this machine first.
 
-- **Text** — per machine: a machine line, then showrunner → unit director → worker, unit directors with no running showrunner and their workers, `director not running: <session dir>` groups for workers with no listed director, freestanding Claude, and `your Codex sessions`. Each row: `<role> <name>[ (you)][ (context)] — <kind>, <status>[, <slot role>][, <unit>][, <cwd with ~>]`. `(you)` marks the sender's row on this machine. No pids or ports.
+- **Text** starts each machine's section with its SSH alias (`natedev` or `mac`).
+  `send.py --machine` accepts this alias or a host name from `config/machines.conf`, without regard to case.
+  Both values select the configured SSH alias.
+  Rows follow this order: showrunner → unit director → worker, then unit directors with no running showrunner and their workers.
+  Next come `director not running: <session dir>` groups for workers with no listed director, freestanding Claude, and `your Codex sessions`.
+  Each row uses `<role> <name>[ (you)][ (context)] — <kind>, <status>[, <slot role>][, <unit>][, <cwd with ~>]`.
+  `(you)` marks the sender's row on this machine.
+  A freestanding Claude row without a staff name shows its registry name, then its address in brackets.
+  A row without a registry name shows its address alone.
+  Rows omit pids and ports.
 - **`--kind`** keeps rows of that kind and adds each listed worker's unit director and showrunner (same machine) as `(context)` rows; `--json` includes them unmarked.
-- **`--json`** prints `{"entries": [...], "problems": [...]}`. Each entry is flat: `machine`, `kind`, `role`, `name`, `status`, `address`, `cwd`, `production`, `showrunner`, `showrunner_address`, `unit`, `director`, `director_address`, `slot_role`, `session_dir`, `thread` (id or `null`). Link fields are empty for no-link states and for a showrunner's or director's own row; `address` is empty for `CannotReceiveMessages`. There is no `session` field.
-- **`--snapshot`** (hidden from `--help`) prints `RosterSnapshot`: tagged JSON that decodes back into the same variants, used only between machines.
+- **`--json`** prints `{"entries": [...], "problems": [...]}`.
+  Each entry is flat: `machine`, `kind`, `role`, `name`, `status`, `address`, `cwd`, `production`, `showrunner`, `showrunner_address`, `unit`, `director`, `director_address`, `slot_role`, `session_dir`, `thread` (id or `null`).
+  The `machine` field holds the SSH alias (`natedev` or `mac`) that `send.py --machine` accepts.
+  `name` holds only the staff name.
+  `shown_name` uses the registry name for a freestanding Claude session without a staff name.
+  Link fields are empty for no-link states and for a showrunner's or director's own row.
+  The `address` field is empty for `CannotReceiveMessages`.
+  Entries omit the `session` field.
+- **`--snapshot`** (hidden from `--help`) prints `RosterSnapshot`: tagged JSON for exchange between machines.
+  The `registry_name` field holds `RegistryName` or `NoRegistryName`.
+  An older snapshot without this field decodes as `NoRegistryName`.
 - **Problems** go to stderr as `could not read: <source>: <detail>`; the other machine's are prefixed with its host; an unreachable machine, timeout or undecodable snapshot is `<host>: not reached: <why>`. A decodable snapshot is used whatever the remote exit status. Exit 0 clean, 1 with any problem.
 
 Durable-role warnings print once on stderr with `warning:`. JSON and snapshots carry an optional `warnings` list; older snapshots without it have no warnings. Warnings alone leave exit status 0. `send.py` prints them once and continues transport resolution; they do not trigger the incomplete-roster refusal. `top_level.py` and `broadcast.py` display the same diagnostics while retaining readable recipients.
@@ -234,10 +252,9 @@ A proved miss permits the relay: `absent`, `stale`, `self`, `unclaimed`, `outbox
 The fallback is a headless `command claude -p` relay (sonnet, auto mode, tools `SendMessage` plus `ListAgents` for a name, hooks, MCP and slash commands off, `CLAUDE_*` variables removed, named by `relay_identity.relay_session_name(--from)` as `relay/<sender>`); delivery is read from the `SendMessage` tool result in the stream, which stays in `STATE/relay/<to>.jsonl`. `--timeout` defaults to 40 s for every transport. Where `~/.config/claude/oauth-token.gpg` exists (the Mac, whose keychain ssh cannot open) the relay decrypts it, and queues with `gpg-agent is cold on <machine>: run github-warmup there` when it cannot. Undelivered Claude messages go to `STATE/queue/`, latest per `--key`, under the recipient's session id; `pending` prints and clears them. `--key` with `--repeat-minutes` skips a repeat within the window; `ack` skips every later send with the key until `reopen`.
 
 The relay name has the form `relay/<sender>`. A name alone does not identify a relay: a real session can use the same form. The message body always carries `Shown sender: <display name>`, even when the display name equals `--from`. The conversation-pause hook reads the original sender with `relay_identity.message_sender_name` for scheduled messages and its return question. The native SendMessage miss hook resolves the exact target through staff. A non-staff name can use a live roster row. Verified relay recovery retains its saved sender lookup. This name is display text. `send.py` records the runtime sender ID separately.
-The generated `Authority: morty (speaks for the user)` mark requires the configured native ID.
-Caller lines that start with `Authority:` or `Sender native id:` get a `> ` prefix in delivered text.
+Caller lines that start with `Sender native id:` get a `> ` prefix in delivered text.
 Rendering converts line separators to LF before it quotes caller labels, including sender and forwarded display text.
-Only the generated metadata block directly after the preview grants authority. Quoted labels elsewhere grant none.
+Only the metadata block directly after the preview is generated. A quoted label elsewhere is caller text.
 Forwarded stamps require `SSH_CONNECTION` as a context check against accidental use.
 A session can inherit this variable. The check does not prove that `remote()` supplied the stamp.
 Code under the same account can set that environment. The mark is not authentication.

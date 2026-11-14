@@ -1223,6 +1223,15 @@ def _park_current(state: dict[str, object], current: dict[str, object]) -> None:
     _parked_phases(state).append(current)
 
 
+def _report_unclosed_phase(state: dict[str, object], phase: dict[str, object]) -> None:
+    """Name a phase set aside with no open pass: its director never closed it."""
+    identity = resolve_production_unit(state)
+    unit = identity.unit if isinstance(identity, ProductionUnitIdentity) else f"unit not recorded ({identity.reason})"
+    started = datetime.fromtimestamp(_number(phase.get("started_at")), user_zone())
+    print(f"anomaly: start-phase: {unit}: phase {_string(phase.get('id'))} set aside unclosed, "
+          + f"started {started:%Y-%m-%d %H:%M %Z}", file=sys.stderr)
+
+
 def _unpark_newest(state: dict[str, object]) -> None:
     """Make the most recently started older open phase current again."""
     parked = _parked_phases(state)
@@ -1665,6 +1674,9 @@ def _start_phase(args: argparse.Namespace) -> None:
     active = _object_dict(state.get("phase"))
     if active is not None and _string(active.get("status")) == "active":
         _park_current(state, active)
+        if not any(_string((_object_dict(record.get("phase")) or {}).get("instance_id"))
+                   == _string(active.get("instance_id")) for record in _open_passes(state).values()):
+            _report_unclosed_phase(state, active)
     else:
         state["pass"] = {}
     phase: dict[str, object] = {
@@ -2248,6 +2260,17 @@ def mark_pass_refused(session_dir: Path, worker_name: str) -> None:
                 passed["status"] = "refused"
                 _write_state(session_dir, state)
                 _append_event(state, _event(state, "pass_refused", plan_history.now_epoch(), passed))
+
+
+def cancel_worker_passes(session_dir: Path, worker_id: staff.StaffId) -> int:
+    """End each open pass of a stopped worker as canceled. Return the number of passes ended."""
+    if not _state_path(session_dir).is_file():
+        return 0
+    with (session_dir / ".progress_history.lock").open("a+", encoding="utf-8") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        state = _read_state(session_dir)
+        slots = [slot for slot, passed in _open_passes(state).items() if passed.get("worker_id") == worker_id]
+        return sum(_close_slot_pass(session_dir, state, slot, "canceled", plan_history.now_epoch()) for slot in slots)
 
 
 def _finish_pass(args: argparse.Namespace) -> None:

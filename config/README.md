@@ -25,6 +25,15 @@ on approval, with the user's words. `/tune` publishes the config file and pulls
 the Mac without a test or release cycle. Moving an unchanged value from code
 to config needs no approval and does not use `/tune`.
 
+## machines.conf
+
+`aliases` lists the workstation SSH aliases.
+Each alias has a `<alias>.platform` value and a `<alias>.hosts` list.
+The platform selects the local workstation.
+`send.py --machine` accepts an alias or a listed host name without regard to case.
+The command uses the alias for SSH.
+`build_targets.conf` keeps its separate `sync.hosts.*` settings.
+
 ## bake_textures_example.json
 
 Example configuration for the `/blender:bake_textures` command. Copy and modify this template to specify blend files, objects, texture maps, and export settings for texture baking.

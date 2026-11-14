@@ -635,6 +635,33 @@ class WorkerCommandTests(unittest.TestCase):
         self.assertEqual(states[busy.row.id].row.current_session, busy.row.current_session)
         self.assertEqual(states[idle.row.id].row.current_session, idle.row.current_session)
 
+    def test_restore_keeps_a_busy_codex_worker_stopped_in_no_worker_mode(self) -> None:
+        self.assert_held_in_no_worker_mode(refused=False)
+
+    def test_restore_keeps_a_refused_codex_pass_stopped_in_no_worker_mode(self) -> None:
+        self.assert_held_in_no_worker_mode(refused=True)
+
+    def assert_held_in_no_worker_mode(self, *, refused: bool) -> None:
+        from scripts.whoami import quota_alert
+
+        busy = self.opened()
+        _ = progress_history.begin_dispatch(self.run_dir, slot="impl", phase="8", role="impl",
+            worker_name=busy.row.name, worker_id=busy.row.id, launcher_command=["assign.sh", "--to", "impl"],
+            prompt=self.prompt, kind="impl", lens="")
+        if refused:
+            progress_history.mark_pass_refused(self.run_dir, busy.row.name)
+            self.assertEqual(worker_panes.worker_pass(busy.row, self.run_dir).get("status"), "refused")
+        _ = self.fixture.world.stop(busy.row, self.fixture.world)
+        launches = len(self.fixture.world.launches)
+        with (patch.object(quota_alert, "no_worker_mode", return_value=True),
+              patch.object(worker, "_resume_launcher", return_value=worker.ExitCode.OK) as resume):
+            self.assertEqual(self.command("restore"), (0, f"{busy.row.name}: not resumed: no-worker mode\n"
+                                                       + f"{self.fixture.parent.name}: workers unchanged\n", ""))
+        resume.assert_not_called()
+        self.assertEqual(len(self.fixture.world.launches), launches)
+        states = {state.row.id: state for state in worker_panes.observe(self.fixture.parent.id, staff.snapshot())}
+        self.assertIsInstance(states[busy.row.id], worker_panes.StoppedWorker)
+
     def test_restore_rerun_after_agent_resume(self) -> None:
         opened = self.opened()
         _ = progress_history.begin_dispatch(self.run_dir, slot="impl", phase="8", role="impl",
@@ -3303,11 +3330,11 @@ class WorkerCommandTests(unittest.TestCase):
                 "staff_id": opened.row.id if name == opened.row.name else fixture_runtime_id("another-worker"),
                 "status": status, "pid": pid, "label": label}))
         for alive, hold, expected, location, activity in (
-                (True, "", "waiting", "known", "idle"), (False, "", "idle", "known", "idle"),
+                (True, "", "busy", "known", "idle"), (False, "", "idle", "known", "idle"),
                 (True, "pause", "paused", "known", "idle"), (True, "exit", "exited", "known", "idle"),
-                (True, "", "starting", "known", "starting"), (False, "", "starting", "known", "starting"),
+                (True, "", "busy", "known", "starting"), (False, "", "busy", "known", "starting"),
                 (True, "pause", "paused", "known", "starting"), (True, "exit", "exited", "known", "starting"),
-                (True, "", "waiting", "saved dispatch", "idle")):
+                (True, "", "busy", "saved dispatch", "idle")):
             self.fixture.world.locations[opened.pane]["agent_status"] = activity
             if location == "saved dispatch":
                 outside = self.fixture.root / "private" / "saved-dispatch"
