@@ -3881,3 +3881,24 @@ Checkpoint 2cfdd87f1. Changed `scripts/message/test_notifier.py` (launcher stubs
 - The seed reads staff with `assignment.staff_record` and follows the `STAFF_FILE` and `SHOWRUNNER_STATE_DIR` marks. A damaged staff file seeds no cache.
 - AWS pair (c7a.8xlarge, 3 rounds): 51.77 -> 44.62 CPU s.
 - Commit fb2511020.
+
+### Phase 264 — copies.py starts fewer git processes  · status: done
+**Depends on:** none
+**Owner:** sdlc gave the go through builds 2026-11-13 (production cut 1 of 4).
+
+#### Work Order
+
+**Goal:** the tests that make copies use less CPU in aws pairs; copies.py behavior stays the same.
+
+**Spec:**
+- Profile: copies.py starts 2080 of 7446 git processes in `production/test_fast_track.py` and 12669 of 21830 in `style/test_crate_run.py`.
+- `origin_url` runs one `git remote get-url origin`. Exit 2 means no remote of that name (git 2.54 on natedev and the Mac); it returns None. Any other failure raises as before.
+- `git` raises `GitExit`, a `CopyError` subclass that keeps the exit status. Each caller that catches `CopyError` keeps its behavior.
+- `refresh_remotes` deletes the stale `refs/remotes/<remote>/HEAD` refs in one `git update-ref --no-deref --stdin` call before the fetch. A missing ref deletes without error, as with `update-ref -d`.
+- `refresh_remotes` still reads two ref lists: the source and the tree are two repositories.
+
+**Files:** `scripts/copies/copies.py`.
+
+**Workers:** director only (no-worker mode).
+
+**Acceptance gate:** the copies modules, `style/test_crate_run.py` and `production/test_fast_track.py` pass; basedpyright reports zero errors and warnings; the aws pair shows a CPU gain; the land runs the full gate.
