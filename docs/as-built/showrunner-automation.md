@@ -734,6 +734,8 @@ An unstaffed session requires an explicit native id and an explicit unit name.
     The words are `busy`, `idle`, `paused` and `exited`; the census gives starting and waiting as activities.
     A unit whose session is not listed shows `exited` when its machine is a reachable census machine, and `—` otherwise.
     A failed census gives `—` in Status and Workers and one anomaly line; the table has no other source for these cells.
+    One census takes 2 s to 4 s on natedev and is the longest read of the table.
+    Tests inject a `Census` and never run `cargo-handler`; an installed handler that prints schema 1 fails every census.
     The style table keeps the [shared session classifier](accounts.md#status-counts-and-notes).
     The status table and the style table add **Machine** after **Status** only when a row runs on another machine.
     The home machine is the `kind.<machine>=local` entry in `config/build_targets.conf`.
