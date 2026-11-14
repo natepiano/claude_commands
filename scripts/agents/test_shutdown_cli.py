@@ -231,7 +231,7 @@ class RetireUnitTests(unittest.TestCase):
         return PaneWorld()
 
     def test_retirement_retains_the_identity_and_excludes_it_from_active_views(self) -> None:
-        from scripts.production import unit_phases, live_units
+        from scripts.production import census, unit_phases, live_units
         from scripts.production import session_staff
 
         row = staff.by_id(self.unit_staff_id)
@@ -245,7 +245,7 @@ class RetireUnitTests(unittest.TestCase):
         self.assertEqual(session_staff.production_members(record)["alpha"], ())
         observed = session_staff.group_labeled_sessions((), record=record, sources=session_staff.MemberSources(()))
         listing = live_units.units_in("alpha", observed)
-        rendered = unit_phases.table(listing, {}, snapshot=record, pane_rows={})
+        rendered = unit_phases.table(listing, {}, snapshot=record, census_read=census.Census((), (), ()))
         self.assertEqual(rendered.splitlines(), [
             "| Unit | Status | Progress | Phase | ETA Next | Workers |",
             "| --- | --- | --- | --- | --- | --- |",

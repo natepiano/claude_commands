@@ -340,7 +340,7 @@ class NativeRuntimeIdentityTests(StaffCommandTestCase):
                         with self.subTest(compressed=compressed):
                             if compressed:
                                 _ = compressed_copy(transcript)
-                            with mock.patch.object(transcripts, "transcript_paths", wraps=transcripts.transcript_paths) as listed:
+                            with mock.patch.object(transcripts, "transcript_stems", wraps=transcripts.transcript_stems) as listed:
                                 self.assertEqual(staff.backend(row), expected)
                                 backends = staff.local_snapshot().backends
                                 self.assertEqual(backends.get(row.id, staff.BACKEND_UNAVAILABLE), expected)

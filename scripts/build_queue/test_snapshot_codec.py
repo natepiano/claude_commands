@@ -66,6 +66,29 @@ def pinned_snapshot_reader() -> Generator[tuple[Callable[[object, object], objec
 
 
 class SnapshotCodecTests(unittest.TestCase):
+    def test_pinned_client_reads_current_pressure_policy_and_some_pressure(self) -> None:
+        with pinned_snapshot_reader() as (parse, schema, _pinned):
+            for pressure in (records.NoPressureHold(), records.MemoryPressure(0, 91, 50, condition="some")):
+                with self.subTest(pressure=pressure):
+                    snapshot = service_snapshot()
+                    snapshot = replace(snapshot, decision=replace(snapshot.decision, pressure=pressure))
+                    raw = cast(dict[str, object], codec.snapshot_value(snapshot))
+                    self.assertFalse(hasattr(snapshot.policy.pressure, "swap_used_limit"))
+                    parsed = parse(raw, schema)
+                    policy = cast(object, getattr(parsed, "policy"))
+                    legacy_policy = cast(object, getattr(policy, "pressure"))
+                    self.assertEqual(cast(object, getattr(legacy_policy, "swap_used_limit")), 0.0)
+                    if isinstance(pressure, records.MemoryPressure):
+                        decision = cast(object, getattr(parsed, "decision"))
+                        legacy_pressure = cast(object, getattr(decision, "pressure"))
+                        self.assertEqual(cast(object, getattr(legacy_pressure, "condition")), "swap")
+                    restored = cast(records.AdmissionWaitSnapshot,
+                        codec.parse_snapshot_value(raw, records.AdmissionWaitSnapshot))
+                    self.assertEqual(restored, snapshot)
+                    if isinstance(pressure, records.MemoryPressure):
+                        assert isinstance(restored.decision.pressure, records.MemoryPressure)
+                        self.assertEqual(restored.decision.pressure.condition, "some")
+
     def test_pinned_client_schema_ignores_new_service_states_in_the_optional_field(self) -> None:
         with pinned_snapshot_reader() as (parse, schema, pinned):
             for current in (records.ServiceJobStateNotRecorded(), WaitingServiceJob(100), UnmatchedServiceJob(100)):

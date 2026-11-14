@@ -627,6 +627,10 @@ def memory_room(host: HostMemory | ReadingUnavailable, runs: Sequence[RunMemory]
     """Calculate room once from swap-backed use and accepted promises."""
     if isinstance(host, ReadingUnavailable):
         return host
+    if isinstance(host.build_and_ci_swap, ReadingUnavailable):
+        return host.build_and_ci_swap
+    swapped_outside = max(0, host.swap_total - host.swap_free - host.build_and_ci_swap)
+    agent_swap_demand = (swapped_outside * policy.agent_swap_share_percent + 99) // 100
     safety = policy.safety_bytes
     holds = tuple(RunKeepAside(run,
                   max(0, run.need - run.use.bytes) + run.held
@@ -637,8 +641,8 @@ def memory_room(host: HostMemory | ReadingUnavailable, runs: Sequence[RunMemory]
     cap: int | CapUnavailable = (CapUnavailable(unavailable) if unavailable
                                  else max(0, used + ci_use + host.available - safety))
     return MemoryRoom(host.available, safety, used, kept,
-                      host.available - safety - kept, cap, holds, total=host.total,
-                      ci_use=ci_use)
+                      host.available - safety - kept - agent_swap_demand, cap, holds, total=host.total,
+                      ci_use=ci_use, agent_swap_demand=agent_swap_demand)
 
 
 def has_running_step(running: list[StepMemory]) -> bool:
@@ -1128,8 +1132,7 @@ def member_programs(members: Iterable[int], proc: Path, *, skip_unreadable: bool
 
 def sccache_memory(proc: Path = PROC) -> list[StepMemory]:
     """Charge the compiler service once, outside all step process trees."""
-    directory = Path(os.environ.get("BUILDLOG_BUILDS_CGROUP",
-        f"/sys/fs/cgroup/user.slice/user-{os.getuid()}.slice/user@{os.getuid()}.service/builds.slice"))
+    directory = builds_slice_cgroup()
     try:
         reading = slice_working_set(directory / "sccache.service")
         try:
@@ -1188,8 +1191,10 @@ def read_meminfo(path: Path) -> HostMemory:
         values.update(kib_fields(line.split()))
     if "MemAvailable" not in values:
         raise ValueError(f"cannot read MemAvailable from {path}")
+    swap_total, swap_free = values.get("SwapTotal", 0), values.get("SwapFree", 0)
+    excluded = read_build_and_ci_swap() if swap_total > swap_free else 0
     return HostMemory(values["MemAvailable"], values.get("MemTotal", UnknownHostTotal()),
-                      values.get("SwapTotal", 0), values.get("SwapFree", 0))
+                      swap_total, swap_free, build_and_ci_swap=excluded)
 
 
 NO_HOST_SWAP = HostMemory(0, UnknownHostTotal())
@@ -1221,9 +1226,9 @@ def read_pressure(host: HostMemory = NO_HOST_SWAP, *, policy: AdmissionPolicy) -
 
 def pressure_from_readings(full: float, some: float, swap: float, policy: AdmissionPolicy) -> Pressure:
     """Use one pressure predicate for live admission and replay estimates."""
-    if swap > policy.pressure.swap_used_limit and some > policy.pressure.some_avg10_limit:
-        return MemoryPressure(full, some, swap, condition="swap")
-    return MemoryPressure(full, some, swap, condition="full") if full > policy.pressure.full_avg10_limit else NO_PRESSURE_HOLD
+    if full > policy.pressure.full_avg10_limit:
+        return MemoryPressure(full, some, swap, condition="full")
+    return MemoryPressure(full, some, swap, condition="some") if some > policy.pressure.some_avg10_limit else NO_PRESSURE_HOLD
 
 
 def admission_dir(root: Path) -> Path:
@@ -1943,7 +1948,7 @@ def admission_walk(inputs: QueueInputs, ordered: list[tuple[Path, RankedWaiter]]
         checked_room = remaining - protected_need
         override = first and has_override
         if override:
-            checked_room = available - safety
+            checked_room = available - safety - (room.agent_swap_demand if isinstance(room, MemoryRoom) else 0)
         fits = extra <= checked_room
         basis: StartBasis = (WithinSlot() if within else OverrideRoom() if override and fits else
                              Fits() if fits else StartsAlone() if alone else DoesNotFit())
@@ -2028,8 +2033,8 @@ def admission_pass(inputs: QueueInputs, now: float, policy: AdmissionPolicy) -> 
         if isinstance(entry.state, TokenWaitingWaiter):
             reason: WaitReason = entry.state
         else:
-            if isinstance(inputs.host, ReadingUnavailable) and not within:
-                cause: HeadCause = inputs.host
+            if isinstance(resolved.room, ReadingUnavailable) and not within:
+                cause: HeadCause = resolved.room
             elif estimate_expired(row, now, policy):
                 cause = EstimateExpired(row.get("estimated_at", now))
             else:
@@ -2537,7 +2542,64 @@ def inputs_after_reservations_end(inputs: QueueInputs, live_reservations: set[st
         running=tuple(step for step in inputs.running if not running_has_reservation(step) or id(step) in kept_steps))
 
 
-def ci_slice_cgroup(name: str) -> Path | ReadingUnavailable:
+def user_manager_cgroup() -> Path:
+    return Path(os.environ.get("BUILDLOG_USER_CGROUP",
+        f"/sys/fs/cgroup/user.slice/user-{os.getuid()}.slice/user@{os.getuid()}.service"))
+
+
+def builds_slice_cgroup() -> Path:
+    return Path(os.environ.get("BUILDLOG_BUILDS_CGROUP", str(user_manager_cgroup() / "builds.slice")))
+
+
+def desktop_guarantee() -> int | ReadingUnavailable:
+    """Read the memory the desktop session keeps protected (session.slice memory.min)."""
+    path = user_manager_cgroup() / "session.slice" / "memory.min"
+    try:
+        check_memory_reading(path)
+        amount = int(path.read_text())
+    except (OSError, UnicodeError, ValueError) as error:
+        return ReadingUnavailable(f"{path}: desktop guarantee unavailable: {error}")
+    return amount if amount >= 0 else ReadingUnavailable(f"{path}: negative desktop guarantee")
+
+
+def agents_memory() -> MeasuredMemory | ReadingUnavailable:
+    """Read the agents' working set and swap (app.slice/app-agents.slice)."""
+    directory = user_manager_cgroup() / "app.slice" / "app-agents.slice"
+    try:
+        return slice_working_set(directory)
+    except (OSError, UnicodeError, ValueError) as error:
+        return ReadingUnavailable(f"{directory}: agents' memory unavailable: {error}")
+
+
+def slice_swap_current(directory: Path) -> int:
+    """Read one required slice swap counter."""
+    path = directory / "memory.swap.current"
+    check_memory_reading(path)
+    amount = int(path.read_text())
+    if amount < 0:
+        raise ValueError(f"{path}: negative swap bytes")
+    return amount
+
+
+@dataclass(frozen=True)
+class InactiveSlice:
+    """systemd names no cgroup for a slice that holds no process."""
+
+
+def read_build_and_ci_swap() -> int | ReadingUnavailable:
+    """Read the build and CI slice swap that is not agent demand; an absent slice holds none."""
+    try:
+        name = conf.read("build_admission").text("ci_memory_slice")
+        ci = systemd_slice_group(name) if name else InactiveSlice()
+        if isinstance(ci, ReadingUnavailable):
+            return ci
+        groups = [builds_slice_cgroup()] if isinstance(ci, InactiveSlice) else [builds_slice_cgroup(), ci]
+        return sum(slice_swap_current(group) for group in groups if group.is_dir())
+    except (OSError, UnicodeError, ValueError, conf.Unusable) as error:
+        return ReadingUnavailable(f"swap demand unavailable: {error}")
+
+
+def systemd_slice_group(name: str) -> Path | InactiveSlice | ReadingUnavailable:
     private = os.environ.get("BUILDLOG_CI_CGROUP", "")
     if private:
         return Path(private)
@@ -2545,11 +2607,20 @@ def ci_slice_cgroup(name: str) -> Path | ReadingUnavailable:
         reply = subprocess.run(["systemctl", "show", "--property=ControlGroup", "--value", name],
                                capture_output=True, text=True, check=True, timeout=5)
         group = reply.stdout.strip()
+        if not group:
+            return InactiveSlice()
         if not group.startswith("/") or group == "/" or ".." in Path(group).parts:
             raise ValueError("systemd returns no slice cgroup")
         return Path("/sys/fs/cgroup") / group.lstrip("/")
     except (OSError, ValueError, subprocess.SubprocessError) as error:
         return ReadingUnavailable(f"{name}: cannot read ControlGroup: {error}")
+
+
+def ci_slice_cgroup(name: str) -> Path | ReadingUnavailable:
+    group = systemd_slice_group(name)
+    if isinstance(group, InactiveSlice):
+        return ReadingUnavailable(f"{name}: cannot read ControlGroup: systemd returns no slice cgroup")
+    return group
 
 def slice_working_set(directory: Path) -> MeasuredMemory:
     """Read the working set, anonymous plus shared memory, and swap separately."""
@@ -2566,7 +2637,7 @@ def slice_working_set(directory: Path) -> MeasuredMemory:
         raise ValueError(f"{stat}: expected inactive_file bytes") from error
     swap = directory / "memory.swap.current"
     check_memory_reading(swap)
-    swapped = int(swap.read_text()) if swap.exists() else 0
+    swapped = slice_swap_current(directory) if swap.exists() else 0
     try:
         anon = int(fields["anon"])
         shmem = int(fields["shmem"])
@@ -2602,8 +2673,7 @@ def unowned_slice_memory(rows: list[Reservation], processes: dict[int, ProcessId
                          *, activity_reader: ScopeActivityReader | None = None,
                          ci_memory_slice: str = "", waiters: Sequence[Waiter] = ()) -> tuple[UnownedSliceMemory, ...]:
     """Count child scopes that no reservation owns, without duplicate process charges."""
-    directory = Path(os.environ.get("BUILDLOG_BUILDS_CGROUP",
-        f"/sys/fs/cgroup/user.slice/user-{os.getuid()}.slice/user@{os.getuid()}.service/builds.slice"))
+    directory = builds_slice_cgroup()
     owned: set[Path] = set()
     tree_pids: set[int] = set()
     for row in rows:

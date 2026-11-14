@@ -589,3 +589,17 @@ The saved baseline reports inserted phases as about 2% of gaps.
 **Files:**
 - `scripts/direct/phase_reservation.py` — `clear`
 - `scripts/direct/test_phase_reservation.py` — rows in `test_a_held_reservation_is_never_replaced_or_cleared_by_hand`, board answer patched
+
+### Phase 26 — Record-active ignores paths a merge brought  · status: done
+
+**Depends on:** none
+
+#### As-built
+
+- `phase_reservation.changed_since_baseline` lists the paths of the branch's first-parent commits from the baseline to `HEAD`, the uncommitted changes against `HEAD`, and the untracked files.
+- With `--diff-merges=dense-combined`, a merge commit adds only a path its result changes from every parent, as a conflict resolved by hand. A plain merge adds nothing, at phase start or later.
+- A path the phase changed and later changed back still counts.
+
+**Files:**
+- `scripts/direct/phase_reservation.py` — `changed_since_baseline` and the module docstring
+- `scripts/direct/test_phase_reservation.py` — `test_record_active_claims_only_the_paths_a_merge_resolved_by_hand`

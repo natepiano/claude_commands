@@ -16,13 +16,17 @@ When it cannot read the width within `units_table_width_read_milliseconds`, it u
 This fallback is normal and prints no anomaly.
 `units_table_cell_lines` sets the cell line cap for Claude Code 2.1.319.
 Each table shows only the production's staff units, sorted by unit name without case distinctions.
-For the phase status table, **Status** is `busy`, `idle`, `paused` or `exited`.
-The accounts board uses the same status rule.
-An exit record gives `exited` before a pause record gives `paused`.
-A busy or starting pane, or a live detached run, gives `busy`.
-Otherwise a live session or pane process gives `idle`.
-No live session or process gives `exited`.
-The style table uses the same status words as the phase table.
+The phase tables read one `cargo-handler census --json` for **Status** and **Workers**.
+The census lists the sessions and the workers that the handler tiles show.
+It runs beside the other reads, within `units_census_seconds` in `config/production.conf`.
+For the phase status table, **Status** is the tile's status word for the unit's current session.
+The session is the staff row's current session, or the session of the Claude in the unit's pane when the unit has no staff row.
+The words are `busy`, `idle`, `paused` and `exited`. Starting and waiting are activities, not status words.
+A tile without an accounts entry shows `—`.
+A unit whose session the census does not list shows `exited` when the census scanned the unit's machine.
+A unit on a machine that the census did not scan shows `—`.
+When the census fails, Status and Workers show `—` and the output ends with one anomaly line.
+The style table keeps the shared session classifier, which the accounts board also uses.
 **Unit** is the unit's staff name, including stopped units and units without a session.
 
 The phase status table and the style table add **Machine** after **Status** only when a row runs on another machine.
@@ -87,7 +91,7 @@ ETA Plan appears when a unit has unfinished plan phases or a promise for an unfi
    An unknown holder keeps its recorded name or ID.
    A reason that starts with `waiting on`, `waiting for`, or either phrase after `blocked:` keeps that wording.
    A finished wait or pass removes its wait text.
-   Status keeps the session classifier even while Notes shows a wait.
+   Status keeps the census word even while Notes shows a wait.
 4. **ETA Next** shows the latest stated promise for that row's phase instance.
    `eta_phase_id` names the target; the active instance on an ETA event does not override that target.
    Without open work, it uses the next not-started plan phase with a promise.
@@ -103,11 +107,13 @@ ETA Plan appears when a unit has unfinished plan phases or a promise for an unfi
    A later `error` or `stopped` finish overrides earlier completions and plan-record done rows.
    That target's promise remains visible.
    A row without an unfinished plan or such a promise shows `—`.
-6. **Workers** lists workers with open passes in that row's phase instance, from the run records.
-   It lists workers with detached runs before workers that are working.
-   Run states are `waiting on run: <label> <elapsed>`, `result queued: <label>`, and `run gone: <label>`.
-   A finished pass removes its worker.
-   Without an open phase row, the cell keeps the existing pane observation rules.
+6. **Workers** lists the census workers of the unit.
+   An open phase row lists only the workers whose open pass is in that phase instance.
+   A row without an open phase lists every census worker of the unit.
+   Each detached run shows first, as `<name> waiting on run: <label> <elapsed>`, `<name> result queued: <label>`, or `<name> run gone: <label>`.
+   A running run without a start time omits the elapsed time.
+   A busy worker without a run shows `<name> waiting` or `<name> starting` when its tile activity ends in that word, else `<name> working`.
+   Idle workers add `+<n> idle` after other workers.
 7. **Non-Phase Work** shows `—` for an open phase row because Notes already describes that phase.
    A row without a recorded phase instance keeps the existing summary for work outside the plan.
 8. **Queued** combines the first `/unit:queue` item and `plan: phase <id>: <title>`.

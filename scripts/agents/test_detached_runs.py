@@ -338,9 +338,57 @@ class DetachedRunsTests(unittest.TestCase):
         self.update_record(paths[0], status="finished", exit_code=0)
         popen, _ = self.start(["new-check"])
         popen.assert_called_once()
-        self.assertEqual(len(list(paths[0].parent.glob("*.json"))), 4)
+        # The start also deletes the finished run: its worker has no open pass.
+        self.assertEqual(len(list(paths[0].parent.glob("*.json"))), 3)
+        self.assertFalse(paths[0].exists())
+
+    def finished_run(self, run_id: str, worker: str = WORKER, **fields: object) -> Path:
+        """A finished record with its log and lock files."""
+        path = self.record(["fixture", run_id]).replace(self.session / detached_runs.DETACHED_RUNS_DIR / f"{run_id}.json")
+        self.update_record(path, **{"run_id": run_id, "worker": worker, "status": "finished", "exit_code": 0,
+                                    "log": str(path.with_suffix(".log")), **fields})
+        for name in (f"{run_id}.log", f"{run_id}.record.lock", f".{run_id}.delivery.lock"):
+            _ = (path.parent / name).write_text("output", encoding="utf-8")
+        return path
+
+    def set_pass(self, status: str, started_at: float) -> None:
+        """Give the worker a pass in the run state."""
+        write_text_atomic(self.session / unit_runs.STATE_FILE, json.dumps({
+            "owner_staff_id": self.unit.id, "pass": {WORKER: {
+                "instance_id": "pass-1", "worker_id": self.worker_id, "status": status, "started_at": started_at}}}))
+
+    def run_files(self, run_id: str) -> list[str]:
+        folder = self.session / detached_runs.DETACHED_RUNS_DIR
+        return sorted(path.name for path in folder.iterdir() if path.name.lstrip(".").startswith(run_id + "."))
+
+    def test_prune_keeps_only_the_finished_runs_that_a_reader_needs(self) -> None:
+        runs = self.session / detached_runs.DETACHED_RUNS_DIR
+        opened = time.time()
+        self.set_pass("active", opened)
+        _ = self.finished_run("before-pass", started_at=opened - 10)
+        _ = self.finished_run("in-pass", started_at=opened + 1)
+        _ = self.finished_run("pending", started_at=opened - 10, completion_pending=True)
+        _ = self.finished_run("running", started_at=opened - 10, status="running")
+        _ = self.finished_run("director-old", worker="director", staff_id="", started_at=opened)
+        _ = self.finished_run("director-new", worker="director", staff_id="", started_at=opened + 5)
+        _ = self.finished_run("owner-gone", worker="gone", staff_id="00000000-0000-4000-8000-000000000000")
+        self.assertEqual(sorted(detached_runs.prune_finished(runs)), ["before-pass", "director-old", "owner-gone"])
+        for removed in ("before-pass", "director-old", "owner-gone"):
+            self.assertEqual(self.run_files(removed), [])
+        for kept in ("in-pass", "pending", "running", "director-new"):
+            self.assertEqual(self.run_files(kept), [f".{kept}.delivery.lock", f"{kept}.json", f"{kept}.log", f"{kept}.record.lock"])
+        # The pass end frees the runs that the pass read.
+        self.set_pass("completed", opened)
+        self.assertEqual(detached_runs.prune_finished(runs), ["in-pass"])
+        self.assertEqual(detached_runs.prune_finished(self.session / "absent"), [])
+
+    def test_a_start_deletes_the_owners_earlier_finished_runs(self) -> None:
+        _ = self.finished_run("director-done", worker="director", staff_id="")
+        _ = self.start(["new-check"], to="director")
+        self.assertEqual(self.run_files("director-done"), [])
 
     def test_a_gone_supervisor_holds_no_place_at_the_limit(self) -> None:
+        self.set_pass("active", 0.0)  # The open pass keeps the ended run for its reader.
         paths = self.seat_runs(3)
         self.update_record(paths[0], pid=DEAD_PID)
         popen, _ = self.start(["new-check"])
@@ -542,7 +590,8 @@ sys.exit(1)
             popen.assert_called_once()
         records = [cast(dict[str, object], json.loads(path.read_text(encoding="utf-8")))
                    for path in (self.session / detached_runs.DETACHED_RUNS_DIR).glob("*.json")]
-        self.assertEqual(sorted(str(record.get("tree_key")) for record in records), ["", "key-1", "key-2"])
+        # The key-2 run has no live supervisor, so the last start reaps it and deletes it: its worker has no open pass.
+        self.assertEqual(sorted(str(record.get("tree_key")) for record in records), ["", "key-1"])
 
     def test_another_command_seat_or_folder_starts_a_new_run(self) -> None:
         command = ["bash", "verify.sh", "lint", "hana"]
@@ -568,6 +617,7 @@ sys.exit(1)
     # On 2026-10-22 a unit stopped 23 queued runs by their process group: a supervisor that dies
     # delivers nothing, and its worker waits for a result that never comes.
     def test_a_start_ends_a_run_whose_supervisor_is_gone_with_a_failure_result(self) -> None:
+        self.set_pass("active", 0.0)  # The open pass keeps the ended run for its reader.
         path = self.record(["bash", "verify.sh", "test", "hana"])
         self.update_record(path, pid=DEAD_PID)
         popen, _ = self.start(["bash", "verify.sh", "lint", "hana"])
@@ -1359,6 +1409,31 @@ class PaneRunDeliveryTests(unittest.TestCase):
                 self.assertEqual((caller.session_dir, caller.name, caller.staff_id), (str(self.run_dir), row.name, row.id))
                 with patch.dict(os.environ, {"CODEX_THREAD_ID": row.id}):
                     self.assertIsInstance(detached_runs.caller_from_environment({variable: row.id}), detached_runs.NotDetachedWorker)
+
+    def test_a_unit_director_with_a_run_folder_owns_its_run_and_hears_its_result(self) -> None:
+        director = self.fixture.parent
+        self.assertEqual(director.kind, "unit")
+        runs = self.run_dir / detached_runs.DETACHED_RUNS_DIR
+        with (patch.dict(os.environ, {"CODEX_THREAD_ID": "", "CLAUDE_CODE_SESSION_ID": director.current_session}),
+              patch.object(treekey, "tree_key", return_value="private-tree"),
+              patch.object(subprocess, "Popen", return_value=SimpleNamespace(pid=0)) as spawn,
+              contextlib.redirect_stdout(io.StringIO()) as output):
+            self.assertEqual(detached_runs.main(["start", "--", "private-land"]), detached_runs.NOT_A_DETACHED_WORKER)
+            spawn.assert_not_called()
+            self.assertEqual(detached_runs.main(["start", "--session-dir", str(self.run_dir), "--", "private-land"]), 0,
+                             output.getvalue())
+        spawn.assert_called_once()
+        path, = runs.glob("*.json")
+        record = cast(detached_runs.RunRecord, json.loads(path.read_text()))
+        self.assertEqual((record["session_dir"], record["worker"], record["staff_id"]),
+                         (str(self.run_dir), director.name, director.id))
+        write_text_atomic(Path(record["log"]), "Private land completed.\n")
+        self.assertIn("sent", detached_runs.deliver(record, detached_runs.CompletedCommand(0)))
+        self.assertEqual(self.inputs, [])
+        target, text = self.notices[-1]
+        self.assertEqual((len(self.notices), target), (1, director.id))
+        self.assertIn(f"Detached run: {record['run_id']}", text)
+        self.assertIn("Private land completed.", text)
 
     def test_a_pane_workers_run_keeps_its_owner_when_options_name_another_worker(self) -> None:
         row = self.fixture.worker("TEST-command-owner", family="codex")
