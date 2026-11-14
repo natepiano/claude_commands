@@ -70,6 +70,12 @@ def write_python_tool(path: Path, source: str) -> None:
     path.chmod(0o755)
 
 
+def write_stdlib_tool(path: Path, source: str) -> None:
+    """Write a fixture tool that imports only the standard library, so it skips the startup rule."""
+    _ = path.write_text(f"#!{sys.executable} -IS\n" + source, encoding="utf-8")
+    path.chmod(0o755)
+
+
 def fixture_shim_source() -> str:
     """Preserve native arguments without an interpreter discovery probe."""
     startup = SOURCE / "scripts/lib/python_startup"
