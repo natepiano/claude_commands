@@ -14,7 +14,8 @@ No other open phase may hold it through an `Active` state, a pending release, or
 Codex workers edit through `apply_patch`, so the Codex
 pre-edit hook (`scripts/hooks/pre-tool-use-berth.py`) runs that check and writes `Active`
 here. `record-active` is the checkpoint-time backstop for a first touch the hook did not see:
-it checks every path of the phase changed since its baseline and writes `Active` from the answer.
+it checks every path the phase changed since its baseline and writes `Active` from the answer.
+A merge into the branch, at phase start or later, adds only the paths it resolved by hand.
 
 A phase is open while the progress recorder lists it as started and unfinished. Every change to it goes through a verb,
 so no session writes it by hand: `enroll` writes the first state from the `/sync board` answer
@@ -834,9 +835,16 @@ def _post_repair(session_dir: Path, line: str, *, record_changed: bool = True) -
 
 
 def changed_since_baseline(root: Path, baseline: str) -> list[str]:
-    """Every path changed, deleted or added since the phase baseline, untracked files included."""
+    """Every path the phase changed, deleted or added since its baseline, untracked files included.
+
+    Only the branch's own commits count. A merge adds only a path its result changes from every
+    parent, as a hand-resolved conflict: the paths it brings from another branch are not the phase's.
+    """
     paths: list[str] = []
-    for command in (["diff", "--name-only", "--no-renames", baseline], ["ls-files", "--others", "--exclude-standard"]):
+    for command in (["log", "--first-parent", "--diff-merges=dense-combined", "--no-renames", "--name-only",
+                     "--format=", f"{baseline}..HEAD"],
+                    ["diff", "--name-only", "--no-renames", "HEAD"],
+                    ["ls-files", "--others", "--exclude-standard"]):
         result = subprocess.run(["git", "-C", str(root), *command], capture_output=True, text=True,
                                 check=False, stdin=subprocess.DEVNULL)
         if result.returncode != 0:
