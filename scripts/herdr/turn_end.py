@@ -218,6 +218,11 @@ def _finish_completion(row: staff.StaffRow, parent: staff.StaffRow, run: Path, p
         _ = scratch.end(scratch.worker_task(row.id))
     except Exception as error:
         details.append(f"scratch cleanup failed for {row.name}: {' '.join(str(error).splitlines())}")
+    from scripts.agents import detached_runs
+    try:
+        _ = detached_runs.remove_finished(run / detached_runs.DETACHED_RUNS_DIR, row.name)
+    except OSError as error:
+        details.append(f"detached run cleanup failed for {row.name}: {' '.join(str(error).splitlines())}")
     try:
         if not completion.pane_closed:
             with redirect_stderr(io.StringIO()) as diagnostics:

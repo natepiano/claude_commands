@@ -139,6 +139,12 @@ class TurnEndTests(unittest.TestCase):
                         kept = scratch.new_worker()
                         atomic_file.write_text_atomic(kept / "peer.txt", "peer output")
                         kept_folders.append(kept)
+                    runs = self.case.run_dir / "detached_runs"
+                    runs.mkdir(exist_ok=True)
+                    for run_id, owner in (("own", name), ("peer", peer.name)):
+                        atomic_file.write_text_atomic(runs / f"{run_id}.json", json.dumps(
+                            {"run_id": run_id, "worker": owner, "status": "finished"}))
+                        atomic_file.write_text_atomic(runs / f"{run_id}.log", "output")
                 active = progress_history.active_dispatch(row.id, self.case.run_dir)
                 self.assertIsInstance(active, progress_history.ActiveDispatch)
                 assert isinstance(active, progress_history.ActiveDispatch)
@@ -201,6 +207,10 @@ class TurnEndTests(unittest.TestCase):
                 if close == "scratch":
                     self.assertEqual(list(Path(os.environ["TMPDIR"]).iterdir()), kept_folders)
                     self.assertEqual((kept_folders[0] / "peer.txt").read_text(), "peer output")
+                    # The pass end deletes the worker's finished runs and keeps the peer's.
+                    runs = self.case.run_dir / "detached_runs"
+                    self.assertEqual(sorted(path.name for path in runs.iterdir() if not path.name.startswith(".")),
+                                     ["peer.json", "peer.log"])
                 self.assertEqual(staff.by_id(row.id), row)
                 log = self.case.fixture.root / "state/herdr/turn-end-ignored.jsonl"
                 entry = cast(dict[str, object], json.loads(log.read_text().splitlines()[-1]))

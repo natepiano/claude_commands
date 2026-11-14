@@ -15,12 +15,16 @@ class ProcessCommandText:
 def process_args(pid: int) -> list[str] | ProcessCommandText:
     """Read the process arguments or the complete ps command text."""
     if Path("/proc/self").exists():
-        try:
-            return Path(f"/proc/{pid}/cmdline").read_bytes().decode(errors="replace").split("\0")
-        except OSError:
-            return []
+        return _proc_args(Path(f"/proc/{pid}"))
     shown = subprocess.run(["ps", "-p", str(pid), "-o", "args="], capture_output=True, text=True, check=False)
     return ProcessCommandText(shown.stdout.strip())
+
+
+def _proc_args(process: Path) -> list[str]:
+    try:
+        return (process / "cmdline").read_bytes().decode(errors="replace").split("\0")
+    except OSError:
+        return []
 
 
 def runs_command(pid: int, command: Sequence[str]) -> bool:
@@ -43,6 +47,27 @@ def runs_command(pid: int, command: Sequence[str]) -> bool:
 
     return any(Path(part).name == Path(command[0]).name and matches(index + 1, command[1:])
                for index, part in enumerate(parts) if part)
+
+
+@dataclass(frozen=True)
+class ProcessTableUnavailable:
+    """This machine has no /proc process table."""
+
+
+def supervisor_records() -> dict[Path, frozenset[int]] | ProcessTableUnavailable:
+    """Map each record that a live supervisor names to the supervisor process IDs."""
+    if not Path("/proc/self").exists():
+        return ProcessTableUnavailable()
+    found: dict[Path, set[int]] = {}
+    for process in Path("/proc").iterdir():
+        if not process.name.isdecimal():
+            continue
+        parts = _proc_args(process)
+        for index, part in enumerate(parts[:-2]):
+            if Path(part).name == "detached_runs.py" and parts[index + 1] == "supervise" and parts[index + 2]:
+                found.setdefault(Path(parts[index + 2]).resolve(), set()).add(int(process.name))
+                break
+    return {path: frozenset(pids) for path, pids in found.items()}
 
 
 def supervises(pid: int, record_path: Path) -> bool:

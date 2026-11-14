@@ -14,7 +14,7 @@ try:
 except FileNotFoundError:
     pass
 
-from collections.abc import Callable, Generator
+from collections.abc import Callable, Generator, Mapping
 
 import argparse
 import contextlib
@@ -146,6 +146,11 @@ def _run_worker(record: RunRecord, membership: staff.StaffSnapshot) -> staff.Sta
         reason = f"{record['worker']}: detached run has no worker staff row"
         return RunWorkerUnavailable(reason)
     return member
+
+
+def _is_worker(staff_id: str) -> bool:
+    member = staff.local_snapshot().by_id(staff.StaffId(staff_id)) if staff_id else None
+    return member is not None and member.kind == "worker"
 
 
 def _runs_dir(session_dir: str) -> Path:
@@ -361,6 +366,37 @@ def _complete_worker_dispatch(record: RunRecord) -> None:
         complete(str(member.current_session))
 
 
+# The files each run keeps beside its record; the record goes last.
+_RUN_FILES = ("{}.log", "{}.scope", "{}.reap", "{}.record.lock", ".{}.delivery.lock", "{}.json")
+
+
+def remove_finished(runs: Path, worker: str) -> list[str]:
+    """Delete the worker's finished runs when its pass ends; the user keeps no old run files.
+
+    Until the pass ends, the pass reads these records to prove that each result reached the transcript.
+    """
+    if not runs.is_dir():
+        return []
+    with (runs / ".start.lock").open("a") as admission:
+        fcntl.flock(admission, fcntl.LOCK_EX)
+        return _remove_finished_locked(runs, worker)
+
+
+def _remove_finished_locked(runs: Path, worker: str) -> list[str]:
+    """Delete the finished runs of one owner while the caller holds the admission lock."""
+    removed: list[str] = []
+    for path in sorted(runs.glob("*.json")):
+        raw = worker_lifecycle.read_json_object(path)
+        run_id = raw.get("run_id")
+        if (raw.get("worker") != worker or raw.get("status") != "finished" or raw.get("completion_pending")
+                or not isinstance(run_id, str) or path.name != f"{run_id}.json"):
+            continue
+        for name in _RUN_FILES:
+            (runs / name.format(run_id)).unlink(missing_ok=True)
+        removed.append(run_id)
+    return removed
+
+
 def live_twin(runs: Path, worker: str, command: list[str], tree_key: str) -> RunRecord | None:
     """A running record of the same worker, command, folder and tree key whose supervisor lives.
     After an interrupt on 2026-10-21, hana_catalyst-inspectors started its lint run three times
@@ -401,6 +437,30 @@ def live_runs(runs: Path, worker: str) -> list[RunRecord]:
 def live_runs_for_staff(runs: Path, identities: frozenset[staff.StaffId]) -> list[RunRecord]:
     """Read live records for fixed staff identities, including renamed members."""
     return _live_runs(runs, lambda raw: isinstance(identity := raw.get("staff_id"), str) and identity in identities)
+
+
+def live_runs_in_folders(folders: Mapping[Path, frozenset[staff.StaffId]]) -> list[RunRecord]:
+    """Read live records for resolved run folders from the supervisor processes.
+
+    Only the records that a live supervisor names are read. Without /proc,
+    each folder's records are read.
+    """
+    supervisors = detached_run_process.supervisor_records()
+    if isinstance(supervisors, detached_run_process.ProcessTableUnavailable):
+        return [run for folder, identities in folders.items()
+                for run in live_runs_for_staff(folder / DETACHED_RUNS_DIR, identities)]
+    named: dict[Path, list[Path]] = {}
+    for path in sorted(supervisors):
+        if path.parent.name == DETACHED_RUNS_DIR and path.parent.parent in folders:
+            named.setdefault(path.parent.parent, []).append(path)
+    found: list[RunRecord] = []
+    for folder, identities in folders.items():
+        for path in named.get(folder, []):
+            raw = worker_lifecycle.read_json_object(path)
+            if (raw.get("status") == "running" and isinstance(identity := raw.get("staff_id"), str)
+                    and identity in identities and _integer(raw.get("pid")) in supervisors[path]):
+                found.append(cast(RunRecord, cast(object, raw)))
+    return found
 
 
 def _live_runs(runs: Path, owns: Callable[[dict[str, object]], bool]) -> list[RunRecord]:
@@ -460,6 +520,11 @@ def command_start(args: argparse.Namespace) -> int:
     with (runs / ".start.lock").open("a") as admission:
         fcntl.flock(admission, fcntl.LOCK_EX)
         _ = _reap_orphans_locked(runs)
+        owner = reference or _worker_reference(session_dir, name)
+        if not _is_worker(owner):
+            # An owner without a pass read its earlier results before this start.
+            # A worker's pass end deletes the worker's finished runs.
+            _ = _remove_finished_locked(runs, name)
         if twin := live_twin(runs, name, command, tree_key):
             started = time.strftime("%H:%M:%S", time.localtime(twin["started_at"]))
             print(f"run {twin['run_id']} is already running for {name} on these files (started {started}, "
@@ -483,7 +548,7 @@ def command_start(args: argparse.Namespace) -> int:
         log_path = runs / f"{run_id}.log"
         record: RunRecord = {
             "run_id": run_id, "status": "running", "session_dir": session_dir, "worker": name,
-            "staff_id": reference or _worker_reference(session_dir, name), "label": label, "command": command,
+            "staff_id": owner, "label": label, "command": command,
             "log": str(log_path), "started_at": time.time(), "pid": 0,
             "director_dir": director_dir, "done_message_file": done_file, "tree_key": tree_key,
         }

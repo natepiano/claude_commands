@@ -340,6 +340,40 @@ class DetachedRunsTests(unittest.TestCase):
         popen.assert_called_once()
         self.assertEqual(len(list(paths[0].parent.glob("*.json"))), 4)
 
+    def finished_run(self, run_id: str, worker: str = WORKER, **fields: object) -> Path:
+        """A finished record with its log and lock files."""
+        path = self.record(["fixture", run_id]).replace(self.session / detached_runs.DETACHED_RUNS_DIR / f"{run_id}.json")
+        self.update_record(path, **{"run_id": run_id, "worker": worker, "status": "finished", "exit_code": 0,
+                                    "log": str(path.with_suffix(".log")), **fields})
+        for name in (f"{run_id}.log", f"{run_id}.record.lock", f".{run_id}.delivery.lock"):
+            _ = (path.parent / name).write_text("output", encoding="utf-8")
+        return path
+
+    def run_files(self, run_id: str) -> list[str]:
+        folder = self.session / detached_runs.DETACHED_RUNS_DIR
+        return sorted(path.name for path in folder.iterdir() if path.name.lstrip(".").startswith(run_id + "."))
+
+    def test_a_pass_end_deletes_only_the_workers_settled_finished_runs(self) -> None:
+        runs = self.session / detached_runs.DETACHED_RUNS_DIR
+        _ = self.finished_run("done")
+        _ = self.finished_run("pending", completion_pending=True)
+        _ = self.finished_run("other", worker="another-worker")
+        _ = self.finished_run("running", status="running")
+        self.assertEqual(detached_runs.remove_finished(runs, WORKER), ["done"])
+        self.assertEqual(self.run_files("done"), [])
+        for kept in ("pending", "other", "running"):
+            self.assertEqual(self.run_files(kept), [f".{kept}.delivery.lock", f"{kept}.json", f"{kept}.log", f"{kept}.record.lock"])
+        self.assertEqual(detached_runs.remove_finished(self.session / "absent", WORKER), [])
+
+    def test_a_start_deletes_earlier_finished_runs_of_an_owner_that_is_not_a_worker(self) -> None:
+        _ = self.finished_run("director-done", worker="director")
+        _ = self.finished_run("worker-done")
+        _ = self.start(["new-check"], to="director")
+        self.assertEqual(self.run_files("director-done"), [])
+        # A worker's pass still reads its finished runs; the pass end deletes them.
+        _ = self.start(["another-check"])
+        self.assertIn("worker-done.json", self.run_files("worker-done"))
+
     def test_a_gone_supervisor_holds_no_place_at_the_limit(self) -> None:
         paths = self.seat_runs(3)
         self.update_record(paths[0], pid=DEAD_PID)

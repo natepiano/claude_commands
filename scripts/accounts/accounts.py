@@ -2353,34 +2353,38 @@ class InvalidProducerSettings:
     """The producer has no usable launch settings for this operation."""
 
 
-_reported_producer_settings: ContextVar[set[staff.StaffId]] = ContextVar("reported_producer_settings")
+_scoped_producer_settings: ContextVar[dict[staff.StaffId, models_registry.LaunchSettings | InvalidProducerSettings]] = (
+    ContextVar("scoped_producer_settings"))
 
 
 @contextmanager
 def settings_report_scope() -> Generator[None]:
-    """Report each invalid producer once within an operation."""
+    """Resolve and report each producer's settings once within an operation."""
     try:
-        _ = _reported_producer_settings.get()
+        _ = _scoped_producer_settings.get()
     except LookupError:
-        token = _reported_producer_settings.set(set())
+        token = _scoped_producer_settings.set({})
         try:
             yield
         finally:
-            _reported_producer_settings.reset(token)
+            _scoped_producer_settings.reset(token)
     else:
         yield
 
 
 def producer_settings(member: staff.StaffRow) -> models_registry.LaunchSettings | InvalidProducerSettings:
     """Read one producer's settings and exclude it when its settings are invalid."""
+    resolved = _scoped_producer_settings.get({})
+    if member.id in resolved:
+        return resolved[member.id]
     try:
-        return models_registry.launch_settings("producers", member.name)
+        settings: models_registry.LaunchSettings | InvalidProducerSettings = (
+            models_registry.launch_settings("producers", member.name))
     except ValueError as error:
-        reported = _reported_producer_settings.get(set())
-        if member.id not in reported:
-            reported.add(member.id)
-            account_anomaly(f"{member.name}: {error}")
-        return InvalidProducerSettings()
+        account_anomaly(f"{member.name}: {error}")
+        settings = InvalidProducerSettings()
+    resolved[member.id] = settings
+    return settings
 
 
 def eligible_producers(membership: staff.StaffSnapshot, family: str) -> tuple[staff.StaffRow, ...]:
@@ -5330,6 +5334,14 @@ def _moving_role_suffix(role: str, label: str, groups: GroupAccounts) -> str:
 @settings_report_scope()
 def _read_local_role_sessions(groups: GroupAccounts, *, include_workers: bool = True) -> LocalRoleSessions:
     """Read local membership, processes, and activity for counts and moves."""
+    from scripts.herdr import herdr
+
+    # One pane and process read serves every member in this read.
+    with herdr.observation_snapshot():
+        return _observed_role_sessions(groups, include_workers=include_workers)
+
+
+def _observed_role_sessions(groups: GroupAccounts, *, include_workers: bool) -> LocalRoleSessions:
     from scripts.message import sessions
     from scripts.herdr import pane_launch
     from scripts.production import session_staff, staff
