@@ -3905,3 +3905,25 @@ Checkpoint 2cfdd87f1. Changed `scripts/message/test_notifier.py` (launcher stubs
 - Old and new agree on 8 layouts: top, subfolder, symlink, linked worktree, bare, separate metadata, metadata folder, `.git`.
 - AWS pair (c7a.8xlarge, 3 rounds): `copies/test_copies.py` 24.75 -> 24.32 CPU s; `style/test_crate_run.py` 55.16 -> 54.26; `production/test_fast_track.py` 56.82 -> 56.75.
 - Commit 5469f0791. Production change with the sdlc go; the land runs the full gate.
+
+### Phase 266 — The offload cleanup tests run the real lint sweep only where they test the trim  · status: done
+**Depends on:** none
+**Owner:** natest (test-only change).
+
+#### Work Order
+
+**Goal:** `mac_test/test_offload_cleanup.py` starts the real lint sweep only in the subtests that check the trim.
+
+**Spec:**
+- The trim step in the remote text runs the lint sweep through `$HOME/.claude/scripts/lib/py`. One start costs about 0.5 CPU s (import and `process_uses`).
+- `setUp` writes a `py` stub that exits 0. The tests of the shell text around the trim use it.
+- `real_sweep()` writes the `exec python3` stub. The budget trim subtests and the trim success subtest call it.
+- The trim failure subtest keeps its `exit 9` stub.
+
+**Files:** `scripts/mac_test/test_offload_cleanup.py`.
+
+**Workers:** director only (no-worker mode).
+
+**Acceptance gate:**
+- The module passes with the same 17 tests.
+- AWS pair on `mac_test/test_offload_cleanup.py`. Every behavior check stays.

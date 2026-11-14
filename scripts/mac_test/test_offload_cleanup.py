@@ -94,6 +94,7 @@ class MacTargetCleanupShellTests(unittest.TestCase):
     temporary_directory: Path = Path()
     bin_directory: Path = Path()
     configuration_environment: dict[str, str] = {}
+    python: Path = Path()
 
     @override
     def setUp(self) -> None:
@@ -106,9 +107,11 @@ class MacTargetCleanupShellTests(unittest.TestCase):
         self.bin_directory = self.root / "bin"
         self.bin_directory.mkdir()
         self.configuration_environment = config_environment(self.root / "configuration")
-        python = self.home_directory / ".claude/scripts/lib/py"
-        python.parent.mkdir(parents=True)
-        write_shell(python, f'exec {shlex.quote(sys.executable)} "$@"\n')
+        # The trim step runs the lint sweep, about 0.5 CPU s a start. Tests of the trim call real_sweep();
+        # the other tests check the shell text around it, so this stub reports a clean trim at once.
+        self.python = self.home_directory / ".claude/scripts/lib/py"
+        self.python.parent.mkdir(parents=True)
+        write_shell(self.python, 'exit 0\n')
         disk_space = self.bin_directory / "df"
         write_shell(disk_space, r'''
 json_args "$@" > "$CLEANUP_TEST_DIR/df-arguments.json"
@@ -133,6 +136,10 @@ printf 'built\n' > "$target/nextest-output"
 printf 'nextest finished\n'
 exit "$CLEANUP_TEST_STATUS"
 ''')
+
+    def real_sweep(self) -> None:
+        """Run the real lint sweep in the trim step."""
+        write_shell(self.python, f'exec {shlex.quote(sys.executable)} "$@"\n')
 
     def run_remote(
         self, shell: list[str], status: int, words: tuple[str, ...] = (), *,
@@ -288,6 +295,7 @@ exit 1
                         self.assertEqual(existing.read_text(), "keep\n")
                         self.assertEqual((target / "nextest-output").read_text(), "built\n")
 
+        self.real_sweep()
         for shell in (["/bin/sh"], ["zsh", "-f"]):
             for status in (0, 42):
                 for default_kib, repository_kib, trim in ((96, 0, True), (256, 96, True), (96, 256, False)):
@@ -324,9 +332,10 @@ exit 1
                     target.mkdir()
                     retained = target / "unmatched-output"
                     _ = retained.write_bytes(os.urandom(128 * 1024))
-                    python = self.home_directory / ".claude/scripts/lib/py"
-                    write_shell(python, 'exit 9\n' if trim_fails else
-                                f'exec {shlex.quote(sys.executable)} "$@"\n')
+                    if trim_fails:
+                        write_shell(self.python, 'exit 9\n')
+                    else:
+                        self.real_sweep()
                     answer = self.run_remote(
                         shell, 42, budget_gib=str(96 / 1024 ** 2),
                         disk_output=("Filesystem GiB Used Available Capacity Mounted\n"
