@@ -175,9 +175,9 @@ The shared pane launch builder uses `set_home`.
 | `scripts/direct/assign_claude_test_support.py` | read | staff.json path |
 | `scripts/direct/assign_launcher_test_support.py` | write | by_id, local_snapshot, rename, set_worktree |
 | `scripts/direct/claude_worker.py` | read | runtime_id |
-| `scripts/direct/clear_phase_review.sh` | read | local_snapshot |
 | `scripts/direct/end_session.sh` | write | clear-run (shell); reads the current pointer through unit_runs.open_run |
 | `scripts/direct/phase_reservation.py` | read | snapshot, WorktreeUnfilled |
+| `scripts/direct/phase_reviewers.py` | read | local_snapshot, find; clear_phase_review.sh runs it |
 | `scripts/direct/phase_table.py` | read | active, snapshot |
 | `scripts/direct/plan_history.py` | read | snapshot |
 | `scripts/direct/prepare_session.sh` | write | set-run (shell), line 24; stores the prepared run path |
