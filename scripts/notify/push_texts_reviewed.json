@@ -814,21 +814,25 @@
           "rule": "title-names-the-stake"
         },
         {
+          "quote": "Thu 10-29 07:00 AST",
+          "rule": "times-carry-zone"
+        },
+        {
           "quote": "codex1 has 6,370 paid credits left.",
           "rule": "reader-starts-cold"
         },
         {
-          "quote": "until Sat 10-24 16:40 AST",
-          "rule": "times-carry-zone"
+          "quote": "codex1 has 6,370 paid credits left. Its plan refills Thu 10-29 07:00 AST.",
+          "rule": "what-happened-why-what-you-do"
         },
         {
           "quote": "Leave on (recommended): work spends these credits, then moves to Claude.",
           "rule": "every-choice-says-what-it-does"
         }
       ],
-      "reviewer": "user-spec: User zone is America/Curacao (AST) since 2026-10-21 (user_zone.conf); examples changed from EDT to AST only; showrunner 2026-10-25. Earlier: the user approved this template 2026-10-21 before 07:52 EDT via natedev; Leave on is recommended (user 2026-10-14); after 3 review passes the remaining objections target approved lines (recorded, not applied).; reviewer: opus",
-      "sha256": "97e3f3a4888e97b3f92e8e110fe60ff9299aad3fe997324ebedb611a638d2c3c",
-      "time": "2026-10-25T13:42:24.199895-04:00"
+      "reviewer": "user-spec: user 2026-11-13: the credits setting moves to the accounts config; only the action line changed; reviewer: claude-opus-5-5",
+      "sha256": "5a67accfbf836cbf2f7dacb08126c37ec74fca41ebf34ef7765141ec71c926ad",
+      "time": "2026-11-13T16:42:08.391255-05:00"
     },
     "typical": {
       "objections": [
@@ -837,21 +841,21 @@
           "rule": "title-names-the-stake"
         },
         {
-          "quote": "Turn off: work moves to Claude until Sat 10-24 16:40 AST.",
+          "quote": "Its plan refills Tue 10-27 02:33 AST.",
           "rule": "times-carry-zone"
         },
         {
           "quote": "codex2 has 25,345 paid credits left.",
-          "rule": "what-happened-why-what-you-do"
+          "rule": "reader-starts-cold"
         },
         {
-          "quote": "codex2 has 25,345 paid credits left.",
-          "rule": "reader-starts-cold"
+          "quote": "Leave on (recommended): work spends these credits, then moves to Claude.",
+          "rule": "every-choice-says-what-it-does"
         }
       ],
-      "reviewer": "user-spec: User zone is America/Curacao (AST) since 2026-10-21 (user_zone.conf); examples changed from EDT to AST only; showrunner 2026-10-25. Earlier: the user approved this template 2026-10-21 before 07:52 EDT via natedev; Leave on is recommended (user 2026-10-14); after 3 review passes the remaining objections target approved lines (recorded, not applied).; reviewer: opus",
-      "sha256": "97e3f3a4888e97b3f92e8e110fe60ff9299aad3fe997324ebedb611a638d2c3c",
-      "time": "2026-10-25T13:42:06.252454-04:00"
+      "reviewer": "user-spec: user 2026-11-13: the credits setting moves to the accounts config; only the action line changed; reviewer: claude-opus-5-5",
+      "sha256": "5a67accfbf836cbf2f7dacb08126c37ec74fca41ebf34ef7765141ec71c926ad",
+      "time": "2026-11-13T16:41:50.535280-05:00"
     }
   },
   "quota.paid_credits_queued": {
@@ -862,21 +866,21 @@
           "rule": "title-names-the-stake"
         },
         {
-          "quote": "To stop it, set use_credits: off",
-          "rule": "first-150-stand-alone"
+          "quote": "Tue 10-27 02:33 AST",
+          "rule": "times-carry-zone"
         },
         {
-          "quote": "codex2 has 25,345 paid credits left.",
-          "rule": "what-happened-why-what-you-do"
-        },
-        {
-          "quote": "workers spend these credits until your queued move runs",
+          "quote": "your queued move",
           "rule": "reader-starts-cold"
+        },
+        {
+          "quote": "Leave on (recommended): workers spend these credits until your queued move runs.",
+          "rule": "every-choice-says-what-it-does"
         }
       ],
-      "reviewer": "user-spec: user 2026-10-21: approved whatever messaging and accounts decide on paid credits; text agreed with accounts-unit; reviewer: opus",
-      "sha256": "5ea0c1dd6ea4e5c01c8436fdb2344b7f9801ab24af834edda4bd55d63b505500",
-      "time": "2026-10-21T18:19:20.767262-04:00"
+      "reviewer": "user-spec: user 2026-11-13: the credits setting moves to the accounts config; only the action line changed; reviewer: claude-opus-5-5",
+      "sha256": "e30d61127cd3bf1485f8c1ac674604c5c0b5f424067f08fa58abb0012e712bc6",
+      "time": "2026-11-13T16:42:20.376803-05:00"
     }
   },
   "review_watch.acknowledge": {
