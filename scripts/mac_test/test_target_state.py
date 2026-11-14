@@ -26,14 +26,14 @@ from unittest import mock
 SCRIPTS = Path(__file__).resolve().parents[1]
 
 if TYPE_CHECKING:
-    from scripts.mac_test import mac_test, offload
+    from scripts.mac_test import eligibility, mac_test, offload
     from scripts.build_targets import targets
     from scripts.build_hold import build_hold
     from scripts.buildlog import record, store
     from scripts.message import sessions
     from scripts.lint.memory_test_support import write_config_fixture, config_environment
 else:
-    from scripts.mac_test import mac_test, offload
+    from scripts.mac_test import eligibility, mac_test, offload
     from scripts.build_targets import targets
     from scripts.build_hold import build_hold
     from scripts.buildlog import record
@@ -115,8 +115,8 @@ class IsolatedTargetState(unittest.TestCase):
         _ = self.enterContext(mock.patch.object(time, "monotonic", return_value=100.0))
         _ = self.enterContext(mock.patch.object(build_hold, "datetime", HoldClock))
         _ = self.enterContext(mock.patch.object(process_identity, "process_start", return_value=process_identity.Started("fake-start")))
-        _ = self.enterContext(mock.patch.object(offload, "repository_identity",
-                                              return_value=offload.KnownRepository("project")))
+        _ = self.enterContext(mock.patch.object(eligibility, "repository_identity",
+                                              return_value=eligibility.KnownRepository("project")))
         _ = self.enterContext(mock.patch.object(build_hold, "owning_session", return_value=NoOwningSession()))
         _ = self.enterContext(mock.patch.object(sessions, "live_sessions", return_value=[]))
         _ = self.enterContext(mock.patch.object(mac_test, "start_watcher"))
@@ -380,7 +380,7 @@ class TargetStateTests(IsolatedTargetState):
                              NOW.timestamp() + seconds)
         before = self.snapshot()
         for name, active in zip(TARGET_NAMES, (False, True, True), strict=True):
-            self.assertEqual(isinstance(offload.read_backoff(NOW.timestamp() + 15, name), offload.ActiveBackoff), active)
+            self.assertEqual(isinstance(eligibility.read_backoff(NOW.timestamp() + 15, name), eligibility.ActiveBackoff), active)
         self.assertEqual(self.snapshot(), before)
 
     def test_free_now_uses_only_the_selected_targets_backoff(self) -> None:
@@ -489,10 +489,10 @@ class TargetStateTests(IsolatedTargetState):
         self.assertIsInstance(state, targets.Running)
         if isinstance(state, targets.Running):
             self.assertEqual([job.what for job in state.jobs], ["legacy test"])
-        self.assertIsInstance(offload.read_backoff(NOW.timestamp()), offload.ActiveBackoff)
+        self.assertIsInstance(eligibility.read_backoff(NOW.timestamp()), eligibility.ActiveBackoff)
         for name in ("linux-one", "linux-two"):
             self.assertIsInstance(targets.target_state(self.selected_target(name)), targets.Free)
-            self.assertNotIsInstance(offload.read_backoff(NOW.timestamp(), name), offload.ActiveBackoff)
+            self.assertNotIsInstance(eligibility.read_backoff(NOW.timestamp(), name), eligibility.ActiveBackoff)
         self.assertEqual(self.snapshot(), before)
         result = self.release()
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
