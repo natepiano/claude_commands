@@ -14,7 +14,8 @@ No other open phase may hold it through an `Active` state, a pending release, or
 Codex workers edit through `apply_patch`, so the Codex
 pre-edit hook (`scripts/hooks/pre-tool-use-berth.py`) runs that check and writes `Active`
 here. `record-active` is the checkpoint-time backstop for a first touch the hook did not see:
-it checks every path of the phase changed since its baseline and writes `Active` from the answer.
+it checks every path the phase changed since its baseline and writes `Active` from the answer.
+A merge into the branch, at phase start or later, adds only the paths it resolved by hand.
 
 A phase is open while the progress recorder lists it as started and unfinished. Every change to it goes through a verb,
 so no session writes it by hand: `enroll` writes the first state from the `/sync board` answer
@@ -86,6 +87,7 @@ HELD_FOR_TICKET = "held_for_ticket"
 WORKTREE = "worktree"
 # Lifecycles of a released reservation; `protected_tip` names the commit it was released at.
 CHECKPOINT_RELEASED = frozenset({"outstanding", "released_after_checkpoint"})
+RELEASED_WITHOUT_CHECKPOINT = "released_without_checkpoint"
 HOLDS_RESERVATION = frozenset({ACTIVE, PENDING})
 # A checkpoint's display form.
 SHORT_COMMIT = 7
@@ -586,7 +588,8 @@ def clear(phase_dir: Path, released: str = "", repo: Path = WORKING_DIRECTORY) -
     A state that owns no reservation clears at once. The pending release state clears only with
     `released`, the checkpoint commit whose release was confirmed: the recorded string itself, or any
     name `repo` resolves to the recorded commit. The recorded commit remains in the release marker
-    until enrollment restores the phase. `Active` never clears here."""
+    until enrollment restores the phase. `Active` clears only when berth's board in `repo` shows its
+    reservation released without a checkpoint; that clear writes no release marker."""
     state = read_state(phase_dir)
     kind = _string(state.get("kind"))
     if not kind:
@@ -596,6 +599,8 @@ def clear(phase_dir: Path, released: str = "", repo: Path = WORKING_DIRECTORY) -
         if not released or (released != commit and commit_id(repo, released) != commit):
             raise StateRefused(f"the pending release names checkpoint {commit}; pass --released {commit} after its release")
         released = commit
+    elif kind == ACTIVE and lifecycle(repo, _recorded(state)) == RELEASED_WITHOUT_CHECKPOINT:
+        released = ""
     elif kind not in BOARD_STATES.values():
         raise StateRefused(f"the phase is {kind}; commit its checkpoint and confirm the release first")
     if released:
@@ -830,9 +835,16 @@ def _post_repair(session_dir: Path, line: str, *, record_changed: bool = True) -
 
 
 def changed_since_baseline(root: Path, baseline: str) -> list[str]:
-    """Every path changed, deleted or added since the phase baseline, untracked files included."""
+    """Every path the phase changed, deleted or added since its baseline, untracked files included.
+
+    Only the branch's own commits count. A merge adds only a path its result changes from every
+    parent, as a hand-resolved conflict: the paths it brings from another branch are not the phase's.
+    """
     paths: list[str] = []
-    for command in (["diff", "--name-only", "--no-renames", baseline], ["ls-files", "--others", "--exclude-standard"]):
+    for command in (["log", "--first-parent", "--diff-merges=dense-combined", "--no-renames", "--name-only",
+                     "--format=", f"{baseline}..HEAD"],
+                    ["diff", "--name-only", "--no-renames", "HEAD"],
+                    ["ls-files", "--others", "--exclude-standard"]):
         result = subprocess.run(["git", "-C", str(root), *command], capture_output=True, text=True,
                                 check=False, stdin=subprocess.DEVNULL)
         if result.returncode != 0:

@@ -407,6 +407,12 @@ It returns 1 when a gate reservation is open and 0 when none is open.
 Missing or unreadable evidence returns 2.
 
 A new gate ranks only variants from its deployment.
+`deploy.py up` saves the deployed `instance_types` in `gate-deployment.json`.
+A gate skips a configured type that this list does not name, and prints `Run deploy.py up`.
+When the list names no configured type, the gate falls back to natedev before any launch.
+A manifest without the list keeps every configured type.
+An `UnauthorizedOperation` refusal skips that type for the rest of the launch while another type remains.
+`launch.json` saves the skipped types in `unauthorized_types`.
 Before its first ranking, it reads live Spot prices in parallel from each deployed region.
 Each region receives one Linux/UNIX request for all configured `instance_types`.
 `spot_price_live_read_timeout_s=3` bounds the whole parallel read in seconds.

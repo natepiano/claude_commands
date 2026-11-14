@@ -1,15 +1,13 @@
 /** Complete activity counts for one role. */
 export interface RoleSessionCounts {
   busy: number;
-  starting: number;
-  waiting: number;
   idle: number;
   paused: number;
   exited: number;
   total: number;
 }
-/** Older status producers omit starting and waiting counts. */
-export interface StoredRoleSessionCounts extends Omit<RoleSessionCounts, 'starting' | 'waiting'> {
+/** Older status producers also wrote starting and waiting counts, which are busy. */
+export interface StoredRoleSessionCounts extends RoleSessionCounts {
   starting?: number;
   waiting?: number;
 }

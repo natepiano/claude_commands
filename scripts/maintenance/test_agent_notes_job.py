@@ -1,6 +1,7 @@
 """Deadlines isolate maintenance failures; completed parts survive an interrupted pass."""
 from __future__ import annotations
 
+import io
 import json
 import os
 import subprocess
@@ -8,6 +9,8 @@ import tempfile
 import time
 import unittest
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import redirect_stdout
+from datetime import datetime, timezone
 from pathlib import Path
 from threading import Event
 from typing import cast, override
@@ -92,6 +95,65 @@ class JobTests(unittest.TestCase):
             return job.PartResult(name, job.Outcome.SUCCESS, 0, 0)
         with patch.object(job, "run_part", side_effect=part):
             self.assertTrue(all(item.exit_code == 0 for item in job.run_job()))
+
+    def test_logins_part_calls_the_reminder_with_utc_time_and_prints_its_lines(self) -> None:
+        from scripts.accounts import login_sittings
+
+        calls: list[datetime] = []
+
+        def remind(now: datetime) -> list[str]:
+            calls.append(now)
+            return ["fixture sitting reminder", "fixture safety reminder"]
+
+        before = datetime.now(timezone.utc)
+        with (patch.object(login_sittings, "run", side_effect=remind),
+              redirect_stdout(io.StringIO()) as output):
+            self.assertEqual(job._perform(Part.LOGINS), 0)  # pyright: ignore[reportPrivateUsage]
+        after = datetime.now(timezone.utc)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0].tzinfo, timezone.utc)
+        self.assertLessEqual(before, calls[0])
+        self.assertLessEqual(calls[0], after)
+        self.assertEqual(output.getvalue(), "fixture sitting reminder\nfixture safety reminder\n")
+
+    def test_logins_part_uses_its_configured_interval_and_deadline_in_the_job(self) -> None:
+        original = self.config.read_text()
+        self.assertEqual(settings().parts[Part.LOGINS], Schedule(120, 45))
+        _ = self.config.write_text(original.replace(
+            "[parts.logins]\ninterval_seconds = 120\ntimeout_seconds = 45",
+            "[parts.logins]\ninterval_seconds = 17\ntimeout_seconds = 9"))
+        calls: list[tuple[Part, Schedule]] = []
+
+        def part(name: Part, cadence: Schedule, _deadline: float) -> job.PartResult:
+            calls.append((name, cadence))
+            return job.PartResult(name, job.Outcome.SUCCESS, 0, 0)
+
+        with patch.object(job, "run_part", side_effect=part):
+            with patch.object(time, "time", return_value=1000):
+                first = job.run_job()
+            self.assertIn(Part.LOGINS, [result.part for result in first if result.outcome is job.Outcome.SUCCESS])
+            calls.clear()
+            with patch.object(time, "time", return_value=1016):
+                before_due = job.run_job()
+            self.assertTrue(all(result.outcome is job.Outcome.NOT_DUE for result in before_due))
+            self.assertEqual(calls, [])
+            with patch.object(time, "time", return_value=1017):
+                _ = job.run_job()
+        self.assertEqual(calls, [(Part.LOGINS, Schedule(17, 9))])
+
+    def test_logins_part_runs_while_notes_are_still_running(self) -> None:
+        logins_started = Event()
+
+        def part(name: Part, _cadence: Schedule, _deadline: float) -> job.PartResult:
+            if name is Part.LOGINS:
+                logins_started.set()
+            if name is Part.NOTES:
+                self.assertTrue(logins_started.wait(timeout=5))
+            return job.PartResult(name, job.Outcome.SUCCESS, 0, 0)
+
+        with patch.object(job, "run_part", side_effect=part):
+            self.assertTrue(all(result.outcome is job.Outcome.SUCCESS for result in job.run_job()))
+        self.assertTrue(logins_started.is_set())
 
     def vault_git(self, *arguments: str) -> str:
         return subprocess.run(

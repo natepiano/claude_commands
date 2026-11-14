@@ -28,7 +28,7 @@ The ledger preserves those costs after builder removal.
 The current resource inventory excludes the removed builder's ongoing storage costs.
 
 The state folder is `~/.local/state/build-targets/aws`.
-`gate-deployment.json` records the bucket and regional launch resources.
+`gate-deployment.json` records the bucket, the deployed `instance_types` and regional launch resources.
 `deployment.json` records foundation ownership.
 The configured region list alone does not prove that all regional stacks exist.
 Preserve the ledger, deployment records, launch records, and cleanup records during recovery.

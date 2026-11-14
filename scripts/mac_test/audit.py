@@ -20,7 +20,7 @@ from typing import Literal, cast
 from scripts.build_hold import override_guard
 from scripts.lib import conf
 
-from scripts.mac_test import cargo_manifest, offload
+from scripts.mac_test import eligibility, cargo_manifest
 
 
 ListingStatus = Literal["yes", "no", "unknown"]
@@ -293,17 +293,17 @@ def suggestion(
     return "can go to the Mac", unclassified
 
 
-def configured_packages(repository: offload.RepositoryIdentity) -> frozenset[str]:
-    if isinstance(repository, offload.UnknownRepository):
+def configured_packages(repository: eligibility.RepositoryIdentity) -> frozenset[str]:
+    if isinstance(repository, eligibility.UnknownRepository):
         return frozenset()
     values = conf.read("mac_test").values()
-    return frozenset(offload.comma_values(values.get(f"linux_only.{repository.name}", "")))
+    return frozenset(eligibility.comma_values(values.get(f"linux_only.{repository.name}", "")))
 
 
 def audit_member(
     root: Path,
     member: Path,
-    repository: offload.RepositoryIdentity,
+    repository: eligibility.RepositoryIdentity,
     listed_packages: frozenset[str],
 ) -> MemberAudit:
     manifest = cargo_manifest.toml_table(member / "Cargo.toml")
@@ -323,7 +323,7 @@ def audit_member(
     )
     listing: ListingStatus = (
         "unknown"
-        if isinstance(repository, offload.UnknownRepository)
+        if isinstance(repository, eligibility.UnknownRepository)
         else "yes" if package in listed_packages else "no"
     )
     return MemberAudit(
@@ -354,7 +354,7 @@ def listing_disagrees(member: MemberAudit) -> bool:
 
 def print_report(
     root: Path,
-    repository: offload.RepositoryIdentity,
+    repository: eligibility.RepositoryIdentity,
     members: tuple[MemberAudit, ...],
 ) -> None:
     print(
@@ -368,7 +368,7 @@ def print_report(
             f"| {member.package} | {member.source_sites} | {member.test_sites} | "
             + f"{dependencies} | {member.listing} | {member.suggestion} |"
         )
-    if isinstance(repository, offload.UnknownRepository):
+    if isinstance(repository, eligibility.UnknownRepository):
         print(f"\nRepository unknown: {root} is in no git repository.")
     disagreements = sorted(
         member.package for member in members if listing_disagrees(member)
@@ -405,7 +405,7 @@ def run(repo_dir: str, check: bool) -> int:
     manifest_path = root / "Cargo.toml"
     try:
         manifest = cargo_manifest.toml_table(manifest_path)
-        repository = offload.repository_identity(root)
+        repository = eligibility.repository_identity(root)
         listed_packages = configured_packages(repository)
         members = tuple(
             sorted(
@@ -420,7 +420,7 @@ def run(repo_dir: str, check: bool) -> int:
         print(f"audit: {error}", file=sys.stderr)
         return 2
     print_report(root, repository, members)
-    if check and isinstance(repository, offload.UnknownRepository):
+    if check and isinstance(repository, eligibility.UnknownRepository):
         return 2
     if check and any(
         member.suggestion == "keep on natedev" and member.listing == "no"

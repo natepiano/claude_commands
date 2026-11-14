@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from contextlib import closing
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from decimal import Decimal
 import json
 import os
@@ -252,6 +252,19 @@ class AwsReportTests(MeasurementFixture):
             self.assertIn('| 2026-01-15 | $0.30 | $0.30 | $0.00 | $0.00 | $0.00 | 1 | bill |',
                           aws_report.daily_spend_lines([renamed], Decimal(20), DAY))
         print('AWS layout fixture:\n### AWS\n' + section)
+
+    def test_spend_analysis_forecasts_the_month_from_billed_days(self) -> None:
+        def spend(day: str, source: str, gate: str, storage: str) -> ledger.DailySpend:
+            return ledger.DailySpend(day, source, (ledger.SpendGroupCost(ledger.SPEND_GROUPS[0], Decimal(gate)),
+                                                   ledger.SpendGroupCost('storage', Decimal(storage))), 1)
+        spends = [spend('2026-01-15', 'estimated from the newest bill', '1', '0'),
+                  spend('2026-01-14', 'AWS bill', '3', '1'), spend('2026-01-13', 'AWS bill', '1', '1'),
+                  spend('2025-12-31', 'AWS bill', '9', '1')]
+        lines = report.spend_analysis(spends, Decimal(100), date(2026, 1, 15), 2)
+        self.assertEqual(lines[0], '**Month to date (UTC 2026-01): $7.00 of the $100.00 monthly limit. '
+                         + 'Month forecast: $57.00 at $3.00 a day, the average of the last 2 billed days.**')
+        self.assertIn('32-CPU gate compute is 67% of the spend on those days.', lines)
+        self.assertEqual(report.spend_analysis(spends[:1], Decimal(100), date(2026, 1, 15), 2), [])
 
     def test_daily_spend_shows_estimates_after_the_newest_bill(self) -> None:
         spends = tuple(

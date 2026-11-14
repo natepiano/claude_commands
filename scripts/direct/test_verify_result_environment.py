@@ -41,11 +41,11 @@ class VerifyResultEnvironmentTests(VerifyMacOffloadFixture):
         )
         self.write_executable(self.bin_directory / "cargo", cargo)
         observe = f'''with open({str(VERIFY.parents[2] / "scripts/lib/package_root.py")!r}) as package_root: exec(package_root.read(), {{"__file__": package_root.name}})
-from scripts.mac_test import offload
+from scripts.mac_test import eligibility, offload
 parsed = offload.parser().parse_args(namespace=offload.CliArguments())
 request = offload.request_from_arguments(parsed)
-config = offload.read_config(Path(parsed.settings))
-command = offload.remote_test_command(config, request, offload.KnownRepository("hana"))
+config = eligibility.read_config(Path(parsed.settings))
+command = offload.remote_test_command(config, request, eligibility.KnownRepository("hana"))
 Path(os.environ["TEST_RUNNER_STATE"], "remote-command").write_text(command)
 '''
         self.write_executable(self.runner, RUNNER_STUB.replace(

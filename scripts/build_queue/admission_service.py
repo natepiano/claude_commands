@@ -2033,7 +2033,8 @@ class AdmissionServer:
     def _read_host_evidence(self, key: placement.HostEvidenceKey) -> placement.HostEvidence:
         """Read provider policy and exact claims outside the service loop."""
         from scripts.build_targets import build_targets, target_config
-        from scripts.mac_test import claim_state, offload
+        from scripts.mac_test import claim_state
+        from scripts.mac_test.eligibility import MacVerb, verb_kind
 
         request = self.host_requests[key]
         destination = key.destination
@@ -2042,7 +2043,7 @@ class AdmissionServer:
         target = next((target for target in target_config.read_targets() if target.name == destination.target), None)
         if target is None:
             return placement.HostEvidenceUnavailable(key, self.clock.now(), "target is no longer configured")
-        kind = offload.verb_kind(cast(offload.MacVerb, request.profile.step))
+        kind = verb_kind(cast(MacVerb, request.profile.step))
         if kind not in ("check", "lint", "doc", "test", "build", "example", "final"):
             return placement.HostEvidenceUnavailable(key, self.clock.now(), "command policy is unavailable")
         if isinstance(target, target_config.SshTarget):

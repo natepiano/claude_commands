@@ -19,9 +19,9 @@ A lint can leave its first mend memory wait for a free Mac.
 `build_targets.py eligible --repo-root DIR --kind check|lint|doc|test|build|example|final [--package PKG]` gives the routing answer.
 Its first line is `any_target` or `natedev_only <reason>`.
 Ordered target rows follow, with tab-separated name, eligibility, reason, settings path, and platform.
-A named test package uses its package rule.
-A workspace test refuses Mac offload when any member is `linux_only`.
-Check, lint, and doc require every workspace member to permit macOS.
+A step with a named package checks only that package against `linux_only.<repo>`, for every kind.
+`linux_only` keeps a package's own steps off the Mac; a package that depends on one still runs there.
+A step with no package refuses Mac offload when any workspace member is `linux_only`.
 This includes in-tree path dependencies, target dependencies, and inherited workspace dependencies.
 An unreadable member keeps the step on natedev.
 Offload must be on for the repository, its backoff must be clear, and the Mac must meet the disk floor.
@@ -193,6 +193,14 @@ The recorded action is `message_showrunner`.
 
 2026-11-11: Dailies and their Mac block footer were retired.
 Use `/build:mac status` to read the Mac block state.
+
+### Step eligibility — `scripts/mac_test/eligibility.py`
+
+This module holds the settings readers, `mac_step_eligibility`, and the readers for backoff, mirror-busy and failed-probe state.
+`build_targets.py` asks it first.
+It imports `offload.py` only for an eligible step: the probe, the disk floor and the reachability check.
+A refused step never imports the runner.
+`offload.py` calls these functions through the module, so one test patch covers both modules.
 
 ### The offload runner — `scripts/mac_test/offload.py`
 

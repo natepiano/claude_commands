@@ -9,15 +9,24 @@ Run this in the showrunner session. Run
 and print its output exactly as it comes, with nothing added. It finds the
 production from this session's staff row. Print its total line too, when present.
 Print the tables as Markdown in the reply, without code fences.
-Keep each phase on one Markdown row so Claude Code wraps its cells within the terminal width.
+Preserve continuation rows exactly as the script prints them.
+Each continuation row repeats Unit and fills one work cell.
+The script reads this pane's width once from herdr and shapes the phase tables for that width.
+When it cannot read the width within `units_table_width_read_milliseconds`, it uses `units_table_floor_columns`.
+This fallback is normal and prints no anomaly.
+`units_table_cell_lines` sets the cell line cap for Claude Code 2.1.319.
 Each table shows only the production's staff units, sorted by unit name without case distinctions.
-For the phase status table, **Status** is `busy`, `starting`, `waiting`, `idle`, `paused` or `exited`.
-The accounts board uses the same status rule.
-An exit record gives `exited` before a pause record gives `paused`.
-A busy pane gives `busy`. A starting pane gives `starting` before a live detached run gives `waiting`.
-Without these activity states, a live session or pane process gives `idle`.
-No live session or process gives `exited`.
-The style table uses the same status words as the phase table.
+The phase tables read one `cargo-handler census --json` for **Status** and **Workers**.
+The census lists the sessions and the workers that the handler tiles show.
+It runs beside the other reads, within `units_census_seconds` in `config/production.conf`.
+For the phase status table, **Status** is the tile's status word for the unit's current session.
+The session is the staff row's current session, or the session of the Claude in the unit's pane when the unit has no staff row.
+The words are `busy`, `idle`, `paused` and `exited`. Starting and waiting are activities, not status words.
+A tile without an accounts entry shows `—`.
+A unit whose session the census does not list shows `exited` when the census scanned the unit's machine.
+A unit on a machine that the census did not scan shows `—`.
+When the census fails, Status and Workers show `—` and the output ends with one anomaly line.
+The style table keeps the shared session classifier, which the accounts board also uses.
 **Unit** is the unit's staff name, including stopped units and units without a session.
 
 The phase status table and the style table add **Machine** after **Status** only when a row runs on another machine.
@@ -27,6 +36,11 @@ Each table omits a column when every row has `—` in that column.
 A table without rows keeps its columns.
 The phase tables preserve full work text and use Claude Code's native Markdown wrapping.
 Claude Code sets their column widths from the terminal width.
+When the column minimums exceed that width, the script adds a space inside the longest ID.
+The space follows a `-`, `/` or `_` between two letters or digits.
+A word without such a mark breaks only at `units_table_break_columns` or more columns; shorter words stay whole.
+When no such word is left and the minimums still exceed the width, the longest word over 3 columns breaks.
+One break costs less than Claude Code's hard wrap of every column.
 The style table uses `units_table_columns` in `config/production.conf`, which defaults to 170 terminal columns.
 It allows four columns for the terminal margin and measures text before Markdown escaping.
 Long style text cells end with `…`; a cut never splits a wide character.
@@ -77,7 +91,7 @@ ETA Plan appears when a unit has unfinished plan phases or a promise for an unfi
    An unknown holder keeps its recorded name or ID.
    A reason that starts with `waiting on`, `waiting for`, or either phrase after `blocked:` keeps that wording.
    A finished wait or pass removes its wait text.
-   Status keeps the session classifier even while Notes shows a wait.
+   Status keeps the census word even while Notes shows a wait.
 4. **ETA Next** shows the latest stated promise for that row's phase instance.
    `eta_phase_id` names the target; the active instance on an ETA event does not override that target.
    Without open work, it uses the next not-started plan phase with a promise.
@@ -93,11 +107,13 @@ ETA Plan appears when a unit has unfinished plan phases or a promise for an unfi
    A later `error` or `stopped` finish overrides earlier completions and plan-record done rows.
    That target's promise remains visible.
    A row without an unfinished plan or such a promise shows `—`.
-6. **Workers** lists workers with open passes in that row's phase instance, from the run records.
-   It lists workers with detached runs before workers that are working.
-   Run states are `waiting on run: <label> <elapsed>`, `result queued: <label>`, and `run gone: <label>`.
-   A finished pass removes its worker.
-   Without an open phase row, the cell keeps the existing pane observation rules.
+6. **Workers** lists the census workers of the unit.
+   An open phase row lists only the workers whose open pass is in that phase instance.
+   A row without an open phase lists every census worker of the unit.
+   Each detached run shows first, as `<name> waiting on run: <label> <elapsed>`, `<name> result queued: <label>`, or `<name> run gone: <label>`.
+   A running run without a start time omits the elapsed time.
+   A busy worker without a run shows `<name> waiting` or `<name> starting` when its tile activity ends in that word, else `<name> working`.
+   Idle workers add `+<n> idle` after other workers.
 7. **Non-Phase Work** shows `—` for an open phase row because Notes already describes that phase.
    A row without a recorded phase instance keeps the existing summary for work outside the plan.
 8. **Queued** combines the first `/unit:queue` item and `plan: phase <id>: <title>`.
@@ -113,10 +129,10 @@ ETA Plan appears when a unit has unfinished plan phases or a promise for an unfi
 Workers first limits each cell to 80 characters.
 Notes, Non-Phase Work, and Queued retain every word of each displayed item or title.
 Each phase table calls `display_cells.wrapped()` to remove columns whose cells are all `—`.
-The helper preserves full cells for native Markdown wrapping.
-Workers uses the same wrapping form when the status table exceeds the terminal width.
-Do not insert `<br>` or continuation rows.
-Claude Code displays `<br>` as text and adds row borders around continuation rows.
+At the pane width, or the floor without one, a cell that needs more lines than the cap continues on extra rows.
+A split uses ` · ` first, then `; `, then a word boundary.
+Unit, Status, Machine, and Progress never split.
+Do not insert `<br>`; Claude Code displays it as text.
 Empty cells show `—`.
 
 For `Kind: style` or units named in the production's `Style units` table, the table is
@@ -159,7 +175,7 @@ Staff name conflicts also produce lines. Worker run checks share one process sna
 A process with an identity but no staff row produces no line and cannot use a unit's pane placement.
 A process without an identity reports an unreadable thread when its pane holds staff.
 One staff candidate retains its pane placement with unknown status.
-Morty produces no anomaly when its thread matches `MORTY_NATIVE_ID` in `config/send.conf`.
+Morty produces no anomaly when its native ID is on the producer staff row named `morty`.
 The command sends one message with all anomaly lines to `UNIT_ANOMALIES_TO` in `config/production.conf` (`sdlc`).
 A failed send adds one anomaly line. It changes neither the table nor the exit code.
 

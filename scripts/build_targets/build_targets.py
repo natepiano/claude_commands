@@ -36,7 +36,7 @@ from scripts.mac_test import claim_state
 if TYPE_CHECKING:
     from scripts.build_hold import build_hold
     from scripts.build_queue.placement import SubmittingSession
-    from scripts.mac_test import mac_test, offload
+    from scripts.mac_test import eligibility, mac_test
     from scripts.message import roster
     from scripts.build_targets.targets import (
         Held, RunningJob, TargetState,
@@ -225,9 +225,9 @@ def format_state(name: str, state: TargetState,
 
 def probe_target(target: SshTarget) -> TargetState:
     from scripts.build_targets.targets import Unreachable
-    from scripts.mac_test import offload
+    from scripts.mac_test import eligibility, offload
 
-    config = offload.read_config(target.settings)
+    config = eligibility.read_config(target.settings)
     result = offload.probe_reachability(offload.ProcessController(), config)
     if isinstance(result, offload.UnreachableHost):
         return Unreachable(result.reason)
@@ -327,20 +327,20 @@ def step_routing_rule(kind: StepKind, routing: Routing = ANY_ELIGIBLE_TARGET,
     return AnyTarget()
 
 
-def remote_verb(kind: StepKind) -> offload.MacVerb:
+def remote_verb(kind: StepKind) -> eligibility.MacVerb:
 
-    from scripts.mac_test import offload
+    from scripts.mac_test import eligibility
 
-    step = offload.remote_step_kinds(kind)[0]
-    return cast(offload.MacVerb, "nextest" if step == "test" else "clippy" if step in ("lint", "example") else step)
+    step = eligibility.remote_step_kinds(kind)[0]
+    return cast(eligibility.MacVerb, "nextest" if step == "test" else "clippy" if step in ("lint", "example") else step)
 
 
 def start_probe_recovery(target: SshTarget, repo_root: Path, package: str, kind: StepKind) -> None:
     """Start one recovery probe without delaying the eligibility answer."""
 
-    from scripts.mac_test import offload
+    from scripts.mac_test import eligibility
 
-    directory = offload.state_directory(target.name)
+    directory = eligibility.state_directory(target.name)
     directory.mkdir(parents=True, exist_ok=True)
     with (directory / "recovery-probe.lock").open("a") as lock:
         try:
@@ -364,15 +364,15 @@ def command_recover_probe(args: CliArguments) -> int:
 
     from scripts.build_targets import target_config
     from scripts.copies import copies
-    from scripts.mac_test import mac_test, offload
+    from scripts.mac_test import eligibility, mac_test, offload
 
     with os.fdopen(args.recovery_fd):
         target = target_config.configured_ssh_target(args.target)
         config = ssh_target_config(target)
         if isinstance(config, ExcludedTarget):
             return 0
-        repository = offload.repository_identity(Path(args.repo_root))
-        if isinstance(repository, offload.UnknownRepository):
+        repository = eligibility.repository_identity(Path(args.repo_root))
+        if isinstance(repository, eligibility.UnknownRepository):
             return 0
         paths = mac_test.state_paths(target.name)
         if mac_test.free_now(paths, target.settings, Path(args.repo_root)) != "bad":
@@ -431,32 +431,38 @@ def mac_target_eligibility(target: LocalTarget | SshTarget, repo_root: Path,
                            session: SubmittingSession | claim_state.CallingSession = claim_state.CALLING_SESSION,
                            ) -> EligibleTarget | ExcludedTarget:
 
-    from scripts.mac_test import mac_test, offload
+    from scripts.mac_test import eligibility, mac_test
 
     session = claim_state.submitting_session(session)
     if isinstance(routing, LocalRequired):
         return ExcludedTarget(target, routing.reason)
     try:
-        config = offload.read_config(target.settings) if isinstance(target, SshTarget) else offload.read_config()
+        config = eligibility.read_config(target.settings) if isinstance(target, SshTarget) else eligibility.read_config()
         name = target.name if isinstance(target, SshTarget) else "mac"
-        steps = offload.remote_step_kinds(kind)
-        eligibility = offload.mac_step_eligibility(config, repo_root, package,
+        steps = eligibility.remote_step_kinds(kind)
+        repository = eligibility.mac_step_eligibility(config, repo_root, package,
             remote_verb(cast(StepKind, steps[0])), name, kind=steps[0])
-        if isinstance(eligibility, offload.IneligibleMacStep):
-            return ExcludedTarget(target, eligibility.reason)
+        if isinstance(repository, eligibility.IneligibleMacStep):
+            return ExcludedTarget(target, repository.reason)
         for step in steps[1:]:
-            policy = offload.mac_step_eligibility(config, repo_root, package,
+            policy = eligibility.mac_step_eligibility(config, repo_root, package,
                 remote_verb(cast(StepKind, step)), name, kind=step)
-            if isinstance(policy, offload.IneligibleMacStep):
+            if isinstance(policy, eligibility.IneligibleMacStep):
                 return ExcludedTarget(target, policy.reason)
         if isinstance(answer, CapacityNotRead):
             answer = mac_test.free_now(mac_test.state_paths(name), config.source, repo_root, session=session)
-        if answer == "blocked":
-            return ExcludedTarget(target, answer)
-        if answer == "bad":
-            return EligibleTarget(target)
+    except (OSError, UnicodeError, ValueError) as error:
+        return ExcludedTarget(target, f"state unreadable: {error}")
+    if answer == "blocked":
+        return ExcludedTarget(target, answer)
+    if answer == "bad":
+        return EligibleTarget(target)
+    # Only an eligible step pays for the offload runner's import.
+    from scripts.mac_test import offload
+
+    try:
         controller = offload.ProcessController()
-        probe = offload.probe_mac(controller, config, eligibility, name)
+        probe = offload.probe_mac(controller, config, repository, name)
         if isinstance(probe, offload.UnresolvedSlotStartup):
             return ExcludedTarget(target, "busy")
         if isinstance(probe, offload.UnavailableProbe):
@@ -464,7 +470,7 @@ def mac_target_eligibility(target: LocalTarget | SshTarget, repo_root: Path,
         handlers = (offload.interrupt_handlers(controller)
                     if threading.current_thread() is threading.main_thread() else nullcontext())
         with handlers:
-            disk = offload.ensure_mac_disk_floor(controller, config, eligibility, probe, name)
+            disk = offload.ensure_mac_disk_floor(controller, config, repository, probe, name)
         if isinstance(disk, offload.SweepFailed):
             print(f"build targets: Mac disk exclusion: {disk.cause}", file=sys.stderr)
         if not isinstance(disk, offload.MacDiskReady):
@@ -482,7 +488,7 @@ def ssh_target_eligibility(target: SshTarget, repo_root: Path, package: str,
                            ) -> EligibleTarget | ExcludedTarget:
     """Read Linux policy and capacity without evaluating a development shell."""
 
-    from scripts.mac_test import mac_test, offload
+    from scripts.mac_test import eligibility, mac_test
 
     session = claim_state.submitting_session(session)
     if target.platform == "macos" or isinstance(routing, LocalRequired):
@@ -495,10 +501,10 @@ def ssh_target_eligibility(target: SshTarget, repo_root: Path, package: str,
     config = ssh_target_config(target)
     if isinstance(config, ExcludedTarget):
         return config
-    for step in offload.remote_step_kinds(kind):
-        policy = offload.mac_step_eligibility(config, repo_root, package,
+    for step in eligibility.remote_step_kinds(kind):
+        policy = eligibility.mac_step_eligibility(config, repo_root, package,
             remote_verb(cast(StepKind, step)), target.name, kind=step)
-        if isinstance(policy, offload.IneligibleMacStep):
+        if isinstance(policy, eligibility.IneligibleMacStep):
             return ExcludedTarget(target, policy.reason)
     paths = mac_test.state_paths(target.name)
     answer = mac_test.free_now(paths, target.settings, repo_root, session=session)
@@ -508,16 +514,18 @@ def ssh_target_eligibility(target: SshTarget, repo_root: Path, package: str,
         return ExcludedTarget(target, answer)
     if answer == "bad":
         return EligibleTarget(target)
+    from scripts.mac_test import offload
+
     if isinstance(offload.probe_reachability(offload.ProcessController(), config), offload.UnreachableHost):
         return ExcludedTarget(target, "unreachable")
     return EligibleTarget(target)
 
 
-def ssh_target_config(target: SshTarget) -> offload.OffloadConfig | ExcludedTarget:
+def ssh_target_config(target: SshTarget) -> eligibility.OffloadConfig | ExcludedTarget:
     """Read execution settings for a registered SSH target."""
-    from scripts.mac_test import offload
+    from scripts.mac_test import eligibility
 
-    return offload.read_config(target.settings)
+    return eligibility.read_config(target.settings)
 
 
 def command_pinned_eligible(args: CliArguments, routing: Routing) -> int:
@@ -573,7 +581,7 @@ def cleanup_refused_claims(target: SshTarget, args: CliArguments, *, session: Su
     """Recover retained cleanup ownership without granting permission to execute."""
 
     from scripts.lib import conf, process_start as process_identity
-    from scripts.mac_test import mac_test, offload
+    from scripts.mac_test import eligibility, mac_test, offload
 
     paths = mac_test.state_paths(target.name)
     scope = mac_test.target_claim_scope(paths, args.repo_root)
@@ -591,7 +599,7 @@ def cleanup_refused_claims(target: SshTarget, args: CliArguments, *, session: Su
     if not claims:
         return
     try:
-        config = offload.read_connection_settings(target.settings)
+        config = eligibility.read_connection_settings(target.settings)
     except conf.Unusable as error:
         print(f"build targets: {target.name}: cleanup settings unavailable: {error}", file=sys.stderr)
         return
@@ -607,7 +615,7 @@ def cleanup_refused_claims(target: SshTarget, args: CliArguments, *, session: Su
                 continue
         try:
             checked = offload.check_leftovers(config, claim.record["remote_host"],
-                                              offload.KnownRepository(scope.name, scope.key), target.name,
+                                              eligibility.KnownRepository(scope.name, scope.key), target.name,
                                               claim.record.get("slot", 1))
         except conf.Unusable as error:
             print(f"build targets: {target.name}: cleanup settings unavailable: {error}", file=sys.stderr)
@@ -661,7 +669,7 @@ def command_reserve(args: CliArguments) -> int:
     for target in read_targets():
         if not isinstance(target, SshTarget) or (args.target and target.name != args.target):
             continue
-        from scripts.mac_test import mac_test, offload
+        from scripts.mac_test import eligibility, mac_test, offload
 
         verb = remote_verb(args.kind)
         config = ssh_target_config(target)
@@ -677,8 +685,8 @@ def command_reserve(args: CliArguments) -> int:
             answer = mac_test.free_now(paths, target.settings, Path(args.repo_root), session=session)
             if answer not in ("free", "busy") and not (answer == "bad" and args.new_step):
                 continue
-        policy = offload.mac_step_eligibility(config, Path(args.repo_root), args.package, verb, target.name, kind=args.kind)
-        if isinstance(policy, offload.IneligibleMacStep):
+        policy = eligibility.mac_step_eligibility(config, Path(args.repo_root), args.package, verb, target.name, kind=args.kind)
+        if isinstance(policy, eligibility.IneligibleMacStep):
             continue
         if isinstance(identity, claim_state.ClaimIdentity):
             publish_wait_reservation(args, target, identity, session)
@@ -1085,22 +1093,22 @@ def command_eligibility(args: CliArguments) -> int:
 
     from scripts.lib.atomic_file import write_text_atomic
     if args.probe_marks_file:
-        from scripts.mac_test import offload
+        from scripts.mac_test import eligibility
 
-        repository = offload.repository_identity(Path(args.repo_root))
+        repository = eligibility.repository_identity(Path(args.repo_root))
         marks: list[str] = []
         for target in read_targets():
             if isinstance(target, SshTarget):
-                marks.append(str(offload.state_directory(target.name) / "failed_probe"))
-                if isinstance(repository, offload.KnownRepository):
-                    marks.append(str(offload.linux_version_decline_path(target.name, repository.name)))
+                marks.append(str(eligibility.state_directory(target.name) / "failed_probe"))
+                if isinstance(repository, eligibility.KnownRepository):
+                    marks.append(str(eligibility.linux_version_decline_path(target.name, repository.name)))
         write_text_atomic(Path(args.probe_marks_file), "".join(path + "\n" for path in marks))
     if args.remote_kinds_file:
-        from scripts.mac_test import offload
+        from scripts.mac_test import eligibility
 
         write_text_atomic(Path(args.remote_kinds_file), "".join(
             f"{remote_verb(cast(StepKind, step))}\t{step}\n"
-            for step in offload.remote_step_kinds(args.kind)))
+            for step in eligibility.remote_step_kinds(args.kind)))
     routing = LocalRequired(args.local_reason) if args.local_reason else ANY_ELIGIBLE_TARGET
     if args.target:
         return command_pinned_eligible(args, routing)

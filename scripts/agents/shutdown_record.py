@@ -101,6 +101,11 @@ def update(*, started: list[str], pending: list[str]) -> None:
         save([row for row in read() if row not in started] + pending)
 
 
+def remove_started(row_ids: list[str]) -> None:
+    """Remove confirmed starts while the caller holds their staff row locks."""
+    update(started=row_ids, pending=[])
+
+
 class MigrationArguments(argparse.Namespace):
     stop_after_first: bool = False
 

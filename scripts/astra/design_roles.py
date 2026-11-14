@@ -768,7 +768,7 @@ def dispatch_turn(design: HeldDesign, role: Role, prompt: Path, reply: Path) -> 
     result = _assign_command(['--role', 'review' if role == 'reviewer' else 'implement',
         '--target', 'durable-design-role', '--policy', 'astra-' + role,
         '--session-dir', str(run), '--parent', str(parent.id), '--to', name,
-        '--phase', phase, '--prompt', str(prompt), '--summary', str(reply),
+        '--phase', phase, '--prompt', str(prompt), '--reply-file', str(reply.resolve()),
         '--completion-actions', json.dumps(asdict(progress_history.CompletionActions(
             finish_phase=phase if isinstance(design.binding, DesignUnbound) else '')))])
     refusal = result.stderr.strip() or f'held dispatch exited {result.returncode}; pending input is retained'
