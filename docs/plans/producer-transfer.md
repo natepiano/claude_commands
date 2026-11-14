@@ -101,32 +101,38 @@ The checkpoint gate passes. basedpyright reports zero errors and zero warnings. 
 **Acceptance gate:** `test_catch_up.py` and `scripts/lib/test_transcript_reader_guard.py` pass. The checkpoint gate passes.
 basedpyright reports zero errors and zero warnings.
 
-### Phase 3 — `agents transfer NAME`  · status: todo
+### Phase 3 — `agents transfer NAME`  · status: done
 
 #### Work Order
 
 **Goal:** A running session that has no staff row takes the named producer role and restarts as that producer.
 
 **Spec:**
-The session that takes the role runs `agents transfer NAME`. The steps run in this order:
+The session that takes the role runs `agents transfer NAME [--model MODEL --effort EFFORT]`. The steps run in this order:
 
-1. Prove the caller: native id, family, account home and pane. Refuse a caller that has a staff row. Refuse a `NAME` with no producer row.
-2. Stop the old producer conversation and close its tab. Keep its transcript.
-3. Write `[producers] NAME=<family>:<model>:<effort>` through a publishing writer. `pane_launch._publish_producer` compares the backend with this value, so this write comes before step 4.
-4. Set `current_session` and `home` in one staff transaction. The fixed id, the document and the staff queue stay.
-5. Move each message kept under the old native id to the staff queue.
-6. Start a detached process that stops the caller and resumes it through the producer resume path. The resume supplies the name, the tab in the `producers` workspace, the model and the pane record.
+1. Prove the caller: native id, family, account home, folder and pane. Refuse a caller that another staff row records.
+   Refuse a `NAME` with no producer row. Refuse a Claude caller outside the showrunners account.
+2. Validate the settings. The caller supplies the family; the options supply the model and effort.
+3. Stop the old producer conversation and close its tab. Keep its transcript and print its `catch_up.py` command.
+4. Write `[producers] NAME=<family>:<model>:<effort>` through `models_registry.store_producer`.
+   `pane_launch._publish_producer` compares the backend with this value, so this write comes before step 5.
+5. Set `current_session`, `home` and the launch folder in one staff transaction. The fixed id, the document and the staff queue stay.
+   Claude resume depends on the folder, and staff is the only source of the launch folder.
+6. Publish the pane record as the producer binding. Give the tab the producer name; the saved layout supplies its position.
+7. Start a detached process that stops the caller and resumes it through the producer resume path.
 
 Other rules:
 - Each step is safe to run again after a failure of a later step.
-- `commands/producer/morty.md`, `brain.md` and `dwight.md` each get a `Transfer` section: run the verb, then read the role command, the role documents and the output of `catch_up.py`, then run `send.py pending`.
+- No message moves: each named message uses the fixed `staff:<row id>` queue.
+- A producer's worktree is its launch folder and owns no path. `by_worktree` and the two branch readers skip producers.
+- `commands/producer/morty.md`, `brain.md` and `dwight.md` each have a `Transfer` section.
 - `commands/agents.md` documents the verb.
 
 **Files:**
-- `scripts/agents/shutdown.py` — the `transfer` verb.
-- `scripts/agents/stop_resume.py`, `scripts/agents/restart.py` — the transfer steps on the producer resume path.
-- `scripts/production/staff.py` — one writer for `current_session` with `home`.
-- The `[producers]` writer beside `default_models.sh`.
+- `scripts/agents/producer_transfer.py` — the transfer steps. `scripts/agents/shutdown.py` — the `transfer` verb.
+- `scripts/production/staff.py` — `transfer_producer`, and the launch-folder rule in `by_worktree` and `_validate`.
+- `scripts/lib/models_registry.py` — `producer_settings` and `store_producer`.
+- `scripts/production/merge_checkpoint.py`, `scripts/review_links/branch_page.py` — no branch read from a producer's folder.
 - Tests beside each module, with fixtures only.
 - `commands/agents.md`, `commands/producer/morty.md`, `commands/producer/brain.md`, `commands/producer/dwight.md`.
 - `docs/as-built/shutdown-and-restart.md`, `docs/as-built/staff-accessors.md`.
@@ -134,11 +140,10 @@ Other rules:
 **Workers:** nothing splits; the director writes in no-worker mode.
 - `impl` — every file.
 
-**State:** the staff row (`current_session`, `home`), `config/models.conf`, the message queues, the old tab and the new pane record.
+**State:** the staff row (`current_session`, `home`, `worktree`), `config/models.conf`, the saved tab layout, the old tab and the new pane record.
 
 **Constraints from prior phases:**
-- Start after the panes phase 53b and the admin-console director-only resume are on `origin/sdlc`; merge `origin/sdlc` first (sdlc holds `herdr.py`, `restart.py`, `stop_resume.py` until then).
-- Phase 1 removes the authority mark, so step 4 moves no authority and needs no alert.
+- Phase 1 removes the authority mark, so step 5 moves no authority and needs no alert.
 - Phase 2 supplies `catch_up.py` for the `Transfer` sections.
 
 **Acceptance gate:** The test file of each changed module passes. The checkpoint gate passes.
