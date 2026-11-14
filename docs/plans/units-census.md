@@ -62,20 +62,15 @@ The showrunner's order on 2026-11-13 19:4x EST: "Start the switch phase now: the
 
 ### Phase 2 — Take census schema 2  · status: done
 
-#### Work Order
+#### As-built
 
-**Goal:** the reader takes schema 2 when the handler sends its hash (handler Phase 10, ETA 22:30 EST).
-
-**Spec:**
-1. `census.parse` reads the top-level `sessions` list into a typed record.
-2. Use it where it replaces a staff lookup in `unit_phases.census_status`.
-3. Drop schema 1 support once the installed handler prints schema 2.
-4. Tests inject census records as in phase 1. Update the docs in the same commit.
+- `census.parse` accepts schema 2 only. It reads the top-level `sessions` list into `CensusSession(session, status)` and does not read `directors`. `Census` is `(machines, sessions, workers)`. `CensusWorker` carries the tile `activity` text, and `live_word` is the text after its last ` · `.
+- `unit_phases.census_status` looks up the unit's session: the staff row's `current_session`, else the session of the Claude in the unit's pane. A listed session gives its status word, or `—` when it is null. An unlisted session gives `exited` on a reachable census machine, else `—`.
+- Status words are `busy`, `idle`, `paused` and `exited`. Starting and waiting are activities: a busy worker without a run shows `<name> starting` or `<name> waiting` when its live word is one of them, else `<name> working`. The user watches those two words (C1489).
 
 **Files:**
-- `scripts/production/census.py`
-- `scripts/production/test_census.py`
-- `scripts/production/unit_phases.py`
-- `scripts/production/test_unit_phases.py`
-- `commands/showrunner/units.md`
-- `docs/as-built/showrunner-automation.md`
+- `scripts/production/census.py` — `CensusSession` and the schema 2 parse.
+- `scripts/production/unit_phases.py` — `_unit_session`, `census_status` and `SHOWN_ACTIVITIES`.
+- `commands/showrunner/units.md`, `docs/as-built/showrunner-automation.md` — the Status and Workers rules.
+
+**Gotchas:** an installed handler that prints schema 1 makes every census fail with `census schema 1 is not 2`.
