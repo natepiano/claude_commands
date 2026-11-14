@@ -20,12 +20,11 @@ from concurrent.futures import ThreadPoolExecutor
 from contextvars import copy_context
 from pathlib import Path
 from datetime import UTC, datetime
-from dataclasses import replace
 from zoneinfo import ZoneInfo
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from typing import NamedTuple, TypedDict, cast
 
-from scripts.production import live_units
+from scripts.production import census, live_units
 from scripts.production import session_staff, showrunners, staff, staff_sources, unit_lookup
 from scripts.production.production_doc import Refusal, production_field, read_production
 from scripts.agents import remote
@@ -38,7 +37,7 @@ from scripts.herdr import herdr
 from scripts.lib.process_failure import failure_detail
 
 from scripts.style import style_config
-from scripts.direct import phase_table, worker_runs
+from scripts.direct import phase_table, phase_waits
 from scripts.direct import plan_history
 
 from scripts.production import display_cells
@@ -235,30 +234,85 @@ def pending_eta_cell(events: list[dict[str, object]], open_phase_ids: tuple[str,
     return " · ".join(parts) or display_cells.NONE
 
 
-def workers_cell(rows: list[dict[str, object]], *, now: float) -> str:
-    """Show active workers with detached runs before workers that are working."""
+# The live activity words that a busy worker without a run shows in place of `working` (sdlc, C1489).
+SHOWN_ACTIVITIES = ("starting", "waiting")
+RUN_TEXT: dict[census.RunState, str] = {"running": "waiting on run", "finished_queued": "result queued",
+                                        "missing": "run gone"}
+
+
+def workers_cell(workers: Sequence[census.CensusWorker] | census.CensusFailed, *, now: float) -> str:
+    """Show census workers with detached runs before workers that are working."""
+    if isinstance(workers, census.CensusFailed):
+        return display_cells.NONE
     bearing: list[str] = []
     working: list[str] = []
     idle = 0
-    for row in rows:
-        state = row.get("state")
-        name = str(row.get("slot", ""))
-        run = row.get("run")
-        if state in ("waiting on run", "result queued", "run gone") and isinstance(run, dict):
-            run = cast(dict[str, object], run)
-            text = f"{name} {state}: {run.get('label', '')}"
-            started = run.get("started_at")
-            if state == "waiting on run" and isinstance(started, int | float):
-                text += " " + elapsed_text(now - started)
+    for worker in workers:
+        for run in worker.runs:
+            text = f"{worker.name} {RUN_TEXT[run.state]}: {run.label}"
+            if run.state == "running" and run.started_at is not None:
+                text += " " + elapsed_text(now - run.started_at)
             bearing.append(text)
-        elif state in ("working", "running", "starting"):
-            working.append(f"{name} working")
-        elif state == "idle":
+        if worker.runs:
+            continue
+        if worker.status == "busy":
+            word = worker.live_word
+            working.append(f"{worker.name} {word if word in SHOWN_ACTIVITIES else 'working'}")
+        elif worker.status == "idle":
             idle += 1
     result = " · ".join([*bearing, *working])
     if result and idle:
         result += f" +{idle} idle"
     return shortened(result) if result else display_cells.NONE
+
+
+class CensusView(NamedTuple):
+    """One census, indexed for the table rows."""
+
+    sessions: dict[str, census.CensusSession]
+    reachable: frozenset[str]
+    workers: dict[staff.StaffId, tuple[census.CensusWorker, ...]]
+
+
+def census_view(read: census.Census | census.CensusFailed) -> CensusView | census.CensusFailed:
+    if isinstance(read, census.CensusFailed):
+        return read
+    workers: dict[staff.StaffId, list[census.CensusWorker]] = {}
+    for worker in read.workers:
+        workers.setdefault(worker.parent_staff_id, []).append(worker)
+    return CensusView({session.session: session for session in read.sessions},
+                      frozenset(machine.name for machine in read.machines if machine.reachable),
+                      {parent: tuple(rows) for parent, rows in workers.items()})
+
+
+def _unit_session(unit: live_units.LiveUnit) -> str | None:
+    """Return the staff row's current session, else the session of the Claude in the unit's pane."""
+    if isinstance(unit.member, staff.StaffRow):
+        return unit.member.current_session
+    claude = unit.session.claude if unit.session is not None else None
+    return claude.session_id if isinstance(claude, unit_lookup.LiveClaude) else None
+
+
+def census_status(view: CensusView | census.CensusFailed, unit: live_units.LiveUnit) -> str:
+    """Return the tile's status word, `exited` for an unlisted unit on a scanned machine, or `—`."""
+    if isinstance(view, census.CensusFailed):
+        return display_cells.NONE
+    session_id = _unit_session(unit)
+    if session_id is not None and (session := view.sessions.get(session_id)) is not None:
+        return session.status or display_cells.NONE
+    return "exited" if (unit.machine or remote.local_machine()) in view.reachable else display_cells.NONE
+
+
+def census_workers(view: CensusView | census.CensusFailed, member: staff.StaffRow,
+                   phase: str | None = None) -> tuple[census.CensusWorker, ...] | census.CensusFailed:
+    """Return the unit's census workers, or those whose open pass is in one phase instance."""
+    if isinstance(view, census.CensusFailed):
+        return view
+    workers = view.workers.get(member.id, ())
+    if phase is None:
+        return workers
+    return tuple(worker for worker in workers
+                 if isinstance(worker.assignment, census.CensusPass) and worker.assignment.phase == phase)
 
 
 def plan_phase_rows(fields: PlanCellRecord) -> list[PlanCellPhase]:
@@ -335,9 +389,9 @@ def phase_notes_cell(phase: phase_table.OpenPhase, events: list[dict[str, object
             parts.append(f"{label}: {text}" if label else text)
     if phase.fix_rounds:
         parts.append(f"fix rounds {phase.fix_rounds}" + (" + 1 running" if phase.fix_running else ""))
-    for wait in worker_runs.phase_waits(events, phase.instance_id):
+    for wait in phase_waits.phase_waits(events, phase.instance_id):
         holder = ""
-        if isinstance(wait.holder, worker_runs.NamedWaitHolder):
+        if isinstance(wait.holder, phase_waits.NamedWaitHolder):
             member = snapshot.by_member_reference(wait.holder.label)
             holder = f" (held by {member.name if member is not None else wait.holder.label})"
         reason = single_spaced(wait.reason)
@@ -527,13 +581,12 @@ def worker_heading() -> str:
 
 def table(units: list[live_units.LiveUnit], records: dict[str, object], *,
           now: float | None = None, zone: ZoneInfo | None = None,
-          snapshot: staff.StaffSnapshot | None = None,
-          pane_rows: dict[staff.StaffId, list[dict[str, object]]] | None = None,
-          runs_reader: worker_runs.WorkerRuns | None = None, columns: int | None = None) -> str:
-    """Render both phase tables with continuation rows for the terminal width, or the configured floor without one."""
+          snapshot: staff.StaffSnapshot | None = None, census_read: census.Census | census.CensusFailed,
+          columns: int | None = None) -> str:
+    """Render both phase tables from one census, with continuation rows for the terminal width."""
     snapshot = plan_history.staff_record() if snapshot is None else snapshot
-    if now is None:
-        now = runs_reader.now if runs_reader is not None else plan_history.now_epoch()
+    now = plan_history.now_epoch() if now is None else now
+    view = census_view(census_read)
     zone = user_zone() if zone is None else zone
     events: dict[Path, list[dict[str, object]]] = {}
     plans: dict[Path, list[plan_history.PlanPhase]] = {}
@@ -556,17 +609,6 @@ def table(units: list[live_units.LiveUnit], records: dict[str, object], *,
         if (current := snapshot.by_id(unit.member.id)) is not None))
     newest = newest_unit_runs(unit_snapshot)
     runs = open_unit_runs(unit_snapshot, read_run=read_run, newest=newest)
-    runs_reader = worker_runs.WorkerRuns(now) if runs_reader is None else runs_reader
-    if pane_rows is None:
-        try:
-            unit_ids = {member.id for member in unit_snapshot.rows}
-            worker_snapshot = replace(snapshot, rows=tuple(
-                row for row in snapshot.rows if row.id in unit_ids
-                or isinstance(row.parent, staff.ReportsTo) and row.parent.id in unit_ids))
-            pane_rows = worker_runs.pane_worker_rows(worker_snapshot)
-        except (OSError, ValueError) as error:
-            print(f"unit_phases: workers: {error}", file=sys.stderr)
-            pane_rows = {}
     machines = display_cells.machine_column([unit.machine for unit in units])
     status_rows: list[tuple[str, ...]] = []
     work_rows: list[tuple[str, ...]] = []
@@ -578,6 +620,7 @@ def table(units: list[live_units.LiveUnit], records: dict[str, object], *,
         run = newest.get(member.id) if isinstance(member, staff.StaffRow) else None
         opened: OpenUnitRun | NoOpenUnitRun = NoOpenUnitRun()
         queued_record = record
+        status = census_status(view, unit)
         workers = display_cells.NONE
         open_run_phases: tuple[phase_table.OpenPhase, ...] = ()
         run_events: list[dict[str, object]] = []
@@ -600,11 +643,8 @@ def table(units: list[live_units.LiveUnit], records: dict[str, object], *,
                 open_run_phases = tuple(sorted(open_run_phases, key=lambda phase: positions.get(phase.phase, len(positions))))
                 if not phase_ids:
                     progress_record = run_record
-            if (not open_run_phases and run is not None and isinstance(member.worktree, staff.PresentWorktree)
-                    and member.worktree.machine == remote.local_machine()):
-                rows = worker_runs.observe_pane_rows(session_directory(run), pane_rows.get(member.id, []),
-                                                     snapshot, member.id, run_events, runs_reader)
-                workers = workers_cell(rows, now=now)
+            if not open_run_phases:
+                workers = workers_cell(census_workers(view, member), now=now)
         notes_record = progress_record if plan_phase_rows(record_fields(progress_record)) else record
         eta_record = (phase_table.with_run_promises(progress_record, run_events)
                       if run is not None and isinstance(progress_record, phase_table.PhaseRecord) else progress_record)
@@ -632,19 +672,18 @@ def table(units: list[live_units.LiveUnit], records: dict[str, object], *,
                 notes = phase_notes_cell(phase, run_events, snapshot=snapshot, now=now)
                 queued = (queued_cell(member.id, queued_record, notes=notes, open_phase_ids=open_ids)
                           if first else display_cells.NONE)
-                rows = worker_runs.phase_workers(session_directory(run), run_events, phase.instance_id,
-                                                 runs_reader)
-                status_rows.append((unit.unit, unit.status if first else display_cells.NONE,
+                phase_workers = census_workers(view, member, phase.instance_id)
+                status_rows.append((unit.unit, status if first else display_cells.NONE,
                                     *((machines[index] if first else display_cells.NONE,) if machines else ()),
                                     progress_cell(progress_record) if first else display_cells.NONE,
                                     phase.phase, phase_eta_cell(phase, now=now, zone=zone),
-                                    plan_eta if first else display_cells.NONE, workers_cell(rows, now=now)))
+                                    plan_eta if first else display_cells.NONE, workers_cell(phase_workers, now=now)))
                 work_rows.append((unit.unit, notes, display_cells.NONE, queued))
         else:
             notes = notes_cell(notes_record, read_run=read_run)
             queued = (queued_cell(member.id, queued_record, notes=notes)
                       if isinstance(member, staff.StaffRow) else display_cells.NONE)
-            status_rows.append((unit.unit, unit.status, *((machines[index],) if machines else ()),
+            status_rows.append((unit.unit, status, *((machines[index],) if machines else ()),
                                 progress_cell(progress_record), phase_cell(progress_record),
                                 eta_cell(eta_record, now=now, zone=zone, open_run_phases=open_run_phases),
                                 plan_eta, workers))
@@ -766,12 +805,14 @@ def main(arguments: list[str], columns: int | None = None) -> int:
                 production = read_production(name, record=snapshot)
                 doc = production.doc
                 style = is_style_production(doc)
-                with ThreadPoolExecutor(max_workers=2) as reads:
+                with ThreadPoolExecutor(max_workers=3) as reads:
+                    tiles = None if style else reads.submit(copy_context().run, census.read)
                     sessions = reads.submit(copy_context().run, live_units.read_units, name, record=snapshot,
                                             check=staff_sources.CodexProcessThreads().check)
                     records = (cast(dict[str, object], json.loads(phase_table.show_production(doc)))
                                if style else production_records(doc))
                     listing = sessions.result()
+                    census_read = tiles.result() if tiles is not None else census.CensusFailed("style production")
                     units = sorted(listing.units, key=lambda unit: unit.unit.casefold())
                 configured: set[str] = set()
                 if not style and style_config.has_style_units(doc.read_text().splitlines()):
@@ -784,7 +825,10 @@ def main(arguments: list[str], columns: int | None = None) -> int:
                 else:
                     sections: list[str] = []
                     if product_units:
-                        sections.append(table(product_units, records, zone=production.zone, columns=columns))
+                        if isinstance(census_read, census.CensusFailed):
+                            session_staff.report_anomaly(census_read.reason)
+                        sections.append(table(product_units, records, zone=production.zone, census_read=census_read,
+                                              columns=columns))
                     if ticket_units:
                         from scripts.production import style_units
                         sections.append(style_units.table(ticket_units, records, doc=doc, ledger_paths=paths))

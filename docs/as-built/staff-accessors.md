@@ -174,7 +174,6 @@ The shared pane launch builder uses `set_home`.
 | `scripts/direct/assign_claude.py` | read | local_snapshot |
 | `scripts/direct/assign_claude_test_support.py` | read | staff.json path |
 | `scripts/direct/assign_launcher_test_support.py` | write | by_id, local_snapshot, rename, set_worktree |
-| `scripts/direct/worker_runs.py` | read | find; pane worker rows |
 | `scripts/direct/claude_worker.py` | read | runtime_id |
 | `scripts/direct/clear_phase_review.sh` | read | local_snapshot |
 | `scripts/direct/end_session.sh` | write | clear-run (shell); reads the current pointer through unit_runs.open_run |
@@ -188,7 +187,6 @@ The shared pane launch builder uses `set_home`.
 | `scripts/direct/review.sh` | read | local_snapshot, StaffRow |
 | `scripts/direct/review_launcher_test_support.py` | write | local_snapshot, native_id, update_current_session |
 | `scripts/direct/verify.sh` | read | snapshot, by_id, StaffId, StaffRow |
-| `scripts/direct/worker_runs.py` | read | StaffId, StaffSnapshot |
 | `scripts/direct/worker_state.py` | read | StaffRow |
 | `scripts/direct/workers.py` | read | initial_snapshot, local_snapshot |
 | `scripts/hana_shot/hana_shot.py` | read | local_snapshot, runtime_id |
@@ -234,6 +232,7 @@ The shared pane launch builder uses `set_home`.
 | `scripts/production/add_showrunner_test_support.py` | read | staff.json path |
 | `scripts/production/add_unit.py` | write | cli_result, ensure, initial_snapshot, native_id, operation, row_operation, set_worktree |
 | `scripts/production/add_unit_test_support.py` | write | find, native_id, record_production, set_worktree, update_current_session |
+| `scripts/production/census.py` | read | StaffId |
 | `scripts/production/change_review.py` | read | snapshot |
 | `scripts/production/change_routing.py` | read | staff.json path |
 | `scripts/production/codex_winddown.py` | read | snapshot |

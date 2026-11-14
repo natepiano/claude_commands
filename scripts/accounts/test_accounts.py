@@ -801,7 +801,7 @@ class AccountsTests(unittest.TestCase):
             self.assertIn(text, table)
             self.assertIn(text, "\n".join(reading.detail_lines))
 
-        from scripts.production import live_units, unit_phases, unit_lookup
+        from scripts.production import live_units, unit_lookup
 
         self.enterContext(patch.dict(os.environ, {"UNIT_HISTORY_DIR": str(self.root / "status-history"),
                                                 "UNIT_QUEUE_STATE_DIR": str(self.root / "unit-queues")}))
@@ -871,8 +871,7 @@ class AccountsTests(unittest.TestCase):
                             selected = live_units.units_in(parent.name, listing)
                         if supervisor != "none":
                             self.assertEqual(sum(call.args == (run_path,) for call in reads.call_args_list), int(supervisor == "live"))
-                        rendered = unit_phases.table(selected, {}, snapshot=snapshot, pane_rows={})
-                        self.assertIn(f"| {member.name} | {expected} |", rendered)
+                        self.assertEqual(selected[0].status, expected)
 
     def test_detached_work_and_a_starting_pane_count_as_busy(self) -> None:
         identity = staff.StaffId("9c5e3298-b8da-5d9d-9a8f-1a023259fefd")
