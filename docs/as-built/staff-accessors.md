@@ -289,6 +289,7 @@ The shared pane launch builder uses `set_home`.
 | `scripts/production/waiting.py` | read | snapshot |
 | `scripts/production/worker.py` | write | backend, snapshot, runtime_id, row_operation, retire |
 | `scripts/production/worker_admission.py` | write | by_current_session, ensure_worker, native_id, runtime_id, snapshot, update_current_session |
+| `scripts/production/worker_capacity.py` | read | snapshot, local_snapshot, WorkerName.parse, CodexBackend; staff writes go through restart.stop_row and worker_panes.close |
 | `scripts/review_links/branch_page.py` | read | snapshot, worktree_machine, by_id, by_current_session, caller_identity; session_staff.RowResolver reads branches and production docs |
 | `scripts/review_links/change_browser.py` | read | QuestionStaff.read resolves question answer recipients; the shared routing record supplies question owners |
 | `scripts/review_links/change_page.py` | read | snapshot; QuestionStaff.read resolves saved question records during delivery recovery |
