@@ -83,7 +83,7 @@ class GateSuitesFixture(MergeGateFixture):
         def stopped() -> bool:
             try:
                 return Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[0] == "Z"
-            # A process reaped between the open and the read is gone, so it is stopped.
+            # A process reaped during the read gives ESRCH, not ENOENT.
             except (FileNotFoundError, ProcessLookupError):
                 return True
 

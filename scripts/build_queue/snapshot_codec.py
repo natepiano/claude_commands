@@ -52,6 +52,15 @@ def record_field_names(schema: type) -> tuple[str, ...]:
     return tuple(member.name for member in fields(schema))
 
 
+def legacy_pressure_shape(record: dict[str, object]) -> dict[str, object]:
+    # Older clients at 7fdfd9a6a require the old pressure shape.
+    if record["kind"] == "PressurePolicy":
+        return {**record, "swap_used_limit": 0.0}
+    if record["kind"] == "MemoryPressure" and record.get("condition") == "some":
+        return {**record, "condition": "swap"}
+    return record
+
+
 def snapshot_value(value: object) -> object:
     """Convert each shared record once within this encoding."""
     converted: dict[int, object] = {}
@@ -65,8 +74,8 @@ def snapshot_value(value: object) -> object:
         if isinstance(item, Path):
             result: object = str(item)
         elif is_dataclass(item) and not isinstance(item, type):
-            result = {"kind": type(item).__name__, **{name: convert(cast(object, getattr(item, name)))
-                for name in record_field_names(type(item))}}
+            result = legacy_pressure_shape({"kind": type(item).__name__, **{name: convert(cast(object, getattr(item, name)))
+                for name in record_field_names(type(item))}})
         elif isinstance(item, Mapping):
             result = {key: convert(value) for key, value in cast(Mapping[str, object], item).items()}
         elif isinstance(item, frozenset):
@@ -137,6 +146,8 @@ def parse_snapshot_value(value: object, schema: object) -> object:
                 if name in annotations}
     if not is_dataclass(schema) or record.get("kind") != schema.__name__:
         raise ValueError("invalid snapshot record tag")
+    if schema.__name__ == "MemoryPressure" and record.get("condition") == "swap":
+        record = {**record, "condition": "some"}
     if any(member.name not in record and member.default is MISSING and member.default_factory is MISSING
            for member in fields(schema)):
         raise ValueError("invalid snapshot record fields")

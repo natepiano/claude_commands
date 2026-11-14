@@ -37,7 +37,7 @@ from typing import Literal, TypedDict, cast
 
 from scripts.lib import process_group
 from scripts.build_hold import override_guard
-from scripts.mac_test import mac_test, offload
+from scripts.mac_test import eligibility, mac_test
 from scripts.lib import build_folders, process_start as process_identity
 from scripts.direct import step_record
 
@@ -447,7 +447,7 @@ def wakeup_on_signals(parent_pid: int) -> Generator[Wakeup, None, None]:
 class Watch:
     """One call's copy state across ticks."""
 
-    def __init__(self, request: WatchRequest, repository: offload.KnownRepository, work: Path) -> None:
+    def __init__(self, request: WatchRequest, repository: eligibility.KnownRepository, work: Path) -> None:
         self.request: WatchRequest = request
         self.work: Path = work
         self.candidate: Path = (
@@ -629,8 +629,8 @@ def main() -> int:
     arguments = parser().parse_args(namespace=CliArguments())
     request = request_from_arguments(arguments)
     with wakeup_on_signals(arguments.parent_pid) as wakeup, build_folders.temporary_build_folder(build_folders.UniqueBuildFolder(prefix=build_folders.FOLDER_PREFIXES["copy-watch"])) as work:
-        repository = offload.repository_identity(request.repo_root)
-        if isinstance(repository, offload.UnknownRepository):
+        repository = eligibility.repository_identity(request.repo_root)
+        if isinstance(repository, eligibility.UnknownRepository):
             report = wait_for_stop(wakeup)
         else:
             watch = Watch(request, repository, work)

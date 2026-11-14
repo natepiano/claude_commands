@@ -619,8 +619,8 @@ def wait_reasons(result: records.AdmissionWaitSnapshot) -> tuple[str, ...]:
     """Describe why admission holds, without treating changing samples as a new reason."""
     from scripts.build_queue import admission_records as records
     cause = result.head_reason.cause if isinstance(result.head_reason, records.HeadAdmissionStatus) else result.head_reason
-    if isinstance(cause, records.MemoryPressure) and cause.condition == "swap":
-        return ("swap memory pressure",)
+    if isinstance(cause, records.MemoryPressure) and cause.condition == "some":
+        return ("some memory pressure",)
     if isinstance(cause, records.BehindHead):
         return (f"queue head {cause.head_name}",)
     if isinstance(cause, records.ReadyForAdmission):

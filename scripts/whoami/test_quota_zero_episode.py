@@ -7,6 +7,7 @@ from scripts.production.staff_test_support import foreign_hostname
 import io
 import json
 import os
+import socket
 import unittest
 from contextlib import redirect_stdout
 from datetime import datetime, timedelta, timezone
@@ -14,6 +15,7 @@ from pathlib import Path
 from typing import cast
 from unittest import mock
 
+from scripts.lib import conf
 from scripts.lib.test_models_registry import write_registry
 
 from scripts.whoami import quota_alert_test_support as support
@@ -506,8 +508,7 @@ class CodexZeroEpisodeTests(support.CodexZeroEpisodeFixture):
         self.assertEqual(push.need, "decision")
         self.assertIsInstance(push.action, ActionRequired)
         assert isinstance(push.action, ActionRequired)
-        self.assertIn("use_credits: off", push.action.text)
-        self.assertIn("codex1.md", push.action.text)
+        self.assertIn("remove codex1 from codex_credit_accounts", push.action.text)
         self.assertIn("gate-fixture", push.action.text)
         self.assertIn("Its plan refills", push.body)
         self.assertIn("paid credits", push.title + push.body)
@@ -801,6 +802,71 @@ class CodexZeroEpisodeTests(support.CodexZeroEpisodeFixture):
                 with quota_alert.state_file() as state:
                     self.assertIsInstance(state["fallback"], quota_alert.AccountCodexQuotaFallback)
 
+    def worker_mode_texts(self) -> list[str]:
+        return [request[3] for request in self.broadcasts]
+
+    def test_credits_setting_edits_turn_no_worker_mode_on_and_off_and_stop_the_codex_workers(self) -> None:
+        """One account at zero has a credit balance, and no other account has room."""
+        accounts_conf = conf.read("accounts")
+        mode_on, mode_off = accounts_conf.text("no_worker_mode_on"), accounts_conf.text("no_worker_mode_off")
+        expected: list[str] = []
+        with mock.patch.object(socket, "gethostname", return_value=role_map.ROLE_MAP_HOST):
+            _ = self.alert(spare_left=0)
+            self.assertEqual((self.worker_mode_texts(), self.broadcasts.stops), ([], []))
+            for minute, setting in ((2, "off"), (6, "on"), (10, "off")):
+                with self.subTest(setting=setting, minute=minute):
+                    _ = self.note(1, setting)
+                    # The second pass repeats no notice and no stop.
+                    for checked in (minute, minute + 2):
+                        _ = self.alert(self.now + timedelta(minutes=checked), spare_left=0)
+                    expected.append(mode_on if setting == "off" else mode_off)
+                    self.assertEqual(self.worker_mode_texts(), expected)
+                    self.assertEqual(quota_alert.registry_assignments()["direct"], "claude" if setting == "off" else "codex")
+                    with quota_alert.state_file() as state:
+                        self.assertEqual(state.get("no_worker_mode", False), setting == "off")
+        self.assertEqual(self.broadcasts.stops, [["worker_capacity.py", "stop"]] * 2)
+        self.swap.assert_not_called()
+
+    def test_credits_off_with_room_on_another_account_moves_the_workers_and_stops_none(self) -> None:
+        _ = self.note(1, "off")
+        with mock.patch.object(socket, "gethostname", return_value=role_map.ROLE_MAP_HOST):
+            for minute in (0, 2):
+                _ = self.alert(self.now + timedelta(minutes=minute), spare_left=50)
+        self.swap.assert_called_once()
+        self.assertEqual((self.worker_mode_texts(), self.broadcasts.stops), ([], []))
+        with quota_alert.state_file() as state:
+            self.assertFalse(state.get("no_worker_mode", False))
+
+    def test_credits_off_with_a_failed_workers_move_stops_the_codex_workers_once(self) -> None:
+        _ = self.note(1, "off")
+        self.swap.side_effect = accounts.AccountsError("server could not stop")
+        with mock.patch.object(socket, "gethostname", return_value=role_map.ROLE_MAP_HOST):
+            for minute in (0, 2, 30):
+                _ = self.alert(self.now + timedelta(minutes=minute), spare_left=50)
+        self.assertEqual(self.worker_mode_texts(), [conf.read("accounts").text("no_worker_mode_on")])
+        self.assertEqual(self.broadcasts.stops, [["worker_capacity.py", "stop"]])
+        self.assertEqual(quota_alert.registry_assignments()["direct"], "claude")
+
+    def test_refused_account_takes_work_again_when_credits_are_on_and_a_newer_reading_shows_a_balance(self) -> None:
+        accounts_conf = conf.read("accounts")
+        readings = self.readings(self.now, balance="0")
+        identity = readings.selected_account
+        assert isinstance(identity, agent_accounts.KnownCodexAccount)
+        with mock.patch.object(socket, "gethostname", return_value=role_map.ROLE_MAP_HOST):
+            _ = quota_alert.blocked([self.note(1)], identity, self.now, codex_readings=readings,
+                                    window=refusals.KnownWindow("weekly"))
+            self.assertEqual(self.broadcasts.stops, [["worker_capacity.py", "stop"]])
+            # The refusal stays unresolved while the account has no allowance and no balance.
+            _ = self.alert(self.now + timedelta(minutes=2), balance="0")
+            self.assertEqual(quota_alert.registry_assignments()["direct"], "claude")
+            _ = self.alert(self.now + timedelta(minutes=4), balance="250")
+        self.assertIn(refusals.key("codex", identity.login), refusals.load())
+        self.assertEqual(quota_alert.registry_assignments()["direct"], "codex")
+        self.assertEqual(self.worker_mode_texts(), [accounts_conf.text("no_worker_mode_on"), accounts_conf.text("no_worker_mode_off")])
+        self.assertEqual(self.broadcasts.stops, [["worker_capacity.py", "stop"]])
+        with quota_alert.state_file() as state:
+            self.assertFalse(state.get("no_worker_mode", False))
+
     def test_failed_claude_switch_reports_work_staying_on_codex_without_internal_logs(self) -> None:
         """F006: a failed routing update cannot claim that new work moved to Claude."""
         _ = self.note(1, "off")
@@ -1033,11 +1099,9 @@ class CodexZeroEpisodeTests(support.CodexZeroEpisodeFixture):
         assert request["kind"] == "requested"
         self.assertEqual(request.get("cause"), "credits off")
 
-    def test_zero_reads_the_selected_accounts_setting_and_invalid_values_log_once(self) -> None:
+    def test_zero_reads_the_selected_accounts_setting(self) -> None:
         _ = self.note(2, "off")
-        _ = self.note(1, "sometimes")
-        lines = self.alert()
-        self.assertEqual(lines.count("codex1: use_credits must be on or off; reading it as on"), 1)
+        _ = self.alert()
         self.swap.assert_not_called()
         self.assertIn("6,370", self.zero_pushes()[-1].body)
 
@@ -1117,19 +1181,6 @@ class CodexZeroEpisodeTests(support.CodexZeroEpisodeFixture):
         self.relay.assert_not_called()
         with quota_alert.state_file() as state:
             self.assertNotIn("codex1", state.get("codex_zero", {}))
-
-    def test_zero_invalid_credit_setting_mid_episode_still_reads_as_on(self) -> None:
-        _ = self.alert()
-        _ = self.note(1, "invalid")
-        log = self.alert(self.now + timedelta(minutes=2))
-        self.assertEqual(log.count("codex1: use_credits must be on or off; reading it as on"), 1)
-        self.swap.assert_not_called()
-        self.history([(0, 6370), (60, 6370)])
-        _ = self.alert(self.now + timedelta(hours=1))
-        self.assertEqual(len(self.zero_pushes()), 2)
-        self.assertIn("forecast", self.zero_pushes()[-1].id)
-        with quota_alert.state_file() as state:
-            self.assertEqual(state.get("codex_zero", {})["codex1"]["credits"], "on")
 
     def test_zero_does_not_open_from_a_stale_selected_snapshot(self) -> None:
         readings = self.readings(self.now)

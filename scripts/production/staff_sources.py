@@ -15,6 +15,7 @@ import shlex
 import subprocess
 from collections.abc import Mapping
 from dataclasses import dataclass
+from functools import cached_property
 import sys
 from pathlib import Path
 from typing import cast
@@ -25,7 +26,7 @@ from scripts.production.production_doc import ProductionDocument  # noqa: E402
 from scripts.production import staff, unit_config, session_staff  # noqa: E402
 from scripts.herdr import pane_launch  # noqa: E402
 from scripts.lib import unit_runs  # noqa: E402
-from scripts.message import sessions  # noqa: E402
+from scripts.message import morty_identity, sessions  # noqa: E402
 from scripts.agents import remote  # noqa: E402
 
 
@@ -152,6 +153,11 @@ class CodexProcessThreads:
         self.panes: dict[tuple[str, str], dict[str, object]] = {}
         self.foreground_pids: dict[tuple[str, str], int] = {}
 
+    @cached_property
+    def morty(self) -> morty_identity.MortyHolder | morty_identity.NoMortyHolder:
+        """One staff read serves every process of a report."""
+        return morty_identity.holder()
+
     def thread(self, pid: int, environment: Mapping[str, str]) -> str:
         from scripts.herdr import herdr
 
@@ -189,7 +195,8 @@ class CodexProcessThreads:
             native = identity or (self.thread(pid, herdr.process_environment(pid)) if pid else "")
         except (OSError, ValueError, herdr_types.HerdrFailure):
             native = identity
-        return session_staff.ReportProcessIdentity(native, session_staff.morty_thread(native))
+        return session_staff.ReportProcessIdentity(
+            native, self.morty == morty_identity.MortyHolder(staff.StaffId(native)))
 
 
 @dataclass(frozen=True)

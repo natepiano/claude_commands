@@ -6,6 +6,7 @@ from collections.abc import Callable, Generator
 import os
 import fcntl
 import json
+import select
 import signal
 import shutil
 from pathlib import Path
@@ -20,8 +21,9 @@ from unittest import mock
 from contextlib import contextmanager
 from typing import ContextManager
 
-from scripts.lib import build_folders as folders, conf, copy_record, scratch, unit_runs
+from scripts.lib import build_folders as folders, conf, copy_record, scratch, unit_runs, process_group
 from scripts.lint.memory_test_support import config_environment
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
 def _release_folder(path: Path) -> None:
@@ -1379,26 +1381,73 @@ os._exit(0)
         with self.assertRaises(ProcessLookupError):
             os.kill(int(child_pid), 0)
 
-    def test_run_removes_work_after_each_handled_signal(self) -> None:
+    def test_run_group_stop_leaves_only_free_recorded_residue(self) -> None:
         probe = "import os, pathlib, signal; print(str(pathlib.Path.cwd()), os.getpid(), flush=True); signal.pause()"
-        for number in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):
+        for number in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT, signal.SIGKILL):
             with self.subTest(signal=number):
                 process: subprocess.Popen[str] = subprocess.Popen([sys.executable, str(Path(folders.__file__)), "run", "--owner", "unit",
                                             "--name", "proof", "--", sys.executable, "-c", probe],
-                                           stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                                           stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=True)
                 try:
                     assert process.stdout is not None
                     path, child_pid = cast(str, process.stdout.readline()).split()
-                    process.send_signal(number)
+                    process_group.send_process_group(process.pid, number)
                     stdout, stderr = process.communicate(timeout=10)
-                    self.assertEqual(process.returncode, 128 + number, stdout + stderr)
-                    self.assertFalse(Path(path).exists())
-                    with self.assertRaises(ProcessLookupError):
-                        os.kill(int(child_pid), 0)
+                    self.assertEqual(process.returncode, -number, stdout + stderr)
+                    folder = Path(path)
+                    self.assertEqual(folders.build_folder_state(folder), "free")
+                    if folder.exists():
+                        self.assertTrue(folder.with_name(folder.name + ".lease.json").is_file())
+                    from scripts.lib import process_start
+
+                    try:
+                        descriptor = os.pidfd_open(int(child_pid))
+                    except ProcessLookupError:
+                        pass
+                    else:
+                        try:
+                            self.assertTrue(select.select([descriptor], [], [], TEST_HANG_GUARD_SECS)[0])
+                        finally:
+                            os.close(descriptor)
+                    self.assertIsInstance(process_start.process_start(int(child_pid)), (process_start.Gone, process_start.Zombie))
+                    folders.sweep_temporary_build_folders(folder.parent)
+                    self.assertFalse(folder.exists())
+                    self.assertFalse(folder.with_name(folder.name + ".lease.json").exists())
+                    self.assertFalse(folder.with_name(folder.name + ".lock").exists())
                 finally:
                     if process.poll() is None:
                         process.kill()
                     _ = process.communicate(timeout=10)
+
+    def test_sweep_removes_free_folders_and_partial_records_but_keeps_held_allocations(self) -> None:
+        for stage in ("folder", "lease", "temporary-lease", "lock"):
+            for held in (False, True):
+                with self.subTest(stage=stage, held=held):
+                    path = folders.create_build_folder(folders.UniqueBuildFolder("sweep-"))
+                    self.addCleanup(_release_folder, path)
+                    lease = path.with_name(path.name + ".lease.json")
+                    temporary = path.with_name(path.name + ".lease.json.0123456789abcdef.tmp")
+                    _ = temporary.write_text("partial lease")
+                    if stage != "folder":
+                        shutil.rmtree(path)
+                    if stage in ("temporary-lease", "lock"):
+                        lease.unlink()
+                    if stage == "lock":
+                        temporary.unlink()
+                    if not held:
+                        _release_folder(path)
+                    folders.sweep_temporary_build_folders(self.root)
+                    if held:
+                        self.assertTrue(path.with_name(path.name + ".lock").is_file())
+                        self.assertEqual(path.exists(), stage == "folder")
+                        self.assertEqual(lease.exists(), stage in ("folder", "lease"))
+                        self.assertEqual(temporary.exists(), stage != "lock")
+                        _release_folder(path)
+                        folders.sweep_temporary_build_folders(self.root)
+                    self.assertFalse(path.exists())
+                    self.assertFalse(lease.exists())
+                    self.assertFalse(temporary.exists())
+                    self.assertFalse(path.with_name(path.name + ".lock").exists())
 
 
 if __name__ == "__main__":

@@ -74,6 +74,31 @@ def select_checkout(arguments: list[str]) -> str:
     return selected
 
 
+def start_process(arguments: list[str]) -> str:
+    """Select the checkout at interpreter startup and give a direct test run its folder."""
+    selected = select_checkout(arguments)
+    _start_test_run(selected, arguments)
+    return selected
+
+
+def _start_test_run(selected: str, arguments: list[str]) -> None:
+    # Decide before any import; module_run.py removes the gate variable later.
+    if os.environ.get("MERGE_GATE_PARENT_PID"):
+        return
+    original = sys.orig_argv
+    unittest_module = ("-munittest" in original
+                       or any(original[index:index + 2] == ["-m", "unittest"] for index in range(len(original))))
+    target = arguments[0] if arguments else ""
+    if not (unittest_module or target == "unittest" or os.path.basename(target) == "module_run.py"):
+        return
+    # Partial fixture checkouts can contain only the startup files.
+    if not os.path.isfile(os.path.join(selected, "scripts/lib/testing_folders.py")):
+        return
+    from scripts.lib.testing_folders import start_test_run
+
+    start_test_run()
+
+
 def after_startup(callback: Callable[[], None]) -> None:
     """Start an observer after the outer startup hook finishes."""
     sys.modules["_devtools_checkout"].__dict__["ready"] = callback
@@ -135,6 +160,6 @@ if __name__ in sys.modules:
 if __name__ == "sitecustomize":
     # Save the hook order before selection removes this startup directory.
     following = sys.path[:]
-    _ = select_checkout(sys.argv)
+    _ = start_process(sys.argv)
     next_sitecustomize(__file__, following)
     finish_startup(__file__, sys.argv)

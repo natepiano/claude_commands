@@ -653,11 +653,10 @@ An unstaffed session requires an explicit native id and an explicit unit name.
   The phase tables use `display_cells.wrapped(headers, rows)` before escaping cells.
   It preserves full cells and omits columns whose cells are all `—`.
   A table without rows keeps its columns.
-  The command emits one Markdown row per phase for Claude Code's native wrapping.
+  The command emits one Markdown row per phase, plus continuation rows for cells over the line cap.
   The renderer sets column widths from the terminal width and wraps text inside each cell.
-  Print the output as Markdown without code fences, `<br>`, or continuation rows.
-  Claude Code 2.1.319 displays `<br>` as text and adds row borders around continuation rows.
-  Renderer trials at 170 columns showed that native wrapping keeps each Markdown row together.
+  Print the output as Markdown without code fences or `<br>`.
+  Claude Code 2.1.319 displays `<br>` as text.
   The style table uses `display_cells.fitted(headers, rows, *, cuttable, columns, cut_order)` before escaping cells.
   `cuttable` contains original column indexes, so equal header text does not change the selected columns.
   `cut_order` uses `CutOrder.LISTED` by default and accepts `CutOrder.WIDEST_FIRST`.
@@ -695,8 +694,8 @@ An unstaffed session requires an explicit native id and an explicit unit name.
     A client that shares the foreground with another process has no thread. It prints one line and refuses nothing.
     The worker scanner uses this reader before it joins the current thread to its staff row.
     A missing pane launch record does not make a resolved staff worker unknown.
-    `scripts/message/morty_identity.py` supplies the shared match against `MORTY_NATIVE_ID` from `config/send.conf`.
-    A match produces no anomaly.
+    `scripts/message/morty_identity.py` supplies the native ID on the producer staff row named `morty`.
+    `CodexProcessThreads` reads it one time for each report. A process with that ID produces no anomaly.
     `unit_phases.send_anomalies` sends all lines once to `UNIT_ANOMALIES_TO` from `config/production.conf` (`sdlc`).
     A failed send adds one anomaly line and preserves the table and exit code.
   - **Pause and exit:** `agents pause <unit> --why "<why>"` records `paused: {since, by, why}` and stops the workers.
@@ -725,8 +724,19 @@ An unstaffed session requires an explicit native id and an explicit unit name.
     The work table prints `| Unit | Notes | Non-Phase Work | Queued |`.
     Workers uses the configured display name.
     ETA Plan appears for unfinished plan phases or promises for unfinished targets without open rows.
-    Status uses the [shared session classifier](accounts.md#status-counts-and-notes).
-    A live Claude or Codex pane supplies live evidence.
+    Status and Workers come from one `census.read()`, which runs `cargo-handler census --json` within `units_census_seconds`.
+    `unit_phases.main` submits the census to its read pool with the unit and plan reads, so the reads overlap.
+    `census.parse` accepts schema 2 only and returns `Census` with `CensusMachine`, `CensusSession` and `CensusWorker` records, or `CensusFailed(reason)`.
+    It reads the top-level `sessions` list and not the `directors` list.
+    A worker carries `CensusPass(role, phase)` or `NoPass`, and its `CensusRun` records.
+    `census_status` gives the status word of the census session for the unit, or `—` when the word is null.
+    The unit's session is the staff row's `current_session`, or the pane Claude's session when the unit has no staff row.
+    The words are `busy`, `idle`, `paused` and `exited`; the census gives starting and waiting as activities.
+    A unit whose session is not listed shows `exited` when its machine is a reachable census machine, and `—` otherwise.
+    A failed census gives `—` in Status and Workers and one anomaly line; the table has no other source for these cells.
+    One census takes 2 s to 4 s on natedev and is the longest read of the table.
+    Tests inject a `Census` and never run `cargo-handler`; an installed handler that prints schema 1 fails every census.
+    The style table keeps the [shared session classifier](accounts.md#status-counts-and-notes).
     The status table and the style table add **Machine** after **Status** only when a row runs on another machine.
     The home machine is the `kind.<machine>=local` entry in `config/build_targets.conf`.
     `worker.py list` places the optional machine field after the account field, and takes the machine from the parent's worktree.
@@ -754,15 +764,33 @@ An unstaffed session requires an explicit native id and an explicit unit name.
     The existing staff snapshot resolves a holder's staff ID or current session ID to its staff name.
     An unknown holder keeps its recorded name or ID.
     Reasons that start with `waiting on`, `waiting for`, or either phrase after `blocked:` need no extra wait prefix.
-    `worker_runs.phase_waits(events, instance_id)` reads starts, holder updates, and wait or pass finishes.
+    `phase_waits.phase_waits(events, instance_id)` reads starts, holder updates, and wait or pass finishes.
     `PhaseWait` carries the reason, start time, and `NamedWaitHolder` or `UnnamedWaitHolder`.
-    Wait text does not change the session classifier in Status.
+    Wait text does not change the census word in Status.
     Notes, Non-Phase Work, and Queued preserve every word of each displayed item or title.
     Each phase table calls `display_cells.wrapped` separately.
     Each table removes columns whose cells are all `—`.
-    Native Markdown wrapping keeps each phase's text in one row inside its cells.
-    Workers uses the same wrapping form when the status table exceeds the terminal width.
-    Unit, Status, Machine, Progress, Phase, and both ETA cells keep their text.
+    `claude_table_layout.py` models the width rule in Claude Code 2.1.319.
+    `unit_phases.py` run as a script reads its pane width once through `herdr.own_pane_columns`.
+    The read sends `pane.layout` for `HERDR_PANE_ID` to `HERDR_SOCKET_PATH`.
+    `units_table_width_read_milliseconds` limits the read; the median is under 1 ms.
+    Without a width, the tables use `units_table_floor_columns` in `config/production.conf` and print no anomaly.
+    Calls to `main` or `table` from tests pass the width or use the floor; they never read a live pane.
+    `units_table_cell_lines` sets the cell line cap, which defaults to four.
+    Cells that exceed the cap continue on rows that repeat Unit and fill one work cell.
+    Item marks take priority over word boundaries when the script splits cells.
+    When the column minimums exceed that width, a space follows a `-`, `/` or `_` inside the longest ID.
+    The mark must join two letters or digits.
+    A word without a mark breaks at the column share only from `units_table_break_columns` columns; shorter words stay whole.
+    When no such word is left and the minimums still exceed the width, the longest word over 3 columns breaks at the share.
+    Unit, Status, Machine, and Progress keep their text.
+    The script fits both tables at that width without changing the style table.
+    Each column can only grow in a wider terminal.
+    The minimums depend on live data: a long unit name or id can put them over the floor.
+    About 6% of width reads meet a herdr wait of about 100 ms; those runs shape for the floor, so a wide window can show break spaces.
+    `:` is no break mark, because it splits times such as `17:24`.
+    A zero-width space cannot replace the break space: Claude Code 2.1.319 wraps only at plain spaces.
+    A renderer change needs a new measure of the width rule.
     When the plan has no phases, an open run supplies Progress, Phase, and both ETA cells from its full event history.
     Notes uses this fallback when it has phase rows; otherwise, it keeps the plan state.
     The fallback does not change Queued.
@@ -783,13 +811,13 @@ An unstaffed session requires an explicit native id and an explicit unit name.
     Without an unfinished plan or such a promise, the cell shows `—`.
     The finish never precedes any open or not-started plan phase's latest promise, including checkpoint promises.
     Times use the production zone and a short date outside the current day.
-    `worker_runs.phase_workers(session, events, instance_id, runs)` reads open passes for that phase from the run records.
-    It shows waiting detached runs, queued results, missing runs, and working workers.
+    `census_workers` selects the census workers whose `parent_staff_id` is the unit.
+    An open phase row keeps only the workers whose open pass names that phase instance.
+    `workers_cell` shows each detached run first: `waiting on run: <label> <elapsed>`, `result queued: <label>`, or `run gone: <label>`.
+    A busy worker without a run shows its live word when `CensusWorker.live_word` is in `SHOWN_ACTIVITIES` (`starting`, `waiting`), else `working`.
+    `live_word` is the text after the last ` · ` of the tile activity, as `waiting` in `impl · waiting`. Idle workers add `+<n> idle`.
     Its cell keeps the existing 80-character limit.
-    Run workers appear first; finished passes remove their workers.
-    Rows without an open phase keep the existing pane observation rules.
-    The command reads panes once for the displayed units and their workers.
-    It shares one lazy process snapshot and reads no CPU totals or log tails.
+    The table reads no panes, run records or process table for Workers.
     Non-Phase Work shows `—` for open phase rows because Notes already describes each phase.
     Rows without a recorded phase instance keep the existing summary for work outside the plan.
     Queued combines the first queue item with the first unfinished plan phase, excluding done and open phases.
@@ -871,8 +899,7 @@ An unstaffed session requires an explicit native id and an explicit unit name.
 
 - **Queued messages.** `sessions.addressed` resolves a staff name through its fixed staff ID and `current_session`. Explicit `session:` and `uds:` addresses select native records. Registry names and former names do not select recipients. A named recipient uses `STATE/queue/staff_<staff id>.jsonl`. An explicit session address uses `session-<session id>.jsonl`. A session drains its native keys, its socket key, and its fixed staff key. Queue entries retain their stable owner across session changes. A delivered keyed message removes its queued copy. `send.py retire` removes the selected queued messages. The one-off `convert_queue_keys.py` program moves current staff-name queue files into their staff ID files. Its default mode only prints the moves.
   Unit names also accept the form from `copies.unit_owner`.
-  Morty uses its staff row when present.
-  Without that row, `send.py` matches Morty's configured `MORTY_NATIVE_ID` against native transport addresses.
+  Morty uses its staff row. Without that row, `send.py` refuses the name `morty` as it refuses each name without a row.
   Postmaster replies use explicit session addresses.
   `postmaster`, `sdlc-merge-gate`, and `natedev` have staff rows.
 

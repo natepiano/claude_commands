@@ -22,7 +22,7 @@ from scripts.production import staff
 from scripts.production.session_labels import StaffLabels
 from scripts.production import unit_config as configuration
 from scripts.agents import remote, worker_lifecycle
-from scripts.message import morty_identity, process_table
+from scripts.message import process_table
 from scripts.message.sessions import SessionRecord
 from scripts.herdr.place import HerdrPlace
 from scripts.herdr.pane_launch import PaneLaunch, agent_kind, without_staff_labels
@@ -102,10 +102,6 @@ def collect_anomaly(message: str, *, pid: int = 0) -> bool:
 def report_anomaly(message: str, *, pid: int = 0) -> None:
     if not collect_anomaly(message, pid=pid):
         print("anomaly: " + " ".join(message.splitlines()), file=sys.stderr)
-
-
-def morty_thread(identity: str) -> bool:
-    return bool(identity) and morty_identity.matches(f"codex:{identity}")
 
 
 WORKER_FACT_KEYS = ("name", "thread_id", "session_id", "codex_home", "manager", "role", "previous_role", "family", "cwd")

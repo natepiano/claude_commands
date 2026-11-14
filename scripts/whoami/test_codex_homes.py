@@ -125,14 +125,14 @@ class CodexHomesTests(unittest.TestCase):
         self.assertEqual(held["weekly"]["left"], 87)
         self.assertEqual(held["weekly"]["at"], now.isoformat())
 
-    def test_credit_setting_reads_on_off_and_defaults_to_on(self) -> None:
-        path = self.home / "codex1.md"
-        for field, expected in (("use_credits: off\n", agent_accounts.CreditsOff),
-                                ("use_credits: on\n", agent_accounts.CreditsOn),
-                                ("", agent_accounts.CreditsOn),
-                                ("use_credits: sometimes\n", agent_accounts.CreditsOn)):
-            with self.subTest(field=field):
-                _ = path.write_text("---\nlogin: next@example.invalid\n" + field + "---\n")
+    def test_credit_setting_reads_the_accounts_config(self) -> None:
+        config = self.enterContext(scratch_accounts_config()) / "accounts.conf"
+        lines = [line for line in config.read_text().splitlines() if not line.startswith("codex_credit_accounts=")]
+        for value, expected in (("codex1 codex2", agent_accounts.CreditsOn),
+                                ("codex2", agent_accounts.CreditsOff),
+                                ("none", agent_accounts.CreditsOff)):
+            with self.subTest(value=value):
+                _ = config.write_text("\n".join([*lines, f"codex_credit_accounts={value}"]) + "\n")
                 self.assertIsInstance(agent_accounts.codex_credits_setting("codex1"), expected)
 
     def test_credit_setting_off_disallows_paid_room_in_either_exhausted_window(self) -> None:
@@ -157,18 +157,17 @@ class CodexHomesTests(unittest.TestCase):
         self.assertEqual(accounts.main(["set-role", "workers", label]), 0)
         return home
 
-    def test_legacy_codex_note_alone_keeps_login_resolution_and_the_user_credit_setting(self) -> None:
+    def test_legacy_codex_note_alone_keeps_login_resolution(self) -> None:
         home = self.select_workers("codex2")
         numbered = self.home / "codex2.md"
         legacy = self.home / "codex 2.md"
         _ = numbered.rename(legacy)
-        _ = legacy.write_text("---\nlogin: selected@example.invalid\nuse_credits: off\n---\n")
+        _ = legacy.write_text("---\nlogin: selected@example.invalid\n---\n")
         identity = agent_accounts.codex_account(home)
         self.assertIsInstance(identity, agent_accounts.KnownCodexAccount)
         assert isinstance(identity, agent_accounts.KnownCodexAccount)
         self.assertEqual(identity.label, "codex2")
         self.assertEqual(agent_accounts.codex_account_home("codex2").home, home)
-        self.assertIsInstance(agent_accounts.codex_credits_setting("codex2"), agent_accounts.CreditsOff)
         self.assertFalse(numbered.exists(), "readers must not migrate files")
 
     def legacy_selection(self) -> ClaudeAccountsInUse:

@@ -136,9 +136,8 @@ def prepare(browser: ReviewBrowser, status: change_page.DeliveryStatus) -> Prepa
             key = item.row["#"] if item.page.review_list == current else item.key
             by_key[key] = item
             if item.waiting:
-                prefix = "" if item.page.review_list == current else item.key.rsplit("/", 1)[0] + "/"
                 entry = change_review.row_entries([item.row])[0]
-                after = prefix + entry.after if entry.after and "/" not in entry.after else entry.after
+                after = change_review.prerequisite_key(entry.after, item.page.review_list, current)
                 entries.append(replace(entry, key=key, item=item.row | {"#": key}, after=after))
         prepared = change_review.ChangeQueue(name, entries)
         changes.extend(by_key[entry.key] for entry in urgency.queue_order(prepared.entries, prepared.name))
@@ -172,23 +171,24 @@ def prepare(browser: ReviewBrowser, status: change_page.DeliveryStatus) -> Prepa
 
 def section(change: WaitingChange, feedback_rows: int) -> str:
     page, row = change.page, change.row
+    shown = change_review.display_id(row, change.tab)
     anomaly = f"<p>{html.escape(change.anomaly)}</p>" if change.anomaly else ""
     if isinstance(page, UnavailableProduction):
         return f'''<section hidden data-type="changes" data-key="{html.escape(change.key)}" data-tab="{html.escape(change.tab)}" data-pending="{str(change.waiting).lower()}">
 <h1>{html.escape(row.get('Change', ''))}</h1>
-{change_page.change_details(row, change.key)}
 <h2>Proof</h2>{change_page.review_text_html(row.get(change_review.CHECK, ''), "pre")}
-{anomaly}{change_page.question_html(change.question)}<p>{html.escape(page.reason)}</p></section>'''
+{anomaly}{change_page.question_html(change.question)}<p>{html.escape(page.reason)}</p>
+{change_page.change_details(row, shown)}</section>'''
     form = change_page.answer_form(page, change_page.AnswerNotice(row["#"]), feedback_rows).replace(
         '<form method="post">', f'<form method="post" action="{change_page.PAGE_NAME}">') if change.waiting else ""
     text = change_page.answer_status(row.get("Verdict", ""), change.slots)
     saved = f'<p>{html.escape(text)}</p>' if text else ""
     return f'''<section hidden data-type="changes" data-key="{html.escape(change.key)}" data-tab="{html.escape(change.tab)}" data-pending="{str(change.waiting).lower()}">
 <h1>{html.escape(row.get('Change', ''))}</h1>
-{change_page.change_details(row, change.key)}
 <h2>{'Proof' if row.get(change_review.KIND) == 'Read only' else 'How to check'}</h2>
 {change_page.review_text_html(row.get(change_review.CHECK, ''), "pre")}
-{anomaly}{change_page.question_html(change.question)}{saved}<p role="status" data-save-state></p>{form}</section>'''
+{anomaly}{change_page.question_html(change.question)}{saved}<p role="status" data-save-state></p>{form}
+{change_page.change_details(row, shown)}</section>'''
 
 
 def question_section(question: WaitingQuestion, browser: ReviewBrowser, feedback_rows: int) -> str:
@@ -267,12 +267,11 @@ def render(browser: ReviewBrowser, status: change_page.DeliveryStatus) -> bytes:
 [data-showrunner-filter]{display:flex;align-items:center;gap:8px;flex-wrap:nowrap;margin-bottom:16px}
 [data-showrunner-filter] label{white-space:nowrap}
 [data-showrunner-filter] select{font:inherit;min-width:0;max-width:100%;flex:1;min-height:44px;color:CanvasText;background:Canvas}
-.feedback-actions{display:flex;flex-wrap:nowrap;gap:8px}.feedback-actions button{margin-right:0;font-size:16px;white-space:nowrap}
 section+section{border:0;margin:0;padding:0}
 [data-rebuilds] article+article{border-top:1px solid GrayText;margin-top:16px;padding-top:16px}
 [data-rebuilds] h2{margin-top:0}[data-rebuilds] li+li{margin-top:16px}
 [data-rebuilds] details p{margin:0}[data-rebuilds] details p+p{margin-top:8px}
-.navigation{padding:12px 0;background:Canvas}button{min-height:44px}
+.navigation{padding:12px 0;background:Canvas}.navigation:empty{display:none}button{min-height:44px}
 </style>''' + f'<div data-review-content data-refresh-seconds="{refresh_seconds}"><h1 data-review-heading>Changes to review</h1>'
                + type_tabs + '<div class="review-panel" id="review-panel" role="tabpanel" aria-labelledby="type-changes">'
                + '<div data-showrunner-filter><label for="review-showrunner">Showrunner:</label>'
@@ -436,6 +435,7 @@ function show(){
   (typeWaiting ? 'No changes for this showrunner.' : 'No changes to review.');
  rows.forEach(r=>r.hidden=r!==current);
  next.hidden=rebuildMode || !waiting().some(r=>r!==current);
+ (current?.querySelector('form:not([hidden]) .answer-actions') || content.querySelector('.navigation')).append(next);
  if(current) remembered.set(kind+'/'+tab,current.dataset.key);
  const hash=new URLSearchParams(rebuildMode ? {type:kind} : {type:kind,showrunner:tab || '',row:current?.dataset.key || ''});
  places.set(kind,hash.toString()); history.replaceState(null,'','#'+hash); shownHash=location.hash; }

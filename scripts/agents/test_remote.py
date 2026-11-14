@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import TypedDict, cast, final, override
 from unittest.mock import patch
 
-from scripts.agents.test_support import linux_process_fixture, ShutdownSendLeaf, ShutdownTestCase
+from scripts.agents.test_support import linux_process_fixture, ShutdownSendLeaf, ShutdownTestCase, write_machine_config
 from scripts.agents import remote
 
 
@@ -30,6 +30,9 @@ class RemoteTests(ShutdownTestCase):
 
     @override
     def setUp(self) -> None:
+        configuration = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        write_machine_config(configuration)
+        _ = cast(object, self.enterContext(patch.dict(os.environ, {"CONF_DIR": str(configuration)})))
         super().setUp()
         linux_process_fixture(self)
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
@@ -94,10 +97,21 @@ raise SystemExit(int(os.environ.get("SHUTDOWN_TEST_SSH_STATUS", "0")))
         return SshInvocation(arguments=cast(list[str], argument_values), stdin=stdin)
 
     def test_other_machine_maps_linux_and_darwin(self) -> None:
-        with patch.object(sys, "platform", "linux"):
+        with patch("scripts.agents.remote.sys.platform", "linux"):
+            self.assertEqual(remote.this_machine(), "natedev")
             self.assertEqual(remote.other_machine(), "mac")
-        with patch.object(sys, "platform", "darwin"):
+        with patch("scripts.agents.remote.sys.platform", "darwin"):
+            self.assertEqual(remote.this_machine(), "mac")
             self.assertEqual(remote.other_machine(), "natedev")
+        for name, alias in (("mac", "mac"), ("MAC", "mac"), ("nates-macbook-pro-2023", "mac"),
+                            ("NATES-MACBOOK-PRO-2023", "mac"), ("NATEDEV", "natedev")):
+            with self.subTest(name=name):
+                self.assertEqual(remote.machine_alias(name), remote.MachineAlias(alias))
+        refused = remote.machine_alias("other-host")
+        self.assertIsInstance(refused, remote.MachineNameRefused)
+        assert isinstance(refused, remote.MachineNameRefused)
+        for name in ("other-host", "natedev", "mac", "Nates-MacBook-Pro-2023"):
+            self.assertIn(name, refused.reason)
 
     def test_remote_status_line_controls_return_code(self) -> None:
         os.environ["SHUTDOWN_TEST_REMOTE_STATUS"] = "3"

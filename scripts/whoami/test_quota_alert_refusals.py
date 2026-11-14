@@ -35,6 +35,7 @@ class QuotaAlertTests(support.SeededQuotaReminderFixture):
                 _ = self.alert(notes, self.now)
                 self.assertEqual(self.broadcasts, [])
                 calls: list[list[str]] = []
+                stops: list[list[str]] = []
 
                 def record_broadcast(arguments: list[str], **options: object) -> subprocess.CompletedProcess[str]:
                     del options
@@ -43,7 +44,10 @@ class QuotaAlertTests(support.SeededQuotaReminderFixture):
                     saved = cast(quota_alert.StoredState, json.loads(quota_alert.STATE.read_text()))
                     self.assertTrue(saved.get("no_worker_mode", False))
                     self.assertIn("--no-block", arguments)
-                    calls.append(arguments[arguments.index("--from"):])
+                    if "--from" in arguments:
+                        calls.append(arguments[arguments.index("--from"):])
+                    else:
+                        stops.append(arguments[arguments.index("--") + 2:])
                     return subprocess.CompletedProcess(arguments, 0, "", "")
 
                 with mock.patch.object(socket, "gethostname", return_value=hostname), \
@@ -58,8 +62,10 @@ class QuotaAlertTests(support.SeededQuotaReminderFixture):
                     with quota_alert.state_file() as state:
                         self.assertTrue(state.get("no_worker_mode", False))
                     self.assertEqual(len(calls), 1)
+                    self.assertEqual([[os.path.basename(stop[0]), *stop[1:]] for stop in stops], [["worker_capacity.py", "stop"]])
                 else:
                     self.assertEqual(calls, [])
+                    self.assertEqual(stops, [])
                     with quota_alert.state_file() as state:
                         self.assertFalse(state.get("no_worker_mode", False))
 
@@ -80,8 +86,9 @@ class QuotaAlertTests(support.SeededQuotaReminderFixture):
                 with redirect_stdout(output), mock.patch("scripts.whoami.quota_alert.subprocess.run", side_effect=fail_start) as start:
                     log = self.block(notes, self.now)
                     _ = self.block(notes, self.now + timedelta(minutes=1))
-                self.assertEqual(output.getvalue().splitlines(), [f"quota-alert: no-worker mode broadcast failed: {detail}"])
-                self.assertEqual(start.call_count, 1)
+                self.assertEqual(output.getvalue().splitlines(), [f"quota-alert: no-worker mode broadcast failed: {detail}",
+                                                                  f"quota-alert: Codex worker stop failed: {detail}"])
+                self.assertEqual(start.call_count, 2)
                 self.assertIn("quota status codex1: Codex refused work on codex1. No credit balance is reported for codex1. "
                               + "New work moved to Claude, the other coding assistant.", log)
                 self.assertEqual(self.assignments()["direct"], "claude")
