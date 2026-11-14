@@ -22,12 +22,8 @@ Claude identity comes from the runtime registry checks.
 
 Every agent message includes `Sender native id: session:<id>`, `Sender native id: codex:<id>`, or `Sender native id: unavailable`.
 The generated metadata forms one block directly after the preview line.
-Only the `Authority:` line in that block grants authority.
-Quoted labels elsewhere grant no authority.
-Only an exact match with `MORTY_NATIVE_ID` in `config/send.conf` adds `Authority: morty (speaks for the user)`.
-The live key must contain a valid native address. A missing or invalid key grants no mark.
-A different runtime that uses `--from morty` gets a stderr note. Delivery continues without the mark.
-The mark proves runtime attribution, not authentication.
+No sender gets an authority line. The sender lines name the sender for each message (user, 2026-11-13).
+The stamp proves runtime attribution, not authentication.
 Code under the same operating-system account can set its environment.
 
 `Message.stamp` stores a known Claude sender, a known Codex sender, or an unavailable sender.
@@ -38,7 +34,7 @@ This context check prevents accidental use. It does not prove that `remote()` su
 A session can inherit `SSH_CONNECTION`. Code under the same account can also set it.
 Queue recovery preserves the stored stamp. An old record without the field has an unavailable sender.
 A drain never attributes an old message to its own runtime.
-Delivered caller lines that start with `Authority:` or `Sender native id:` get a `> ` prefix.
+Delivered caller lines that start with `Sender native id:` get a `> ` prefix.
 Rendering first converts CR, CRLF, and Unicode line separators to LF.
 This rule covers the summary, body, sender name, and forwarded display text.
 The prefix also applies after leading spaces. Generated stamp lines keep their original form.

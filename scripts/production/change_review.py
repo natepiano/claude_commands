@@ -374,8 +374,13 @@ def next_number(text: str) -> int:
     return max((int(found.group(1)) for found in _NUMBER.finditer(text)), default=0) + 1
 
 
+def now() -> datetime:
+    """The current time in the user's zone."""
+    return datetime.now(user_zone())
+
+
 def today() -> date:
-    return datetime.now(user_zone()).date()
+    return now().date()
 
 
 def _cell(text: str) -> str:
@@ -679,11 +684,12 @@ def append_rows(path: Path, changes: Sequence[Visible | PublicationChange], day:
                 producers: Sequence[staff.StaffId | UnknownProducer] = (), *,
                 record: staff.StaffSnapshot, repo: Path = _CURRENT_REPO,
                 on_hold: Callable[[PublicationChange], None] | None = None,
-                merge_changes: Sequence[PublicationChange] = ()) -> list[str]:
+                merge_changes: Sequence[PublicationChange] = (), added_at: datetime | None = None) -> list[str]:
     """Add changes to To review with fixed staff IDs from record.
 
     owners supplies production documents; producers supplies fixed staff IDs for plain Visible changes.
     merge_changes supplies every change of this merge routed to this list.
+    added_at puts the time of day after the date in the Merged cell.
     """
     if not changes:
         return []
@@ -723,7 +729,8 @@ def append_rows(path: Path, changes: Sequence[Visible | PublicationChange], day:
         if merged and (held := _held(columns, lines[first:end], plain, merged)):
             raise ChangeReviewError(f"{held} already holds that change from merge {merged}; no row added")
         number = next_number("".join(lines))
-        when = f"{day.isoformat()} · {_cell(merged)}" if merged else day.isoformat()
+        added = f"{day.isoformat()} {added_at:%H:%M}" if added_at is not None else day.isoformat()
+        when = f"{added} · {_cell(merged)}" if merged else added
         rows = [_row(path, columns, {"#": f"C{number + offset}", "Change": _cell(items[index].change), "Merged": when,
                                      "On the Mac build": NOT_YET, CHECK: _cell(items[index].how()), URGENCY: _cell(rank),
                                      KIND: "", PRODUCER: str(row_producers[index]) if isinstance(row_producers[index], str) else "",
@@ -1822,9 +1829,10 @@ def list_ready(repo: Path, production: Path, merge_branch: str, *,
             if isinstance(selection, CompletedStep):
                 selected = [change for change in changes if isinstance(change.item.readiness, AfterStep)
                             and change.item.readiness.step == selection.step]
-            rows.extend(append_rows(path, selected, today(), short, owner_doc, record=record, repo=repo,
+            stamp = now()
+            rows.extend(append_rows(path, selected, stamp.date(), short, owner_doc, record=record, repo=repo,
                                     on_hold=note if isinstance(selection, ReadinessScan) else None,
-                                    merge_changes=merge_changes[path]))
+                                    merge_changes=merge_changes[path], added_at=stamp))
     if isinstance(selection, CompletedStep) and not matched_step:
         raise ChangeReviewError(f"{selection.merged}: no change waits for step {selection.step!r}; no row added")
     return rows
@@ -1979,8 +1987,9 @@ def _run(options: CommandLine) -> int:
             path = _list(options)
             item, rank = _visible(options), _rank_option(options, path)
             record = staff.snapshot()
-            rows = append_rows(path, [item], today(), merged, production_doc(options.production), rank,
-                               producers=[producer_at(repo, record)], record=record)
+            stamp = now()
+            rows = append_rows(path, [item], stamp.date(), merged, production_doc(options.production), rank,
+                               producers=[producer_at(repo, record)], record=record, added_at=stamp)
             row = row_id(rows[0])
             print(row)
             for line in hold_for_row(path, row, options.hold or []):
@@ -2001,8 +2010,8 @@ def _run(options: CommandLine) -> int:
                   if shown is not None else "nothing to review")
         case "mark-important":
             target = _row_option(options)
-            now = datetime.now(user_zone()).replace(tzinfo=None)
-            print(mark_row(target.path, target.row, now, production_doc(options.production)))
+            marked_at = datetime.now(user_zone()).replace(tzinfo=None)
+            print(mark_row(target.path, target.row, marked_at, production_doc(options.production)))
         case "set-kind":
             target = _row_option(options)
             print(set_row_kind(target.path, target.row, options.kind, production_doc(options.production)))
