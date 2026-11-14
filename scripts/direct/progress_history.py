@@ -34,7 +34,7 @@ from typing import Literal, NoReturn, Protocol, TypedDict, cast
 from scripts.agents import worker_lifecycle  # noqa: E402
 from scripts.direct import plan_history, recorder_state  # noqa: E402
 from scripts.direct.recorder_state import OPEN_PHASES_KEY as OPEN_PHASES_KEY  # noqa: E402
-from scripts.lib import conf_reads, models_registry, unit_runs  # noqa: E402
+from scripts.lib import conf_reads, git_files, models_registry, unit_runs  # noqa: E402
 from scripts.lib.atomic_file import write_text_atomic  # noqa: E402
 from scripts.lib.intervals import merged_spans  # noqa: E402
 from scripts.lib.probe_session import PROBE_ENV  # noqa: E402
@@ -5724,27 +5724,11 @@ def _phase_repository(working_dir: str) -> RecordedPhaseMetadata | PhaseMetadata
     worktree = Path(working_dir).expanduser()
     if not worktree.is_dir():
         return PhaseMetadataNotRecorded("phase working directory is unavailable")
-    for directory in (worktree, *worktree.parents):
-        marker = directory / ".git"
-        if marker.is_dir():
-            return RecordedPhaseMetadata(directory.name)
-        if not marker.is_file():
-            continue
-        try:
-            location = marker.read_text(encoding="utf-8").strip()
-            if not location.startswith("gitdir:") or not location.removeprefix("gitdir:").strip():
-                break
-            git_directory = (directory / location.removeprefix("gitdir:").strip()).resolve()
-            common = (git_directory / "commondir").read_text(encoding="utf-8").strip()
-            if not common:
-                break
-            repository = (git_directory / common).resolve()
-            if not repository.is_dir():
-                break
-            return RecordedPhaseMetadata(repository.parent.name if repository.name == ".git" else repository.name)
-        except (OSError, ValueError):
-            break
-    return PhaseMetadataNotRecorded("repository common directory is unavailable")
+    try:
+        repository = git_files.locate(worktree).common_dir
+    except git_files.GitFilesError:
+        return PhaseMetadataNotRecorded("repository common directory is unavailable")
+    return RecordedPhaseMetadata(repository.parent.name if repository.name == ".git" else repository.name)
 
 
 def _phase_plan_names(state: Mapping[str, object]) -> tuple[
