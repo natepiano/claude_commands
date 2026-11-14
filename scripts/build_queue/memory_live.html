@@ -13,7 +13,7 @@
   --building: #007e78; --testing: #b00079;
   --remote-memory: var(--remote-memory-light); --machine-natedev: var(--machine-natedev-light);
   --machine-mac: var(--machine-mac-light); --machine-aws: var(--machine-aws-light);
-  --other: #a3a19b; --free: #e7e5df; --floor: #eda100; --cap: #c22d2c;
+  --other: #a3a19b; --free: #e7e5df; --floor: #eda100; --cap: #c22d2c; --block: #8a5a00;
   --agents: #7f6fc4; --desktop: #78756e;
 }
 @media (prefers-color-scheme: dark) {
@@ -25,7 +25,7 @@
     --building: #27c6b8; --testing: #ca458f;
     --remote-memory: var(--remote-memory-dark); --machine-natedev: var(--machine-natedev-dark);
     --machine-mac: var(--machine-mac-dark); --machine-aws: var(--machine-aws-dark);
-    --other: #5c5b57; --free: #2a2a28; --floor: #c98500; --cap: #ef7372;
+    --other: #5c5b57; --free: #2a2a28; --floor: #c98500; --cap: #ef7372; --block: #e3a83f;
     --agents: #9585e0; --desktop: #8a877f;
   }
 }
@@ -37,7 +37,7 @@
   --building: #27c6b8; --testing: #ca458f;
   --remote-memory: var(--remote-memory-dark); --machine-natedev: var(--machine-natedev-dark);
   --machine-mac: var(--machine-mac-dark); --machine-aws: var(--machine-aws-dark);
-    --other: #5c5b57; --free: #2a2a28; --floor: #c98500; --cap: #ef7372;
+    --other: #5c5b57; --free: #2a2a28; --floor: #c98500; --cap: #ef7372; --block: #e3a83f;
     --agents: #9585e0; --desktop: #8a877f;
 }
 * { box-sizing: border-box; }
@@ -94,6 +94,11 @@ h1 { font-size: 1.4rem; margin: 0; letter-spacing: -0.01em; }
 #tip .mac-tip-fields { display: grid; grid-template-columns: max-content minmax(0, 1fr); gap: 2px 16px; margin: 6px 0 0; white-space: normal; }
 #tip .mac-tip-fields dt { text-align: left; }
 #tip .mac-tip-fields dd { margin: 0; text-align: right; font-variant-numeric: tabular-nums; }
+#tip .identity { display: grid; grid-template-columns: max-content minmax(0, 1fr); gap: 2px 8px; margin: 6px 0; white-space: normal; }
+#tip .identity dt { display: flex; justify-content: space-between; }
+#tip:has(.identity) { max-width: min(calc(100vw - 20px), 24rem); }
+#tip .identity dt::after { content: ":"; }
+#tip .identity dd { margin: 0; overflow-wrap: anywhere; }
 #tip .mac-note { display: block; margin-top: 6px; white-space: nowrap; }
 #tip:has(.mac-note) { width: max-content; max-width: min(calc(100vw - 20px), 34rem); }
 .seg-remote { background: var(--remote-memory); }
@@ -145,6 +150,24 @@ td small { color: var(--ink-3); }
 .pill.hold .pd { background: var(--cap); }
 .pill.hold { color: var(--cap); border-color: var(--cap); }
 .pill:hover { background: var(--free); }
+.targets { padding: 14px 18px 4px; }
+.target-row { display: grid; grid-template-columns: minmax(0, 1fr) auto; grid-template-areas: "head until" "reason reason" "owner since";
+  gap: 2px 16px; padding: 10px 0; border-top: 1px solid var(--line); }
+.targets .section-head + .target-row { border-top: 0; padding-top: 6px; }
+.target-head { grid-area: head; display: flex; flex-wrap: wrap; align-items: baseline; gap: 2px 10px; }
+.target-head .machine { font-weight: 600; }
+.target-state { padding: 0 8px; border-radius: 999px; border: 1px solid currentColor; font-size: 0.82rem; font-weight: 600; color: var(--block); }
+.target-state.unavailable { color: var(--cap); }
+.target-reason { grid-area: reason; overflow-wrap: anywhere; }
+.target-owner { grid-area: owner; }
+.target-until { grid-area: until; }
+.target-since { grid-area: since; }
+.target-owner, .target-until, .target-since { color: var(--ink-2); font-size: 0.88rem; }
+.target-until, .target-since { text-align: right; }
+@media (max-width: 560px) {
+  .target-row { grid-template-columns: minmax(0, 1fr); grid-template-areas: "head" "reason" "owner" "since" "until"; }
+  .target-until, .target-since { text-align: left; }
+}
 .gauges { display: grid; grid-template-columns: max-content minmax(0, 1fr); gap: 10px; margin-top: 14px; }
 .gauge { grid-column: 1 / -1; padding-bottom: 22px; display: grid; grid-template-columns: subgrid; gap: var(--gap); align-items: center; font-size: 0.88rem; cursor: help; }
 .gauge > span { white-space: nowrap; }
@@ -298,6 +321,8 @@ body.queue-unavailable .status, body.queue-unavailable .card { display: none; }
   <div class="queue-error" id="queue-error" role="status"></div>
   <div class="status"><div class="status-content"><span class="dot" id="dot"></span><span id="status">Reading…</span><a class="pill" id="pill" href="#swap" data-tip="pill"><span class="pd"></span><span id="pill-t">pressure –</span></a></div></div>
 
+  <section class="card targets" id="targets" aria-label="Target availability" hidden></section>
+
   <section class="card">
     <div class="answer">
       <div class="big num" data-tip="room"><span id="room">–</span> <small id="room-unit"></small></div>
@@ -430,10 +455,18 @@ function macRow(row) {
 }
 function ciRow(row) { return row.ci || !!row.ci_label; }
 const STEP_TABLE_HEADERS = {target: "Target", duration: "Dur", waiting: "Waiting"};
-function ownerTipFields(row) {
-  return ciRow(row) ? [["CI", row.ci_label || row.name]]
-    : [["Showrunner", publicText(row.showrunner || "") || "not recorded"],
-       ["Unit", publicText(row.unit || "") || "not recorded"]];
+const RUN_FROM = {showrunner: "this run is from the showrunner", director: "this run is from the unit director"};
+function identityFields(row) {
+  if (ciRow(row)) return [["CI", row.ci_label || row.name]];
+  const showrunner = ["showrunner", publicText(row.showrunner || "") || "not recorded"];
+  const unit = publicText(row.unit || "");
+  if (row.runner === "showrunner") return [showrunner, ["unit", RUN_FROM.showrunner]];
+  if (row.runner === "unit director") return [showrunner, ["unit", unit || "not recorded"], ["worker", RUN_FROM.director]];
+  if (row.runner === "worker") return [showrunner, ["unit", unit || RUN_FROM.showrunner], ["worker", publicText(row.worker || "") || "not recorded"]];
+  return [showrunner, ["unit", unit || "not recorded"]];
+}
+function identityHtml(row) {
+  return `<dl class="identity">` + identityFields(row).map(([name, value]) => `<dt>${esc(name)}</dt><dd>${esc(value)}</dd>`).join("") + `</dl>`;
 }
 function pageOwnerTipFields(data) {
   const rows = [...data.walk, ...data.waiters, ...data.swap_by];
@@ -466,7 +499,7 @@ function doneText(row) {
   return recorded(percent) ? formatPercent(percent, progress.done === progress.total) : "—";
 }
 function macTipFields(row, data) {
-  const fields = [...ownerTipFields(row), [STEP_TABLE_HEADERS.target, "mac"],
+  const fields = [[STEP_TABLE_HEADERS.target, "mac"],
     ["Started", row.started_at ? `${ago(row.started_at, data.read_at)} ago` : "unavailable"],
     ["Used", recorded(row.used) ? `${f1(row.used)} GiB` : "unavailable"],
     ["Reading age", row.read_at ? `${ago(row.read_at, data.read_at)} old` : "unavailable"]];
@@ -474,14 +507,36 @@ function macTipFields(row, data) {
     `${row.progress.done} of ${row.progress.total} ${row.progress.unit} · ${formatPercent(row.progress.percent, row.progress.done === row.progress.total)}`]);
   return fields;
 }
+function stepRow(key, data) {
+  const [kind, index] = key.split(":");
+  return kind === "row" ? data.walk[+index] : kind === "wait" ? data.waiters[+index] : null;
+}
 function tooltipHtml(key, data) {
   const [head, body] = tipText(key, data);
-  const [kind, index] = key.split(":");
-  const row = kind === "row" ? data.walk[+index] : null;
-  if (!row || !macRow(row)) return `<b>${esc(head)}</b>${esc(body)}`;
-  return `<b>${esc(head)}</b><dl class="mac-tip-fields">` +
+  const row = stepRow(key, data);
+  if (!row) return `<b>${esc(head)}</b>${esc(body)}`;
+  if (!macRow(row)) return `<b>${esc(head)}</b>${identityHtml(row)}${esc(body)}`;
+  return `<b>${esc(head)}</b>${identityHtml(row)}<dl class="mac-tip-fields">` +
     macTipFields(row, data).map(([name, value]) => `<dt>${esc(name)}</dt><dd>${esc(value)}</dd>`).join("") +
     `</dl><span class="mac-note">Mac memory does not count against natedev.</span>`;
+}
+function sentence(text) { return text ? text[0].toUpperCase() + text.slice(1) : ""; }
+function targetOwner(row) {
+  return [["Unit", row.unit], ["Showrunner", row.showrunner]]
+    .filter(([, name]) => name && name !== "—").map(([label, name]) => `${label} ${publicText(name)}`).join(" · ");
+}
+function renderTargets(rows) {
+  const box = $("targets");
+  box.hidden = !rows.length;
+  box.innerHTML = !rows.length ? "" : `<div class="section-head">Target availability</div>` + rows.map(row => {
+    const owner = row.state === "Unavailable" ? "" :
+      targetOwner(row) || (row.holder ? `Holder ${publicText(row.holder)}` : "Owner not recorded");
+    return `<div class="target-row"><div class="target-head"><span class="machine" data-machine="${esc(row.target)}">${esc(row.target)}</span>` +
+      `<span class="target-state ${esc(row.state.toLowerCase())}">${esc(row.state)}</span></div>` +
+      `<div class="target-until">${esc(sentence(row.until))}</div>` +
+      `<div class="target-reason">${esc(row.reason || "No reason recorded")}</div>` +
+      `<div class="target-owner">${esc(owner)}</div><div class="target-since">${esc(sentence(row.since))}</div></div>`;
+  }).join("");
 }
 function recorded(value) { return typeof value === "number"; }
 function hasCap(d) { return recorded(d.cap); }
@@ -539,8 +594,8 @@ function rawTipText(key, d) {
     if (!r) return ["", ""];
     if (macRow(r)) return [`${r.name} · ${recorded(r.used) ? f1(r.used) + " GiB" : "unavailable"}`,
       macTipFields(r, d).map(([name, value]) => `${name.padEnd(11)} ${value}`).join("\n") + "\nMac memory does not count against natedev."];
-    if (r.kind === "cloud") return [`${r.name} · ${rowOwner(r)}`, `${r.status ? r.status + ". " : ""}Target: ${r.machine}. No local memory reservation.${progressTip(r)}`];
-    if (r.ci) return [`${r.name} · ${rowOwner(r)} · ${r.detail}`, [r.unit, r.keep_text].filter(Boolean).join("\n") + progressTip(r)];
+    if (r.kind === "cloud") return [r.name, `${r.status ? r.status + ". " : ""}Target: ${r.machine}. No local memory reservation.${progressTip(r)}`];
+    if (r.ci) return [`${r.name} · ${r.detail}`, [r.unit, r.keep_text].filter(Boolean).join("\n") + progressTip(r)];
     const when = r.started_at ? `Started ${ago(r.started_at, d.read_at)} ago. ` : "";
     const res = !recorded(r.used) ? `Run use unavailable: ${r.used.reason}. Reserved ${f1(r.reserved)} GiB.` : r.reserved > 0 ? `It uses ${f1(r.used)} GiB. It reserves ${f1(r.reserved)} GiB. The queue counts ${f1(r.counted)} GiB.` : `It uses ${f1(r.used)} GiB. It reserves no memory.`;
     const src = r.queued ? "The queue holds this memory for the run." : "Host free memory already accounts for this use.";
@@ -549,14 +604,15 @@ function rawTipText(key, d) {
       const how = r.group === "Codex servers" ? "Codex servers hold this memory outside the build queue." : "Worker background runs hold this memory outside the build queue.";
       return [`${r.name} · ${f1(r.used)} GiB`, `${how} ${r.detail ? r.detail + ". " : ""}By run: ${parts}.`];
     }
-    return [`${r.name}${rowOwner(r) ? " · " + rowOwner(r) : ""}`, `${when}${!recorded(r.used) ? res + " " : ""}${r.keep_text || res} ${src}${r.unit ? "\n" + r.unit : ""}${progressTip(r)}`];
+    const detail = !r.queued || r.between_steps ? visibleDetail(r) : "";
+    return [`${r.name}${detail ? " · " + detail : ""}`, `${when}${!recorded(r.used) ? res + " " : ""}${r.keep_text || res} ${src}${progressTip(r)}`];
   }
   if (kind === "wait") {
     const w = d.waiters[+i];
     if (!w) return ["", ""];
-    if (w.kind === "cloud") return [`Waits · ${w.name} · ${rowOwner(w, true)}`, `${w.reason}. No local memory reservation.`];
+    if (w.kind === "cloud") return [`Waits · ${w.name}`, `${w.reason}. No local memory reservation.`];
     const need = w.head_text?.includes("; need ") ? "" : `Needs ${f1(w.need)} GiB. `;
-    return [`Waits · ${w.name} · ${rowOwner(w, true)}`, `${need}Waiting for ${ago(w.since, d.read_at)}. Reason: ${w.reason}.`];
+    return [`Waits · ${w.name}`, `${need}Waiting for ${ago(w.since, d.read_at)}. Reason: ${w.reason}.`];
   }
   return TIPS[key](d);
 }
@@ -569,11 +625,11 @@ function tipText(key, d) {
   const text = rawTipText(key, d);
   if (!text[0] && !text[1]) return text;
   const [kind, index] = key.split(":");
-  const row = kind === "row" ? d.walk[+index] : kind === "wait" ? d.waiters[+index] : null;
-  const notes = row ? [row.head_text, row.priority_text] : key === "walksum" && !d.waiters.length ? [d.head_text] : [];
-  if (!row || !macRow(row)) {
-    const owner = row || (kind === "swap" ? d.swap_by[+index] : null);
-    const fields = owner ? ownerTipFields(owner) : pageOwnerTipFields(d);
+  const row = stepRow(key, d);
+  const notes = row ? [row.head_text, row.priority_text, row.mac_text] : key === "walksum" && !d.waiters.length ? [d.head_text] : [];
+  if (!row) {
+    const swap = kind === "swap" ? d.swap_by[+index] : null;
+    const fields = swap ? identityFields(swap) : pageOwnerTipFields(d);
     notes.unshift(fields.map(([name, value]) => `${name}: ${value}`).join("\n"));
   }
   if (key === "walkhead") notes.push(d.unmatched_priority_text);
@@ -651,6 +707,7 @@ function render(d) {
   }
   $("mac-idle-alert").textContent = d.mac_idle_alert;
   $("mac-idle-alert").hidden = !d.mac_idle_alert;
+  renderTargets(d.targets || []);
   $("room-equation").textContent = roomEquation(d);
   document.body.classList.remove("queue-unavailable");
   const t = d.total;

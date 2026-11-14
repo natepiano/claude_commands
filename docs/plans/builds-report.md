@@ -1373,9 +1373,42 @@ From the user (via builds), 2026-11-13, with screenshots /tmp/claude/scratch/use
 
 ### Phase 72 — AWS rows name their owner · status: done
 
-From builds (not the user), 2026-11-13: AWS rows on the Builds page read "owner not recorded" (user shot /tmp/claude/scratch/user-shot-done-duration-gap.png, pid 3184935). Cause, from aws: `cloud_gate.service_command` (scripts/aws_target/cloud_gate.py, about line 1061) starts each gate worker, and `gate_trial.py:476` each paired-trial worker, as a `systemd-run` unit without the caller's session id or unit. The worker's step record has no owner, so `queue_evidence.step_labels` falls back.
+From builds (not the user), 2026-11-13: AWS rows on the Builds page read "owner not recorded" (user shot /tmp/claude/scratch/user-shot-done-duration-gap.png). A gate worker and a paired-trial worker start as a `systemd-run` unit without the caller's session id or unit.
 
-1. The worker carries the caller's session id, session name and unit into its step record.
-2. A cloud gate row and a paired-trial row name their showrunner and unit, the same as a natedev row.
-3. aws owns cloud_gate.py and gate_trial.py; aws-unit is asked about the change.
-4. Proof: before and after page shots of an AWS row and its tooltip.
+#### As-built
+
+- `cloud_gate.service_command` forwards `CODEX_THREAD_ID`, `CLAUDE_CODE_SESSION_ID`, `CLAUDE_SESSION_NAME` and `BUILDLOG_UNIT` with `--setenv`, each only when the caller sets it. An empty value stays empty.
+- The gate worker and the paired-trial worker both use `service_command`, so `gate_trial.py` does not change.
+- The existing `admission_records.waiter_identity` reads the forwarded values. The worker's step record names its session and unit, and the AWS row reads "{unit} {step}" over the showrunner name.
+- The AWS `UnsetEnvironment` list does not change, and no new credential data is read. A hold owned by another session still refuses the worker (exit 10).
+- `memory_page_proof.mjs --cloud-owner` saves before and after shots of an AWS row and its tooltip.
+- aws-unit's conditions are met. A live check of the owner on the next gate worker and paired-trial worker goes to builds.
+
+**Files:** `scripts/aws_target/cloud_gate.py`, `test_cloud_gate.py`; `scripts/build_queue/memory_page_proof.mjs`.
+
+### Phase 73 — The Builds page shows each block and hold · status: done
+
+From the user (via builds), 2026-11-13, with user shot /tmp/claude/scratch/user-shot-mac-block-banner.png: "this design is not quite what i had in mind although it does tell me that the mac is idle - although it should say that it is blocked. i want you to ask that whoever implements showing the mac block should do an astra design review to make it more beautiful than what we're currently doing". No AWS hold exists, so the page has no AWS row (director decision).
+
+#### As-built
+
+- `target_availability.py` reads `targets.target_snapshots()` once for each page reading. `availability_rows` gives one row for each Mac block ("Blocked") and each natedev hold ("Held"), with holder, unit, showrunner, reason, since and until. An unreachable or unreadable target gives an "Unavailable" row. A free or busy target has no row.
+- The "Target availability" card on the Builds page shows these rows. A narrow view puts the reason, owner, since and until in that order.
+- `MacRoutes.line` gives the "Mac: ..." tooltip line for natedev rows and waiters: kind not offloaded, natedev only, excluded (policy), blocked, busy, unreachable, state unreadable, or no recorded block or claim. It reads `build_targets.step_policy` once for each (folder, package, kind) in a reading. Backoff and unreadable state are not policy; the state line names them.
+- Cost: `step_policy` runs local git reads, 5–25 ms for each repository in each 3 s reading. Accepted, because a cache across readings would hide a config change.
+- `ssh_target_snapshot` puts a block before a failed probe, running jobs and backoff. `read_backoff(strict=True)` returns `UnreadableBackoff`; the non-strict read does not change.
+- The idle alert says "MAC BLOCKED by ...". When the card shows the block, the page omits the block sentence from the alert (`BlockText.OMITTED`); admission diagnostics stay.
+- The astra design review came before the build. Its findings and rulings are in the phase notice to builds.
+- `memory_page_proof.mjs --blocks` saves before and after shots with the user shot's values, a narrow view with two natedev holders, and one tooltip for each Mac line form.
+
+### Phase 74 — Every row hover names who ran it · status: done
+
+From the user (via builds), 2026-11-13, with user shot /tmp/claude/scratch/until-2026-11-16T0500Z-hover-shot-a361af/user-hover-identity.png: "this hover panel is going in the right direction - i want to make sure we non-redundantly indentify the showrunner: {showrunner} unit : {unit} worker : {worker} if the showrunner is the only thing that ran it, then it should say showrunner: {showrunner} unit : this run is from the showrunner and don't show the unit similarly if it is something run from the unit it should be showrunner: {showrunner} unit : {unit} worker : this run is from the unit director This should be a standard at the beginning of each hover over every running and queued row". From builds (not the user), 2026-11-13: a showrunner run has no worker line; use the user's label texts exactly; one shared block from one place in the code; a run with no recorded owner keeps "owner not recorded"; a showrunner's worker shows "unit: this run is from the showrunner".
+
+#### As-built
+
+- `unit_labels.Runner` records who ran the step: showrunner, unit director, worker, or unknown. `make_labels` sets it through `runner_of`. It is the only place that builds labels from the relationships, so the fast and full readers agree.
+- `memory_feed.page_owner_labels` sends `runner` and `worker` on every running and queued row. Cloud rows use it too. A CI row sends runner unknown and keeps its CI line.
+- `identityHtml` on the Builds page is the one place for the block. Every walk and waiter hover, Mac rows included, starts with it: showrunner, unit, then worker, with the user's label texts. The labels are lowercase and the colons align.
+- Row headings and the local row body no longer repeat the owner that the block names. A hover with the block is up to 24rem wide, so the values do not wrap.
+- `memory_page_proof.mjs --identity` saves before and after shots of the Mac row hover, plus one showrunner-run row and one unit-director-run row.

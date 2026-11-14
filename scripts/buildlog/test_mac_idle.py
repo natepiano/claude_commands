@@ -933,7 +933,7 @@ done
         with mock.patch.object(subprocess, "run", side_effect=AssertionError("file read only")):
             line = mac_idle_alert.alert_line(path, 1180, ZoneInfo("UTC"))
         self.assertLess(time.monotonic() - started, 0.05)
-        self.assertIn("Blocked by research since 00:16 (run)", line or "")
+        self.assertIn("MAC BLOCKED by research since 00:16 (run): ", line or "")
         self.assertNotIn("\u001b", line or "")
         invalid_values: tuple[tuple[str, object], ...] = (("version", True), ("written", float("nan")), ("since", "1000"),
                                ("changed", None), ("changed", True), ("changed", "1000"), ("changed", -1),

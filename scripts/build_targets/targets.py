@@ -9,7 +9,7 @@ except FileNotFoundError:
 
 
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timezone, tzinfo
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -30,7 +30,7 @@ from scripts.build_targets.target_config import (
 
 
 if TYPE_CHECKING:
-    from scripts.mac_test import mac_test
+    from scripts.mac_test import eligibility, mac_test
 
 
 @dataclass(frozen=True)
@@ -49,8 +49,14 @@ class UntilReleased:
 
 
 @dataclass(frozen=True)
+class ExpiryNotRecorded:
+    pass
+
+
+@dataclass(frozen=True)
 class AwaitingBlockRemoval:
     """A block remains enforced after its requested expiry."""
+    requested_expiry: datetime | ExpiryNotRecorded = ExpiryNotRecorded()
 
 
 HoldEnd = ExpiresAt | ReleaseEstimated | UntilReleased | AwaitingBlockRemoval
@@ -110,10 +116,15 @@ class Running:
 
 
 @dataclass(frozen=True)
+class StartNotRecorded:
+    pass
+
+
+@dataclass(frozen=True)
 class Held:
     holder: str
     reason: str
-    since: datetime
+    since: datetime | StartNotRecorded
     end: HoldEnd
     holder_session: HolderSession | NoHolderSession = NO_HOLDER_SESSION
 
@@ -129,6 +140,14 @@ class StateUnreadable:
 
 
 TargetState = Free | Running | Held | Unreachable | StateUnreadable
+
+
+@dataclass(frozen=True)
+class TargetSnapshot:
+    target: Target
+    states: tuple[TargetState, ...]
+    claims: tuple[mac_test.HeldClaim, ...]
+    backoff: eligibility.BackoffState
 
 
 def target_eligibility(
@@ -183,57 +202,96 @@ def running_job(claim: mac_test.HeldClaim) -> RunningJob:
 
 
 def local_hold_state() -> TargetState:
+    return local_hold_states()[0]
+
+
+def local_hold_states() -> tuple[TargetState, ...]:
     """Read the local hold without importing remote claim readers."""
     from scripts.build_hold import build_hold
 
     try:
         holds = build_hold.natedev_holds(build_hold.holder_directory())
         if not holds.in_force:
-            return Free()
-        holder = holds.in_force[0]
-        end = (
-            ReleaseEstimated(holder.release.at)
-            if isinstance(holder.release, build_hold.KnownReleaseEta)
-            else UntilReleased()
-        )
-        return Held(holder.name, holder.purpose, holder.since, end,
-                    HolderSession(build_hold.holder_session(holder.key)))
+            return (Free(),)
+        return tuple(Held(holder.name, holder.purpose,
+            holder.since if holder.start_recorded else StartNotRecorded(),
+            ReleaseEstimated(holder.release.at) if isinstance(holder.release, build_hold.KnownReleaseEta) else UntilReleased(),
+            HolderSession(build_hold.holder_session(holder.key))) for holder in holds.in_force)
     except build_hold.ReleaseRecordReadError as error:
-        return StateUnreadable(build_hold.release_record_error_line(error))
+        return (StateUnreadable(build_hold.release_record_error_line(error)),)
     except (OSError, UnicodeError, ConfigError) as error:
-        return StateUnreadable(str(error))
+        return (StateUnreadable(str(error)),)
 
 
 def ssh_target_state(target: SshTarget) -> TargetState:
-    """Read remote claim records without probing the target."""
+    return ssh_target_snapshot(target).states[0]
+
+
+def ssh_target_snapshot(target: SshTarget) -> TargetSnapshot:
+    """Read remote claim, block and backoff records once, without probing the target."""
     from scripts.build_hold import build_hold
     from scripts.mac_test import eligibility, mac_test
 
+    claims: tuple[mac_test.HeldClaim, ...] = ()
+    backoff: eligibility.BackoffState = eligibility.NO_BACKOFF
+
+    def snapshot(state: TargetState) -> TargetSnapshot:
+        return TargetSnapshot(target, (state,), claims, backoff)
+
     try:
         paths = mac_test.state_paths(target.name)
-        claims = mac_test.read_claims(paths)
+        claims = tuple(mac_test.read_claims(paths))
         block = mac_test.read_claim_block(paths)
+        backoff = eligibility.read_backoff(utc_now().timestamp(), target.name, strict=True)
         if not isinstance(block, mac_test.NoMacBlock):
-            block_end = (
-                ExpiresAt(block.expires)
-                if block.expires > utc_now()
-                else AwaitingBlockRemoval()
-            )
+            block_end = ExpiresAt(block.expires) if block.expires > utc_now() else AwaitingBlockRemoval(block.expires)
             session = (HolderSession(block.delivery.name)
                        if isinstance(block.delivery, mac_test.RecordedSession) else NO_HOLDER_SESSION)
-            return Held(mac_test.holder_name(block.holder), block.reason, block.since, block_end, session)
+            return snapshot(Held(mac_test.holder_name(block.holder), block.reason, block.since, block_end, session))
         if isinstance(eligibility.read_failed_probe(target.name), eligibility.FailedProbe):
-            return Unreachable("failed probe")
+            return snapshot(Unreachable("failed probe"))
         jobs = tuple(running_job(claim) for claim in claims if mac_test.run_is_live(claim.record))
         if jobs:
-            return Running(jobs)
-        if isinstance(eligibility.read_backoff(utc_now().timestamp(), target.name), eligibility.ActiveBackoff):
-            return Unreachable("retry backoff")
-        return Free()
+            return snapshot(Running(jobs))
+        if isinstance(backoff, eligibility.UnreadableBackoff):
+            return snapshot(StateUnreadable("retry backoff: " + backoff.reason))
+        if isinstance(backoff, eligibility.ActiveBackoff):
+            return snapshot(Unreachable("retry backoff"))
+        return snapshot(Free())
     except build_hold.ReleaseRecordReadError as error:
-        return StateUnreadable(build_hold.release_record_error_line(error))
+        return snapshot(StateUnreadable(build_hold.release_record_error_line(error)))
     except (OSError, UnicodeError, mac_test.StateReadError, ConfigError) as error:
-        return StateUnreadable(str(error))
+        return snapshot(StateUnreadable(str(error)))
+
+
+def target_snapshots() -> tuple[TargetSnapshot, ...]:
+    """Read coordination evidence once for one page reading."""
+    from scripts.mac_test import eligibility
+
+    return tuple(TargetSnapshot(target, local_hold_states(), (), eligibility.NO_BACKOFF)
+                 if isinstance(target, LocalTarget) else ssh_target_snapshot(target)
+                 for target in read_targets())
+
+
+def start_text(since: datetime | StartNotRecorded, zone: tzinfo) -> str:
+    """Name a hold's recorded start, or say that none was recorded."""
+    return "start not recorded" if isinstance(since, StartNotRecorded) else "since " + clock(since, zone)
+
+
+def end_text(end: HoldEnd, zone: tzinfo) -> str:
+    """Name a fixed expiry, an estimated release, an open hold or an expired block."""
+    if isinstance(end, ExpiresAt):
+        return "until " + clock(end.when, zone)
+    if isinstance(end, ReleaseEstimated):
+        return "expected release " + clock(end.when, zone)
+    if isinstance(end, AwaitingBlockRemoval):
+        expiry = end.requested_expiry
+        return "awaiting unblock" + (f"; requested expiry was {clock(expiry, zone)}" if isinstance(expiry, datetime) else "")
+    return "until released"
+
+
+def clock(instant: datetime, zone: tzinfo) -> str:
+    return instant.astimezone(zone).strftime("%H:%M %Z")
 
 
 def target_state(target: Target) -> TargetState:

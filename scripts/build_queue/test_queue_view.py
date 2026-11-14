@@ -64,7 +64,8 @@ class RecordedOwnerQueueTests(unittest.TestCase):
             current = fixture_runtime_id("owner-after-session-restart")
             worker = staff.update_current_session(worker.current_session, staff.native_id(current))
             model = fixture.model()
-            for source, owner in (("detached", worker), ("systemd", unit)):
+            for source, owner, ran_by in (("detached", worker, unit_labels.Runner.WORKER),
+                                          ("systemd", unit, unit_labels.Runner.UNIT_DIRECTOR)):
                 with self.subTest(source=source), mock.patch.dict(os.environ, {
                     "CODEX_THREAD_ID": "", "CLAUDE_CODE_SESSION_ID": "", "CLAUDE_SESSION_NAME": "",
                     "BUILDLOG_UNIT": "", "BUILDLOG_OWNER_STAFF_ID": str(owner.id),
@@ -77,7 +78,7 @@ class RecordedOwnerQueueTests(unittest.TestCase):
                     running = replace(model.reading.view.running[0], session_id=identity.session_id,
                                       session_name=identity.name, unit=identity.unit)
                     for step in (waiter, running):
-                        expected = UnitLabels(owner.name, "hana", "demo", unit_labels.OwnerRole.UNIT)
+                        expected = UnitLabels(owner.name, "hana", "demo", unit_labels.OwnerRole.UNIT, ran_by)
                         self.assertEqual(queue_evidence.step_labels(step, labels), expected)
                     cloud = replace(cloud_reading(model.reading).cloud[0], identity=identity)
                     self.assertEqual(queue_view.cloud_step_labels(cloud, replace(model, labels=labels)),

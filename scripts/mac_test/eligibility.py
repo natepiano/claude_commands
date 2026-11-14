@@ -21,6 +21,11 @@ from scripts.mac_test import cargo_manifest
 MacVerb = Literal["nextest", "check", "clippy", "mend-check", "doc", "build"]
 
 
+def step_kind(verb: str) -> str:
+    """Map a command verb to its recorded step kind."""
+    return {"test": "nextest", "mend-check": "mend"}.get(verb, verb)
+
+
 NonBusyMacDeclineReason = Literal[
     "off",
     "repo",
@@ -139,7 +144,22 @@ class ActiveBackoff:
     """The last failed probe still suppresses remote work."""
 
 
-BackoffState = NoBackoff | ActiveBackoff
+@dataclass(frozen=True)
+class UnreadableBackoff:
+    """The backoff file exists but holds no finite time; a strict read names why."""
+
+    reason: str
+
+
+@dataclass(frozen=True)
+class ReadBackoff:
+    """The caller has not read backoff, so the eligibility check reads it."""
+
+
+READ_BACKOFF = ReadBackoff()
+
+
+BackoffState = NoBackoff | ActiveBackoff | UnreadableBackoff
 
 
 NO_BACKOFF = NoBackoff()
@@ -217,16 +237,16 @@ def backoff_path(target: str = "mac") -> Path:
     return state_directory(target) / "unreachable_until"
 
 
-def read_backoff(now: float, target: str = "mac") -> BackoffState:
+def read_backoff(now: float, target: str = "mac", *, strict: bool = False) -> BackoffState:
     path = backoff_path(target)
     try:
         until = float(path.read_text(encoding="utf-8").strip())
     except FileNotFoundError:
         return NO_BACKOFF
-    except (OSError, ValueError):
-        return NO_BACKOFF
+    except (OSError, UnicodeError, ValueError) as error:
+        return UnreadableBackoff(str(error)) if strict else NO_BACKOFF
     if not math.isfinite(until):
-        return NO_BACKOFF
+        return UnreadableBackoff("backoff time is not finite") if strict else NO_BACKOFF
     return ACTIVE_BACKOFF if until > now else NO_BACKOFF
 
 
@@ -360,7 +380,8 @@ def verb_kind(verb: MacVerb) -> str:
 
 
 def mac_step_eligibility(config: OffloadConfig, repo_root: Path, package: str,
-                         verb: MacVerb, target: str = "", *, kind: str = "") -> KnownRepository | IneligibleMacStep:
+                         verb: MacVerb, target: str = "", *, kind: str = "",
+                         backoff: BackoffState | ReadBackoff = READ_BACKOFF) -> KnownRepository | IneligibleMacStep:
     """Share repository, package/workspace and backoff rules with eligible --kind."""
     if not config.enabled:
         return IneligibleMacStep("off")
@@ -370,13 +391,20 @@ def mac_step_eligibility(config: OffloadConfig, repo_root: Path, package: str,
     if target and not target_config.uses_legacy_mac_layout(configured_ssh_target(target).platform):
         if not linux_kind_permitted(config.values, kind or verb_kind(verb)):
             return IneligibleMacStep("target does not permit this command")
-        if isinstance(read_backoff(time.time(), target), ActiveBackoff):
-            return IneligibleMacStep("backoff")
-        return repository
+        return backoff_eligibility(repository, target, backoff)
     policy = linux_only_policy(config, repository, repo_root, package)
     if isinstance(policy, IneligibleMacStep):
         return policy
-    if isinstance(read_backoff(time.time(), target), ActiveBackoff):
+    return backoff_eligibility(repository, target, backoff)
+
+
+def backoff_eligibility(repository: KnownRepository, target: str,
+                        backoff: BackoffState | ReadBackoff) -> KnownRepository | IneligibleMacStep:
+    """Refuse a step while backoff is active or unreadable; read it unless the caller has."""
+    current = read_backoff(time.time(), target) if isinstance(backoff, ReadBackoff) else backoff
+    if isinstance(current, UnreadableBackoff):
+        return IneligibleMacStep("state")
+    if isinstance(current, ActiveBackoff):
         return IneligibleMacStep("backoff")
     return repository
 

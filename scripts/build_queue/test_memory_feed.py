@@ -24,7 +24,7 @@ from unittest import mock
 
 from scripts.buildlog import charts, costs, moments
 from scripts.buildlog.mac_idle_test_support import write_idle_alert, write_idle_config
-from scripts.build_queue import admission_client, admission_protocol as wire, cloud_progress, memory_feed, progress_profile, queue_lines, queue_view
+from scripts.build_queue import admission_client, admission_protocol as wire, cloud_progress, memory_feed, progress_profile, queue_lines, queue_view, target_availability
 from scripts.build_queue.test_queue_view import cloud_reading
 from scripts.build_queue.admission_test_support import AdmissionFixture, NOW as ADMISSION_NOW, only_admitted
 from scripts.build_queue.queue_fixture import write_process, write_scope
@@ -140,6 +140,7 @@ class MemoryFeedTests(unittest.TestCase):
         _ = self.enterContext(mock.patch.object(charts, "page_data", return_value=report_fixture()))
         _ = self.enterContext(mock.patch.object(queue_view, "mac_reading_path", return_value=self.root / "mac-builds.json"))
         _ = self.enterContext(mock.patch.object(queue_view, "refresh_mac_builds"))
+        _ = self.enterContext(mock.patch.object(target_availability, "read_snapshots", return_value=()))
 
     def configure(self, *, seconds: float = 0.125) -> None:
         source = Path(__file__).resolve().parents[2] / "config/memory_feed.conf"
@@ -349,10 +350,9 @@ class MemoryFeedTests(unittest.TestCase):
         lease = floor_claims.HeldMirror(floor_claims.MirrorIdentity("mac", build.folder), "owner")
         identity = unit_labels.UnitLabels("worker", "hana", "trunk")
         for claims, leases in (((claim,), ()), ((), (lease,)), ((), ())):
-            with (mock.patch.object(claim_state, "read_claims", return_value=claims),
-                  mock.patch.object(copies, "held_remote_mirrors", return_value=leases),
+            with (mock.patch.object(copies, "held_remote_mirrors", return_value=leases),
                   mock.patch.object(unit_labels, "unit_labels_for", return_value={"owner": identity})):
-                result = memory_feed.mac_build_units((build,))
+                result = memory_feed.mac_build_units((build,), claims)
             self.assertEqual(result.get(100, unit_labels.UnitLabels("")).unit, "trunk" if claims else "—")
 
     def test_mac_remote_claim_matches_its_session_and_repository(self) -> None:
@@ -366,12 +366,12 @@ class MemoryFeedTests(unittest.TestCase):
             "worktree": "/home/nate/source", "since": "2026-11-12T18:00:00+00:00", "remote_host": "mac", "repo_name": "hana"}
         claim = claim_state.HeldClaim(claim_state.RepositoryScope("hana"), self.root / "claim.json", record)
         identity = unit_labels.UnitLabels("worker", "hana", "trunk")
-        with (mock.patch.object(claim_state, "read_claims", return_value=(claim,)),
+        with (mock.patch.object(claim_state, "read_claims", side_effect=AssertionError("claims come from the page reading")),
               mock.patch.object(copies, "held_remote_mirrors", return_value=()),
               mock.patch.object(unit_labels, "unit_labels_for", return_value={"claim-session": identity})):
-            self.assertEqual(memory_feed.mac_build_units((build,))[100], identity)
-            self.assertEqual(memory_feed.mac_build_units((replace(build, repository="cargo-liner"),)), {})
-            self.assertEqual(memory_feed.mac_build_units((replace(build, session="unclaimed"),)), {})
+            self.assertEqual(memory_feed.mac_build_units((build,), (claim,))[100], identity)
+            self.assertEqual(memory_feed.mac_build_units((replace(build, repository="cargo-liner"),), (claim,)), {})
+            self.assertEqual(memory_feed.mac_build_units((replace(build, session="unclaimed"),), (claim,)), {})
 
     def test_old_native_mac_readings_hide_their_process_rows(self) -> None:
         baseline = reservation_reading()
@@ -409,10 +409,9 @@ class MemoryFeedTests(unittest.TestCase):
             labels[session] = unit_labels.UnitLabels("worker", "hana", "research")
         leases = ((floor_claims.HeldMirror(floor_claims.MirrorIdentity(host, build.folder),
                    "claim-session-0"),) if mirror else ())
-        with (mock.patch.object(claim_state, "read_claims", return_value=tuple(claims)),
-              mock.patch.object(copies, "held_remote_mirrors", return_value=leases),
+        with (mock.patch.object(copies, "held_remote_mirrors", return_value=leases),
               mock.patch.object(unit_labels, "unit_labels_for", return_value=labels)):
-            return dict(memory_feed.mac_build_units((build,)))
+            return dict(memory_feed.mac_build_units((build,), tuple(claims)))
 
     def test_mac_manual_clone_unit_requires_one_claim_and_a_known_non_ci_origin(self) -> None:
         build = queue_view.MacBuild(68214, "/Users/nate/rust/hana_handmade", 200_000,
@@ -1099,8 +1098,8 @@ class MemoryFeedTests(unittest.TestCase):
         reading = captured_reading()
         now = reading.explanation.now
         cases = (
-            ("idle", 0, "MAC IDLE 10 min: 7 steps wait for the Mac. Blocked by research since "
-                + "07:23 (P15 F11 L0 run); /build:mac unblock clears it."),
+            ("idle", 0, "MAC BLOCKED by research since 07:23 (P15 F11 L0 run): 7 steps wait for the Mac, "
+                + "idle 10 min; /build:mac unblock clears it."),
             ("busy", 0, ""),
             ("unreachable", 0, "MAC UNREACHABLE until 07:38: 7 steps wait for the Mac."),
             ("unreadable", 0, "MAC IDLE WATCH: Mac state unreadable: P15 F11 L0 run."),
@@ -1121,6 +1120,38 @@ class MemoryFeedTests(unittest.TestCase):
                     page = memory_feed.reading()
                 payload = cast(dict[str, object], json.loads(memory_feed.page_json(page)))
                 self.assertEqual(payload["mac_idle_alert"], expected)
+
+    def test_mac_block_shows_its_card_and_waiter_line_and_omits_the_duplicate_alert(self) -> None:
+        from scripts.build_targets import build_targets, targets
+        from scripts.build_targets.target_config import LocalTarget, SshTarget
+        from scripts.mac_test import eligibility
+
+        _ = write_idle_config(self.root)
+        reading = queued_reading(captured_reading(), ())
+        now = reading.explanation.now
+        since = datetime.fromtimestamp(now - 600, UTC)
+        block = targets.Held("research", "P15 F11 L0 run", since, targets.UntilReleased(), targets.HolderSession("mac-owner"))
+        snapshots = (targets.TargetSnapshot(SshTarget("mac", "macos", self.root / "mac.conf"), (block,), (), eligibility.NO_BACKOFF),
+                     targets.TargetSnapshot(LocalTarget("natedev", "linux"), (targets.Free(),), (), eligibility.NO_BACKOFF))
+        labels = {"mac-owner": unit_labels.UnitLabels("director", "hana", "research")}
+        for admission_error, expected in (("", ""), ("fixture down", "MAC IDLE WATCH: admission query failed: fixture down.")):
+            with self.subTest(admission_error=admission_error):
+                path = write_idle_alert(self.root / "mac-idle", now)
+                saved = cast(dict[str, object], json.loads(path.read_text()))
+                saved.update(admission_error=admission_error)
+                _ = path.write_text(json.dumps(saved))
+                with mock.patch.object(admission_client, "view", return_value=reading), \
+                     mock.patch.object(time, "time", return_value=now), \
+                     mock.patch.object(target_availability, "read_snapshots", return_value=snapshots), \
+                     mock.patch.object(unit_labels, "unit_labels_for", return_value=labels), \
+                     mock.patch.object(build_targets, "step_policy", return_value=eligibility.KnownRepository("hana")):
+                    page = memory_feed.reading()
+                self.assertEqual(page["mac_idle_alert"], expected)
+                self.assertEqual(page["targets"], [{"target": "mac", "state": "Blocked", "reason": "P15 F11 L0 run",
+                    "holder": "research", "unit": "research", "showrunner": "hana", "since": "since " + since.strftime("%H:%M UTC"),
+                    "until": "until released"}])
+                self.assertEqual({waiter.get("mac_text") for waiter in page["waiters"]},
+                                 {"Mac: blocked by research (hana) until released"})
 
     def test_cloud_rows_show_stage_and_location(self) -> None:
         reading = cloud_reading(reservation_reading())
@@ -1704,7 +1735,7 @@ def write_browser_fixture(folder: Path) -> None:
         claim = claim_state.HeldClaim(claim_state.RepositoryScope("hana"), fixture.root / "claim.json", mac_claim)
         with (mock.patch.object(admission_client, "view", return_value=base),
               mock.patch.object(queue_view, "read_mac_builds", return_value=mac_reading),
-              mock.patch.object(claim_state, "read_claims", return_value=(claim,)),
+              mock.patch.object(target_availability, "mac_claims", return_value=(claim,)),
               mock.patch.object(copies, "held_remote_mirrors", return_value=()),
               mock.patch.object(unit_labels, "unit_labels_for", return_value={"claim-owner": unit_labels.UnitLabels("worker", "hana", "trunk")})):
             pages["mac_three"] = json.loads(memory_feed.page_json(memory_feed.reading(configuration)))
