@@ -13,7 +13,7 @@ import subprocess
 import sys
 import time
 from collections.abc import Iterable
-from contextlib import nullcontext, redirect_stderr, redirect_stdout
+from contextlib import ExitStack, nullcontext, redirect_stderr, redirect_stdout
 from concurrent.futures import ThreadPoolExecutor
 from contextvars import copy_context
 from threading import Event
@@ -570,7 +570,7 @@ def start_row(row: staff.StaffRow, record: staff.StaffSnapshot, client: herdr.He
                                                       herdr.NO_ENVIRONMENT_REMOVALS)
         if isinstance(prepared, nix_env.Refused):
             raise OSError(str(prepared))
-        target: herdr.NewTab | herdr.SplitPane | herdr.ExistingPane = destination
+        target: herdr.NewTab | herdr.ExistingPane = destination
         source_pane: pane_launch.ResumeSourcePane | pane_launch.ResumeSourceAbsent = pane_launch.ResumeSourceAbsent.CURRENT
         exiting_source: RetainedRestartPane | pane_launch.ResumeSourceAbsent = pane_launch.ResumeSourceAbsent.CURRENT
         source_client = client
@@ -744,14 +744,26 @@ def row_panes(rows: list[staff.StaffRow], client: herdr.Herdr) -> list[tuple[sta
         return []
 
 
-def live_members(rows: Iterable[staff.StaffRow], record: staff.StaffSnapshot, *,
+@dataclass(frozen=True)
+class CompleteLiveRows:
+    rows: list[staff.StaffRow]
+
+
+@dataclass(frozen=True)
+class PartialLiveRows:
+    rows: list[staff.StaffRow]
+
+
+def _read_live_members(rows: Iterable[staff.StaffRow], record: staff.StaffSnapshot, *,
                  resolver: session_staff.RowResolver | None = None,
                  codex: herdr.CodexConversations | None = None,
-                 account: AllRestartAccounts | accounts.AccountSelection = ALL_RESTART_ACCOUNTS) -> list[staff.StaffRow]:
+                 account: AllRestartAccounts | accounts.AccountSelection = ALL_RESTART_ACCOUNTS
+                 ) -> CompleteLiveRows | PartialLiveRows:
     """Read only the supplied rows and return their live local conversations."""
     from scripts.agents import remote
 
     selected: list[staff.StaffRow] = []
+    complete = True
     shared_unknown = 0
     hosted = {session.thread_id: read.owner.home
               for read in codex_daemon.read_daemons(os.environ)
@@ -784,15 +796,25 @@ def live_members(rows: Iterable[staff.StaffRow], record: staff.StaffSnapshot, *,
                         observed.kind == "claude" or str(row.current_session) not in hosted):
                     print(f"{row.name}: left alone; account unknown")
             elif isinstance(observed, herdr.UnknownConversation):
+                complete = False
                 if observed.shared_codex:
                     shared_unknown += 1
                 if not observed.shared_codex or os.environ.get("SHUTDOWN_DETAIL") == "1":
                     herdr.conversation_note(observed)
         except (OSError, ValueError) as error:
+            complete = False
             _anomaly(row, error)
     if shared_unknown:
         print(f"anomaly: {shared_unknown} rows not proved live or stopped (shared cause above); not blocking", file=sys.stderr)
-    return selected
+    return CompleteLiveRows(selected) if complete else PartialLiveRows(selected)
+
+
+def live_members(rows: Iterable[staff.StaffRow], record: staff.StaffSnapshot, *,
+                 resolver: session_staff.RowResolver | None = None,
+                 codex: herdr.CodexConversations | None = None,
+                 account: AllRestartAccounts | accounts.AccountSelection = ALL_RESTART_ACCOUNTS) -> list[staff.StaffRow]:
+    """Return proved live members for callers that do not replace restart records."""
+    return _read_live_members(rows, record, resolver=resolver, codex=codex, account=account).rows
 
 
 def _codex_conversations(client: herdr.Herdr) -> PaneConversations:
@@ -837,17 +859,22 @@ def live_rows(record: staff.StaffSnapshot, client: herdr.Herdr, *, save_tabs: bo
               resolver: session_staff.RowResolver | None = None,
               account: AllRestartAccounts | accounts.AccountSelection = ALL_RESTART_ACCOUNTS,
               observed: RestartObservations | None = None,
-              selection: SelectedRestartRows | AllRestartRows = AllRestartRows.CURRENT) -> list[staff.StaffRow]:
+              selection: SelectedRestartRows | AllRestartRows = AllRestartRows.CURRENT
+              ) -> CompleteLiveRows | PartialLiveRows:
+    from scripts.herdr.worker_panes import UncertainWorker, ProcessUnknownWorker
+
     observed = _observations(record, client) if observed is None else observed
     resolver = session_staff.RowResolver(record) if resolver is None else resolver
     codex = observed.codex
     rows = [row for row in record.rows if not isinstance(selection, SelectedRestartRows) or row.id in selection.ids]
+    complete = True
     if isinstance(selection, AllRestartRows):
         # The registry supplies candidate names; the reader proves each conversation.
         try:
             candidates = {session["sessionId"]: (session["name"] or session["sessionId"]) +
                 (f" in {folder}" if (folder := session.get("cwd")) else "") for session in sessions.running_sessions()}
         except (OSError, ValueError) as error:
+            complete = False
             print(f"restart: Claude registry anomaly: {error}", file=sys.stderr)
             candidates = {}
         for identity in herdr.running_codex_threads(thread_host=herdr.codex_managed_daemon, codex=codex):
@@ -871,7 +898,11 @@ def live_rows(record: staff.StaffSnapshot, client: herdr.Herdr, *, save_tabs: bo
     candidates_rows = [row for row in rows if row.id not in workers]
     if not isinstance(account, AllRestartAccounts):
         candidates_rows.extend(active_workers)
-    selected = live_members(candidates_rows, record, resolver=resolver, codex=codex, account=account)
+    reading = _read_live_members(candidates_rows, record, resolver=resolver, codex=codex, account=account)
+    complete = complete and isinstance(reading, CompleteLiveRows) and not any(
+        isinstance(state, (UncertainWorker, ProcessUnknownWorker))
+        for state in workers.values())
+    selected = reading.rows
     if isinstance(account, AllRestartAccounts):
         selected.extend(active_workers)
     positions = {row.id: index for index, row in enumerate(record.rows)}
@@ -886,7 +917,30 @@ def live_rows(record: staff.StaffSnapshot, client: herdr.Herdr, *, save_tabs: bo
                 client.remember_row_tab(str(row.id), pane)
             except (OSError, ValueError, herdr_types.HerdrFailure, subprocess.SubprocessError) as error:
                 _anomaly(row, error)
-    return selected
+    return CompleteLiveRows(selected) if complete else PartialLiveRows(selected)
+
+
+def prune_live_rows(reading: CompleteLiveRows | PartialLiveRows) -> None:
+    """Prune recorded live rows after a complete read and a locked liveness check."""
+    if isinstance(reading, PartialLiveRows):
+        print("restart: partial liveness read; existing restart rows retained", file=sys.stderr)
+        return
+    saved = set(shutdown_record.read())
+    for row in reading.rows:
+        if str(row.id) not in saved:
+            continue
+        try:
+            with staff.row_operation(str(row.id)):
+                current = staff.initial_snapshot().by_id(row.id)
+                if current is None:
+                    continue
+                observed = herdr.read_conversation(str(current.current_session))
+                if isinstance(observed, herdr.LiveConversation):
+                    shutdown_record.remove_started([str(row.id)])
+                elif isinstance(observed, herdr.UnknownConversation):
+                    _anomaly(row, observed.reason)
+        except (OSError, ValueError, staff.StaffRefused) as error:
+            _anomaly(row, error)
 
 
 def _after_unconfirmed_stop(row: staff.StaffRow, before: herdr.CodexConversations
@@ -941,8 +995,9 @@ class AfterStop(Enum):
     KEEP_STOPPED = "keep the selected rows for the next restart"
 
 
-def stop_all(*, dry_run: bool = False) -> int:
-    return restart(stop_all=True, dry_run=dry_run, after_stop=AfterStop.KEEP_STOPPED)
+def stop_all(*, dry_run: bool = False, only: tuple[str, ...] = (),
+             account: AllRestartAccounts | accounts.AccountSelection = ALL_RESTART_ACCOUNTS) -> int:
+    return restart(stop_all=True, dry_run=dry_run, only=only, account=account, after_stop=AfterStop.KEEP_STOPPED)
 
 
 @herdr.pane_evidence_run()
@@ -960,11 +1015,13 @@ def restart(*, stop_all: bool = False, dry_run: bool = False, only: tuple[str, .
         client = herdr.Herdr(herdr.shared_session())
         observed = _observations(record, client)
         selected: list[staff.StaffRow] = []
+        reading: CompleteLiveRows | PartialLiveRows = CompleteLiveRows([])
         if stop_all:
             selection = (SelectedRestartRows(frozenset(row.id for reference in only
                 if (row := record.by_member_reference(reference)) is not None)) if only else AllRestartRows.CURRENT)
-            selected = live_rows(record, client, save_tabs=not dry_run, resolver=resolver, account=account,
-                                 observed=observed, selection=selection)
+            reading = live_rows(record, client, save_tabs=not dry_run, resolver=resolver, account=account,
+                                observed=observed, selection=selection)
+            selected = reading.rows
         select_only = bool(only) and not stop_all
         pending_ids = ([] if after_stop == AfterStop.KEEP_STOPPED else
                        list(only) if select_only else
@@ -973,7 +1030,7 @@ def restart(*, stop_all: bool = False, dry_run: bool = False, only: tuple[str, .
             path = shutdown_record.record_path()
             saved_at = time.strftime("%H:%M", time.localtime(path.stat().st_mtime)) if path.exists() else "unknown"
             print(f"restart record: {len(pending_ids)} rows saved at {saved_at}")
-            for row in live_rows(record, client, resolver=resolver, observed=observed):
+            for row in live_rows(record, client, resolver=resolver, observed=observed).rows:
                 if str(row.id) not in pending_ids:
                     print(f"{row.name}: live, not in the restart record")
         for reference in pending_ids:
@@ -1015,8 +1072,9 @@ def restart(*, stop_all: bool = False, dry_run: bool = False, only: tuple[str, .
             for row in {row.id: row for row, _pane in visible if row not in selected}.values():
                 print(f"{row.name}: left alone; no proved local restart target")
             return 0
+    if stop_all and after_stop is AfterStop.KEEP_STOPPED and not only and isinstance(account, AllRestartAccounts):
+        prune_live_rows(reading)
     errors = (OSError, ValueError, staff.StaffRefused, herdr_types.HerdrFailure, subprocess.SubprocessError)
-    pending: list[str] = []
     started: list[str] = []
     worker_scope = (WorkerRestartScope.SELECTED_ROWS if only or not isinstance(account, AllRestartAccounts)
                     else WorkerRestartScope.FOLLOW_OWNER)
@@ -1032,9 +1090,13 @@ def restart(*, stop_all: bool = False, dry_run: bool = False, only: tuple[str, .
         members_by_holder.setdefault(holder.id, []).append(str(row.id))
     callers = {os.environ.get("CLAUDE_CODE_SESSION_ID"), os.environ.get("CODEX_THREAD_ID")} - {None, ""}
     if stop_all and any(row.current_session in callers for row in selected):
-        arguments = ["restart", "--all", "--only", ",".join(str(row.id) for row in selected),
-                     "--why", why]
+        arguments = ["stop" if after_stop is AfterStop.KEEP_STOPPED else "restart",
+                     "--all", "--only", ",".join(str(row.id) for row in selected)]
+        if after_stop is AfterStop.RESTART:
+            arguments.extend(("--why", why))
         if not isinstance(account, AllRestartAccounts):
+            if after_stop is AfterStop.KEEP_STOPPED:
+                arguments.append("--account")
             arguments.append(account.label)
         log = stop_resume.detach(arguments, "restart", program=Path(__file__).resolve())
         print(f"restart continues outside this session; log: {log}")
@@ -1046,7 +1108,11 @@ def restart(*, stop_all: bool = False, dry_run: bool = False, only: tuple[str, .
     def stop_holder(holder: staff.StaffRow, previous: Event, recorded: Event) -> tuple[bool, tuple[staff.StaffId, ...]]:
         _ = previous.wait()
         try:
-            with staff.row_operation(str(holder.id)):
+            with ExitStack() as locks:
+                _ = locks.enter_context(staff.row_operation(str(holder.id)))
+                for member in members_by_holder[holder.id]:
+                    if member != str(holder.id):
+                        _ = locks.enter_context(staff.row_operation(member))
                 shutdown_record.update(started=[], pending=members_by_holder[holder.id])
                 recorded.set()
                 workers: tuple[staff.StaffId, ...] = ()
@@ -1055,7 +1121,10 @@ def restart(*, stop_all: bool = False, dry_run: bool = False, only: tuple[str, .
                     if unresolved and holder.id in observed.pane_owners:
                         workers = tuple(child.id for child in record.find(kind="worker", parent=holder.id)
                                         if child.id in selected_ids)
-                return stop_row(holder, client, codex=observed.codex), workers
+                stopped = stop_row(holder, client, codex=observed.codex)
+                if not stopped:
+                    shutdown_record.remove_started([str(holder.id)])
+                return stopped, workers
         finally:
             recorded.set()
 
@@ -1109,7 +1178,12 @@ def restart(*, stop_all: bool = False, dry_run: bool = False, only: tuple[str, .
 
     def start_holder(holder: staff.StaffRow, focus: bool,
                      success_report: RestartSuccessReport = RestartSuccessReport.START_ROW) -> RestartDisposition:
-        with staff.row_operation(str(holder.id)):
+        with ExitStack() as locks:
+            _ = locks.enter_context(staff.row_operation(str(holder.id)))
+            for member in members_by_holder[holder.id]:
+                if member != str(holder.id):
+                    _ = locks.enter_context(staff.row_operation(member))
+            shutdown_record.update(started=[], pending=members_by_holder[holder.id])
             current_record = staff.initial_snapshot()
             current_record = replace(current_record, rows=tuple(row for row in current_record.rows if row.id not in blocked_workers))
             current = current_record.by_id(holder.id)
@@ -1127,9 +1201,11 @@ def restart(*, stop_all: bool = False, dry_run: bool = False, only: tuple[str, .
                     if worker_scope is WorkerRestartScope.FOLLOW_OWNER:
                         _ = _restore_workers(current, current_record, observed=observed)
                     print(f"{current.name}: unchanged")
+                    shutdown_record.remove_started([member for member in members_by_holder[holder.id]
+                                                    if staff.StaffId(member) not in blocked_workers])
                     return RestartDisposition.RESTORED
             facts = session_staff.RowResolver(current_record)
-            opening = (herdr.OpeningPrompt(resume_message.resume_message(why))
+            opening = (herdr.OpeningPrompt(resume_message.resume_message(why, workers=resume_message.worker_mode()))
                        if current.kind in ("unit", "showrunner") else NO_RESTART_MESSAGE)
             launch_row = (start_row if success_report is RestartSuccessReport.START_ROW else
                           partial(start_row, success_report=success_report))
@@ -1140,15 +1216,15 @@ def restart(*, stop_all: bool = False, dry_run: bool = False, only: tuple[str, .
                 pane = launch_row(current, current_record, client, present=focus, resolver=facts,
                                   target_account="" if isinstance(account, AllRestartAccounts) else account,
                                   worker_scope=worker_scope, observed=observed, opening=opening, resume_checks=resume_checks)
+            shutdown_record.remove_started([member for member in members_by_holder[holder.id]
+                                            if staff.StaffId(member) not in blocked_workers])
             return RestartDisposition.STARTED if pane else RestartDisposition.RESTORED
 
     def record_start(holder: staff.StaffRow, disposition: RestartDisposition) -> None:
         members = members_by_holder[holder.id]
         if disposition is RestartDisposition.HELD:
-            pending.extend(members)
             return
         started.extend(member for member in members if staff.StaffId(member) not in blocked_workers)
-        pending.extend(member for member in members if staff.StaffId(member) in blocked_workers)
 
     failed_starts: list[FailedHolderStart] = []
     if holders:
@@ -1157,11 +1233,9 @@ def restart(*, stop_all: bool = False, dry_run: bool = False, only: tuple[str, .
                         pool.submit(copy_context().run, start_holder, holder, present and index == 0))
                        for index, holder in enumerate(holders.values())]
             for holder, focus, future in futures:
-                members = members_by_holder[holder.id]
                 try:
                     record_start(holder, future.result())
                 except ClaudeTrustWriteFailed:
-                    pending.extend(members)
                     exit_code = 1
                 except staff.StaffRefused as error:
                     _anomaly(holder, error)
@@ -1177,7 +1251,6 @@ def restart(*, stop_all: bool = False, dry_run: bool = False, only: tuple[str, .
             except errors:
                 pass
         if not isinstance(fresh, herdr.StoppedConversation):
-            pending.extend(members_by_holder[holder.id])
             _anomaly(holder, failed.error)
             continue
         try:
@@ -1186,16 +1259,11 @@ def restart(*, stop_all: bool = False, dry_run: bool = False, only: tuple[str, .
             if disposition is RestartDisposition.STARTED:
                 print(f"{holder.name}: down; started")
         except ClaudeTrustWriteFailed:
-            pending.extend(members_by_holder[holder.id])
             exit_code = 1
         except staff.StaffRefused as error:
-            pending.extend(members_by_holder[holder.id])
             _anomaly(holder, error)
         except errors as error:
-            pending.extend(members_by_holder[holder.id])
             print(f"{holder.name}: down: {_error_reason(error)}")
-    if started or pending:
-        shutdown_record.update(started=started, pending=pending)
     if started:
         try:
             _ = client.sort_tabs()

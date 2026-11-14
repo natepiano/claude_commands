@@ -255,7 +255,12 @@ from scripts.production.showrunners import (
 
 
 Config = ShowrunnerSettings
-STATE = Path(os.environ.get("XDG_STATE_HOME") or Path.home() / ".local" / "state") / "quota_alert.json"
+def state_path() -> Path:
+    """The quota state file under the current XDG_STATE_HOME."""
+    return Path(os.environ.get("XDG_STATE_HOME") or Path.home() / ".local" / "state") / "quota_alert.json"
+
+
+STATE = state_path()
 SESSIONS = Path.home() / ".claude" / "sessions"
 PROTOCOL = Path.home() / ".claude" / "docs" / "quota_alerts.md"
 AGENTS = Path(__file__).resolve().parent.parent / "agents" / "models_config.sh"
@@ -661,11 +666,27 @@ def _write_state(state: State) -> None:
     os.replace(tmp, STATE)
 
 
+def no_worker_mode() -> bool:
+    """Whether Codex workers have no capacity now; a missing or unreadable state reads as False.
+
+    The path is read at each call, so a test with its own XDG_STATE_HOME never reads the live state.
+    """
+    try:
+        saved = cast(StoredState, json.loads(state_path().read_text(encoding="utf-8")))
+    except (OSError, ValueError):
+        return False
+    return saved.get("no_worker_mode", False)
+
+
+def no_worker_notice() -> str:
+    """The notice that starts no-worker mode."""
+    return conf.read("accounts").text("no_worker_mode_on")
+
+
 def _broadcast_worker_mode(active: bool) -> None:
     """Start one notice unit after the state lock closes."""
     try:
-        account_config = conf.read("accounts")
-        text = account_config.text("no_worker_mode_on") if active else account_config.text("no_worker_mode_off")
+        text = no_worker_notice() if active else conf.read("accounts").text("no_worker_mode_off")
         scripts = Path(__file__).resolve().parents[1]
         command = [os.environ.get("SHUTDOWN_SYSTEMD_RUN", "systemd-run"), "--user", "--collect", "--quiet", "--no-block",
                    "--working-directory=" + str(scripts.parent), "--", str(scripts / "lib/py"),
@@ -1919,14 +1940,6 @@ def _codex_zero_alert(config: Config, readings: CodexAlertPassReadings, now: dat
     stamp = now.isoformat(timespec="seconds")
     pushes: list[tuple[QuotaNote, Literal["phone", "forecast_phone"], str]] = []
     log: list[str] = []
-    warnings: set[str] = set()
-    for home in readings.checked_homes:
-        account = agent_accounts.codex_account(home.home)
-        if isinstance(account, agent_accounts.KnownCodexAccount):
-            setting = agent_accounts.codex_credits_setting(account.label)
-            if isinstance(setting, agent_accounts.CreditsOn) and setting.warning:
-                warnings.add(setting.warning)
-    log.extend(sorted(warnings))
     workers_queued = workers_entry_pending()
     with state_file() as state:
         fallback = state["fallback"]

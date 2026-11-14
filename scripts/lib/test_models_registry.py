@@ -283,6 +283,29 @@ class LaunchSettingsTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     _ = models_registry.launch_settings(section, key)
 
+    def test_a_producer_row_is_validated_before_the_write_and_an_equal_row_changes_nothing(self) -> None:
+        from scripts.lib import models_registry
+
+        _ = write_registry(self.path, {"producers": {"morty": "codex:gpt-test:high", "brain": "codex:gpt-test:medium"}})
+        unchanged = self.path.read_bytes()
+        checked = models_registry.producer_settings("morty", "claude", "sonnet", "max")
+        self.assertEqual(self.path.read_bytes(), unchanged)
+        stored = models_registry.store_producer("morty", "claude", "sonnet", "max")
+        self.assertEqual(stored, checked)
+        self.assertEqual((stored.kind, stored.model, stored.effort), ("claude", "sonnet", "max"))
+        self.assertEqual(models_registry.launch_settings("producers", "morty"), stored)
+        self.assertEqual(models_registry.parse_registry(self.path.read_text())["producers"],
+                         {"morty": "claude:sonnet:max", "brain": "codex:gpt-test:medium"})
+        before = self.path.read_bytes(), self.path.stat().st_mtime_ns
+        self.assertEqual(models_registry.store_producer("morty", "claude", "sonnet", "max"), stored)
+        for family, model, effort in (("claude", "missing-agent", "max"), ("claude", "sonnet", "invalid-effort"),
+                                      ("unknown-family", "sonnet", "max"), ("claude", "sonnet", "")):
+            with self.subTest(family=family, model=model, effort=effort), self.assertRaises(ValueError):
+                _ = models_registry.store_producer("morty", family, model, effort)
+        self.assertEqual((self.path.read_bytes(), self.path.stat().st_mtime_ns), before)
+        added = models_registry.store_producer("producer_only", "codex", "gpt-test", "high")
+        self.assertEqual(models_registry.launch_settings("producers", "producer_only"), added)
+
 
 @final
 class Arguments(argparse.Namespace):

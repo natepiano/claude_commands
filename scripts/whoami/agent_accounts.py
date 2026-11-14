@@ -86,7 +86,6 @@ def codex_account(home: Path) -> RefusingCodexAccount:
 @dataclass(frozen=True)
 class CreditsOn:
     """This account may pay for work after its allowance is used."""
-    warning: str = ""
 
 
 @dataclass(frozen=True)
@@ -97,21 +96,14 @@ class CreditsOff:
 CodexCreditsSetting = CreditsOn | CreditsOff
 
 
-def codex_credits_setting(label: str) -> CodexCreditsSetting:
-    from scripts.whoami.note_file import Note, note_path, read_note
+def codex_credit_accounts() -> frozenset[str]:
+    """The Codex accounts that the accounts config allows to spend paid credits."""
+    return frozenset(conf.read("accounts").text("codex_credit_accounts").split()) - {"none"}
 
-    try:
-        path = note_path(label)
-    except ValueError:
-        # An unnamed home's display label has no account note or explicit setting.
-        return CreditsOn()
-    note = read_note(path)
-    value = note.get("use_credits") if isinstance(note, Note) else None
-    if value == "off":
-        return CreditsOff()
-    if value is None or value == "on":
-        return CreditsOn()
-    return CreditsOn(f"{label}: use_credits must be on or off; reading it as on")
+
+def codex_credits_setting(label: str) -> CodexCreditsSetting:
+    """An account not named in codex_credit_accounts uses only its included allowance."""
+    return CreditsOn() if label in codex_credit_accounts() else CreditsOff()
 
 
 @dataclass(frozen=True)
