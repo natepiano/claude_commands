@@ -576,3 +576,16 @@ The saved baseline reports inserted phases as about 2% of gaps.
 **Files:**
 - `scripts/direct/progress_history.py` — `_report_unclosed_phase` and its call in `_start_phase`
 - `scripts/direct/test_progress_history.py` — rows in `test_a_phase_started_while_another_is_open_leaves_the_older_one_open`
+
+### Phase 25 — A reservation released without a checkpoint clears  · status: done
+
+**Depends on:** none
+
+#### As-built
+
+- `phase_reservation.clear` deletes an `Active` record when berth's board in `repo` shows its reservation `released_without_checkpoint` (`RELEASED_WITHOUT_CHECKPOINT`). That clear writes no release marker.
+- Every other `Active` lifecycle (`active`, `outstanding`, unreadable) stays refused, as before.
+
+**Files:**
+- `scripts/direct/phase_reservation.py` — `clear`
+- `scripts/direct/test_phase_reservation.py` — rows in `test_a_held_reservation_is_never_replaced_or_cleared_by_hand`, board answer patched
