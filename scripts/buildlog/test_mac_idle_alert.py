@@ -11,6 +11,7 @@ import tempfile
 import unittest
 from typing import cast
 from unittest import mock
+from zoneinfo import ZoneInfo
 
 from scripts.lib import conf
 from scripts.buildlog import mac_idle_alert
@@ -31,6 +32,22 @@ class SavedAlertTests(unittest.TestCase):
             _ = path.write_text(json.dumps(row))
             self.assertEqual(mac_idle_alert.read_alert(path), mac_idle_alert.UnreadableAlert("invalid changed"))
 
+
+    def test_a_shown_block_carries_its_diagnostics_and_an_omitted_block_keeps_only_them(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config = write_idle_config(Path(directory))
+            path = write_idle_alert(Path(directory), 1600)
+            zone = ZoneInfo("UTC")
+            with mock.patch.dict(os.environ, {"CONF_DIR": str(config.parent)}):
+                self.assertEqual(mac_idle_alert.alert_line(path, 1600, zone, block=mac_idle_alert.BlockText.OMITTED), None)
+                row = cast(dict[str, object], json.loads(path.read_text()))
+                row["admission_error"] = "socket closed"
+                _ = path.write_text(json.dumps(row))
+                self.assertEqual(mac_idle_alert.alert_line(path, 1600, zone, block=mac_idle_alert.BlockText.OMITTED),
+                                 "MAC IDLE WATCH: admission query failed: socket closed.")
+                self.assertEqual(mac_idle_alert.alert_line(path, 1600, zone),
+                                 "MAC BLOCKED by research since 00:16 (P15 F11 L0 run): 7 steps wait for the Mac, idle 10 min; "
+                                 + "/build:mac unblock clears it; admission query failed: socket closed.")
 
 class MacIdleConfigTests(unittest.TestCase):
     def test_conf_dir_values_apply_without_a_second_read(self) -> None:

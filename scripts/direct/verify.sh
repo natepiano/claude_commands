@@ -599,7 +599,7 @@ verify_helper() {
             printf '\0%s\0' "$input"
             if [[ ${#forwarded[@]} -gt 0 ]]; then printf '%s\0' "${forwarded[@]}"; fi
             printf '\0'
-        ) >&"$VERIFY_HELPER_INPUT" 2>/dev/null \
+        ) 1>&"$VERIFY_HELPER_INPUT" 2>/dev/null \
             && IFS= read -r -d '' status <&"$VERIFY_HELPER_OUTPUT" \
             && IFS= read -r -d '' output <&"$VERIFY_HELPER_OUTPUT" \
             && IFS= read -r -d '' errors <&"$VERIFY_HELPER_OUTPUT"; then
@@ -681,7 +681,7 @@ finish_verify_run() {
         FINAL_PASS_START=""
     fi
     if [[ -n "${UNIT_DETACHED_RECORD:-}" ]]; then
-        "$PY" "$VERIFY_START_DIR/../agents/detached_runs.py" record-exit "$UNIT_DETACHED_RECORD" "$1" || true
+        verify_helper "$DETACHED_RUNS_SCRIPT" record-exit "$UNIT_DETACHED_RECORD" "$1" --pid "$$" || true
     fi
 }
 STEP_RECORD_ACTIVE=0
@@ -921,38 +921,6 @@ run_step() {
         : > "$step_log"
     done
 }
-
-DEV_FEATURES_PY='
-from pathlib import Path
-import sys
-import tomllib
-
-try:
-    with Path(sys.argv[1]).open("rb") as source:
-        value = tomllib.load(source)
-    for key in ("workspace", "metadata", "dev"):
-        if not isinstance(value, dict):
-            raise ValueError("expected a table")
-        value = value.get(key, {})
-    if not isinstance(value, dict):
-        raise ValueError("expected a table")
-    features = value.get("features", [])
-    if not isinstance(features, list) or any(not isinstance(name, str) for name in features):
-        raise ValueError("expected a list of strings")
-except FileNotFoundError:
-    features = []
-except (OSError, ValueError):
-    print("verify.sh: workspace.metadata.dev.features must be a list of strings", file=sys.stderr)
-    sys.exit(2)
-print(",".join(features))
-if len(sys.argv) > 2 and sys.argv[2] in ("test", "final"):
-    with open(Path(sys.argv[3]).resolve().parents[2] / "scripts/lib/package_root.py") as package_root: exec(package_root.read(), {"__file__": package_root.name})
-    from scripts.direct.result_environment import read_policy
-    policy = read_policy()
-    print(" ".join(policy.forwarded_names))
-    print(" ".join(policy.prefixes))
-    print(" ".join(name + "=" + value for name, value in policy.fixed))
-'
 
 # Workspace members with a file that differs from HEAD: staged, unstaged,
 # deleted, or new and not ignored. A phase commits nothing before its
@@ -1397,10 +1365,11 @@ esac
 # Exit 4 refuses the run at its live-run limit; never run that command attached.
 # The detached run sets UNIT_DETACHED_RUN, so it does not detach again.
 DETACHED_RUNS_SCRIPT="${VERIFY_DETACHED_RUNS_SCRIPT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../agents" && pwd)/detached_runs.py}"
+verify_helper --start
 if [[ -z "${UNIT_DETACHED_RUN:-}" && -n "${CODEX_THREAD_ID:-}" ]]; then
     VERIFY_SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
     DETACH_STATUS=0
-    "$PY" "$DETACHED_RUNS_SCRIPT" start --label "verify.sh ${VERIFY_ORIGINAL_ARGS[*]-}" -- \
+    verify_helper "$DETACHED_RUNS_SCRIPT" start --label "verify.sh ${VERIFY_ORIGINAL_ARGS[*]-}" -- \
         bash "$VERIFY_SELF" ${VERIFY_ORIGINAL_ARGS[@]+"${VERIFY_ORIGINAL_ARGS[@]}"} || DETACH_STATUS=$?
     case "$DETACH_STATUS" in
         0) exit 0 ;;
@@ -1411,7 +1380,6 @@ if [[ -z "${UNIT_DETACHED_RUN:-}" && -n "${CODEX_THREAD_ID:-}" ]]; then
 fi
 
 # Set the run identity after detachment so the run owns its queue place.
-verify_helper --start
 if [[ "${OSTYPE:-}" != darwin* && -z "${BUILDLOG_RUN+x}" ]]; then
     BUILDLOG_RUN_START="$(verify_helper "$STEP_RECORD_SCRIPT" start "$$")"
     if [[ -n "$BUILDLOG_RUN_START" ]]; then
@@ -1433,7 +1401,7 @@ if [[ "$CMD" == final && -z "$VERIFY_PACKAGE" && -z "$PINNED_TARGET" && "$MAC_ON
     FINAL_PASS_START="$("$PY" "$FINAL_PASS_SCRIPT" start "${BASH_SOURCE[0]}")"
     trap 'final_status=$?; finish_verify_run "$final_status"; exit "$final_status"' EXIT
 fi
-VERIFY_SETUP="$(VERIFY_PY_HELPER=DEV_FEATURES_PY "$PY" -c "$DEV_FEATURES_PY" "$(git rev-parse --show-toplevel 2>/dev/null || pwd)/Cargo.toml" "$CMD" "$VERIFY_START_DIR/result_environment.py")" || exit 2
+VERIFY_SETUP="$(verify_helper "$VERIFY_START_DIR/dev_features.py" "$(git rev-parse --show-toplevel 2>/dev/null || pwd)/Cargo.toml" "$CMD")" || exit 2
 DEV_FEATURES="${VERIFY_SETUP%%$'\n'*}"
 VERIFY_TEST_ENVIRONMENT=()
 VERIFY_USER_ENVIRONMENT=( ${VERIFY_MAC_ENVIRONMENT[@]+"${VERIFY_MAC_ENVIRONMENT[@]}"} )

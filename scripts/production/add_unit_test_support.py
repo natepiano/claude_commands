@@ -14,6 +14,7 @@ from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.script_envelope import script_prompt
 from scripts.lib.test_names import fixture_names
 from scripts.lib.socket_test_support import short_socket_directory
+from scripts.lib.unit_runs_test_support import bind_private_run_roots
 from scripts.message import sessions as runtime_sessions
 from scripts.message.process_identity import process_start as REAL_PROCESS_START
 
@@ -287,6 +288,7 @@ class AddUnitTestCase(ShutdownTestCase):
 
         _ = self.enterContext(patch.object(herdr.Herdr, "submit_opening_prompt", submitted))
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
+        bind_private_run_roots(self, self.root)
         home_context = cast(object, self.enterContext(
             patch.dict(os.environ, {"HOME": str(self.root / "home")})
         ))

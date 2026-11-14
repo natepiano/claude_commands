@@ -14,6 +14,7 @@ import unittest
 
 from scripts.lib.shell_test_support import shell_functions
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.lib import process_start
 
 
 DIRECT = Path(__file__).resolve().parent
@@ -27,11 +28,15 @@ class VerifyHelperTests(unittest.TestCase):
 
     @override
     def setUp(self) -> None:
-        _ = self.program.write_text('''import json, os, sys
+        _ = self.program.write_text('''import json, os, signal, sys
 from pathlib import Path
 with Path(__file__).with_suffix('.imports').open('a') as target:
     target.write('imported\\n')
 def main():
+    if sys.argv[1:2] == ['trap']:
+        os.kill(int(sys.argv[2]), signal.SIGUSR1)
+        print(os.getpid())
+        return 0
     if sys.argv[1:] == ['pid']:
         print(os.getpid())
         return 0
@@ -109,7 +114,13 @@ if __name__ == "__main__":
         runner = self.root / "runner"
         _ = runner.write_text(f'#!/bin/bash\nif [[ "$1" == "{shell}" ]]; then exec bash "$@"; fi\nexec "{sys.executable}" "$@"\n')
         runner.chmod(0o755)
-        for mode in ("death", "shell", "TERM", "INT", "HUP", "parent-exit"):
+        record = self.root / "detached.json"
+        started = process_start.process_start(os.getpid())
+        self.assertIsInstance(started, process_start.Started)
+        assert isinstance(started, process_start.Started)
+        _ = record.write_text(json.dumps(dict(run_id="helper-test", command=[], status="running",
+                                             command_pid=os.getpid(), command_started=started.start)))
+        for mode in ("death", "shell", "TERM", "INT", "HUP", "parent-exit", "forwarded-empty", "trap", "record-exit"):
             with self.subTest(mode=mode):
                 if mode == "parent-exit" and sys.platform != "linux":
                     continue
@@ -124,6 +135,19 @@ elif [[ "$3" == parent-exit ]]; then
     helper_pid=$(verify_helper "$4" pid)
     sleep "$6" <&"$VERIFY_HELPER_OUTPUT" >&"$VERIFY_HELPER_INPUT" 2>/dev/null &
     printf '%s\\n' "$helper_pid" "$!"
+elif [[ "$3" == forwarded-empty ]]; then
+    exec 3< <(printf '%s\\0' "" VALUE=forwarded "")
+    VERIFY_RESULT_ENVIRONMENT_FD=3 verify_helper "$4" pid
+    verify_helper "$4" pid
+elif [[ "$3" == trap ]]; then
+    program=$4
+    trap 'verify_helper "$program" pid' USR1
+    exec 3< <(printf '\\0')
+    VERIFY_RESULT_ENVIRONMENT_FD=3 verify_helper "$4" trap $$
+elif [[ "$3" == record-exit ]]; then
+    verify_helper "$1/../agents/detached_runs.py" record-exit "$8" 23 --pid "$7"
+    verify_helper "$1/../agents/detached_runs.py" record-exit "$8" 31 --pid "$7"
+    cat "$8"
 elif [[ "$3" == shell ]]; then
     verify_helper "$5" argument
 else
@@ -131,7 +155,8 @@ else
 fi
 '''
                 result = subprocess.run(["bash", "-c", script, "helper-test", str(DIRECT), str(runner),
-                                         mode, str(self.program), str(shell), str(TEST_HANG_GUARD_SECS)], capture_output=True,
+                                         mode, str(self.program), str(shell), str(TEST_HANG_GUARD_SECS),
+                                         str(os.getpid()), str(record)], capture_output=True,
                                         text=True, timeout=TEST_HANG_GUARD_SECS)
                 if mode == "death":
                     self.assertEqual(result.returncode, 0, result.stderr)
@@ -157,6 +182,15 @@ fi
                             os.kill(holder_pid, signal.SIGKILL)
                         except ProcessLookupError:
                             pass
+                elif mode in ("forwarded-empty", "trap"):
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    first, second = map(int, result.stdout.splitlines())
+                    self.assertEqual(first, second, "the second call started another Python process")
+                elif mode == "record-exit":
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    saved = cast(dict[str, object], json.loads(result.stdout))
+                    self.assertEqual(saved["exit_code"], 31)
+                    self.assertEqual(saved["command_pid"], os.getpid())
                 elif mode == "shell":
                     self.assertEqual((result.returncode, result.stdout), (9, "shell:argument\n"))
                 else:

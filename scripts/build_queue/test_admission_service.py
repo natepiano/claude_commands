@@ -1372,8 +1372,8 @@ class PendingPriorityTests(unittest.TestCase):
         worker = staff.StaffRow(staff.StaffId("worker"), "worker", "builder", staff.ReportsTo(director.id),
                                current_session=staff.StaffId("worker-session"))
         snapshot = staff.StaffSnapshot((producer, director, worker))
-        expected = {"director-session": UnitLabels("chosen", "production", "chosen", unit_labels.OwnerRole.UNIT),
-                    "worker-session": UnitLabels("builder", "production", "chosen", unit_labels.OwnerRole.UNIT)}
+        expected = {"director-session": UnitLabels("chosen", "production", "chosen", unit_labels.OwnerRole.UNIT, unit_labels.Runner.UNIT_DIRECTOR),
+                    "worker-session": UnitLabels("builder", "production", "chosen", unit_labels.OwnerRole.UNIT, unit_labels.Runner.WORKER)}
         with mock.patch.object(staff, "snapshot", return_value=snapshot), \
                 mock.patch.object(roster, "unit_labels_for", side_effect=AssertionError("transcript lookup")):
             self.assertEqual(gate.priority_labels(["producer-session", "director-session", "worker-session"]), expected)

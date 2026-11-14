@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from scripts.lib.checkout_test_support import write_python_tool
+from scripts.lib.checkout_test_support import write_python_tool, write_stdlib_tool
 
 from scripts.build_queue.admission_test_support import caller_admission
 from scripts.lib.py_floor_test_support import seed_interpreter_cache
@@ -229,8 +229,8 @@ class VerifyLintScopeFixture(unittest.TestCase):
         self.taplo_events = self.root / "taplo-events.jsonl"
         self.config = self.root / "lint.conf"
         self.write_config(clippy="on")
-        self.write_executable(bin_directory / "cargo", CARGO_STUB)
-        self.write_executable(bin_directory / "taplo", TAPLO_STUB)
+        write_stdlib_tool(bin_directory / "cargo", CARGO_STUB)
+        write_stdlib_tool(bin_directory / "taplo", TAPLO_STUB)
         self.write_shell(bin_directory / "git", GIT_STUB)
         self.write_shell(bin_directory / "rustc", 'printf "rustc fixture\\n"\n')
         targets = self.root / "build-targets.py"

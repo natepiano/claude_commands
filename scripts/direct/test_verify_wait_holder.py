@@ -56,7 +56,7 @@ def recorded_holders(rows: list[dict[str, object]]) -> list[object]:
     return [row["holder"] for row in rows if row["event_type"] in ("wait_started", "wait_holder_seen")]
 
 
-RECORDER_OBSERVER = '''import json, os, sys
+RECORDER_OBSERVER = '''import json, os, runpy, sys
 from pathlib import Path
 arguments = sys.argv[1:]
 if arguments and arguments[0].endswith("progress_history.py"):
@@ -66,6 +66,9 @@ if arguments and arguments[0].endswith("progress_history.py"):
     if arguments[1] == os.environ.get("TEST_FAIL_RECORDER") and not failure.exists():
         failure.touch()
         raise SystemExit(1)
+    sys.argv = arguments
+    runpy.run_path(arguments[0], run_name="__main__")
+    raise SystemExit(0)
 os.execv(os.environ["TEST_REAL_PYTHON"], [os.environ["TEST_REAL_PYTHON"], *arguments])
 '''
 
@@ -474,7 +477,42 @@ phase_wait_start token "cargo token"
                 self.assertEqual(calls.read_text().splitlines(), ["recorder", "recorder"])
 
 
-class VerifyHoldHolderTests(VerifyHoldWaitFixture):
+class RecordedHoldWaitFixture(VerifyHoldWaitFixture):
+    """Copy a real recorded phase before each wait test."""
+
+    recorded_environment: ClassVar[dict[str, str]]
+
+    @classmethod
+    @override
+    def setUpClass(cls) -> None:
+        super().setUpClass()
+        seed = cls()
+        fixture = seed.fixture
+        fixture.root = fixture.fixture_root
+        fixture.environment = fixture.fixture_environment.copy()
+        try:
+            _ = shutil.copytree(fixture.fixture_seed, fixture.root, symlinks=True)
+            isolate_run_sources(fixture.environment, fixture.root)
+            _ = VerifyHoldWaitFixture.record_phase(seed)
+            cls.recorded_environment = {key: value for key, value in fixture.environment.items()
+                                        if fixture.fixture_environment.get(key) != value}
+            shutil.rmtree(fixture.fixture_seed)
+            _ = shutil.copytree(fixture.root, fixture.fixture_seed, symlinks=True)
+        finally:
+            shutil.rmtree(fixture.root)
+
+    @override
+    def setUp(self) -> None:
+        super().setUp()
+        self.fixture.environment.update(self.recorded_environment)
+
+    @override
+    def record_phase(self) -> Path:
+        """Use the private phase that the class seed already records."""
+        return self.fixture.root / "history/runs/unit-run.jsonl"
+
+
+class VerifyHoldHolderTests(RecordedHoldWaitFixture):
     def start_hold_step(self) -> subprocess.Popen[str]:
         """Call the real hold wrapper before the real cargo launcher."""
         script = self.fixture.root / "held-step.sh"
@@ -560,33 +598,7 @@ except SystemExit as result:
 '''
 
 
-class VerifyTargetWaitHolderTests(VerifyHoldWaitFixture):
-    recorded_environment: ClassVar[dict[str, str]]
-
-    @classmethod
-    @override
-    def setUpClass(cls) -> None:
-        super().setUpClass()
-        seed = cls()
-        fixture = seed.fixture
-        fixture.root = fixture.fixture_root
-        fixture.environment = fixture.fixture_environment.copy()
-        _ = shutil.copytree(fixture.fixture_seed, fixture.root, symlinks=True)
-        try:
-            isolate_run_sources(fixture.environment, fixture.root)
-            _ = seed.record_phase()
-            cls.recorded_environment = {key: value for key, value in fixture.environment.items()
-                                        if fixture.fixture_environment.get(key) != value}
-            shutil.rmtree(fixture.fixture_seed)
-            _ = shutil.copytree(fixture.root, fixture.fixture_seed, symlinks=True)
-        finally:
-            shutil.rmtree(fixture.root)
-
-    @override
-    def setUp(self) -> None:
-        super().setUp()
-        self.fixture.environment.update(self.recorded_environment)
-
+class VerifyTargetWaitHolderTests(RecordedHoldWaitFixture):
     def prepare_target_wait(self) -> Path:
         root = self.fixture.root
         claims = Path(self.fixture.environment["MAC_TEST_STATE_DIR"]) / "claims"
@@ -816,7 +828,7 @@ if "--assignment-file" in arguments:''', 1)
         self.assertEqual(len(self.fixture.local_runs()), 1)
 
 
-class VerifyMemoryRouteHolderTests(VerifyHoldWaitFixture):
+class VerifyMemoryRouteHolderTests(RecordedHoldWaitFixture):
     def prepare_memory_route(self) -> Path:
         isolate_run_sources(self.fixture.environment, self.fixture.root)
         _ = self.record_phase()

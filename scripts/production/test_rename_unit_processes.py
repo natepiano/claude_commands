@@ -26,6 +26,7 @@ from scripts.production.staff_test_support import (
 )
 from scripts.lib.conf import UseConfiguredValue
 from scripts.lib import conf, unit_runs
+from scripts.lib.unit_runs_test_support import bind_private_run_roots
 from scripts.lint.memory_test_support import config_environment
 from scripts.agents.unit_staff_test_support import PARENTS, isolated_parents
 
@@ -159,6 +160,11 @@ class RunProcessTests(StaffTestCase):
 
 
 class RunRecordLookupTests(StaffTestCase):
+    @override
+    def setUp(self) -> None:
+        super().setUp()
+        bind_private_run_roots(self, self.root)
+
     def test_move_lookups_build_once_and_keep_exact_worktree_spelling(self) -> None:
         root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         runs = root / "history/runs"

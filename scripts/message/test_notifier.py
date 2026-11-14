@@ -25,6 +25,8 @@ from scripts.direct.wait_for_test_state import wait_until
 from scripts.lib.socket_test_support import short_socket_directory
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lib.checkout_test_support import copy_runtime
+from scripts.lib import user_zone
+from scripts.production.cli_fixture import invoke_cli, process_boundary, process_boundary_for_case
 
 
 SCRIPT = Path(__file__).with_name("notifier.sh")
@@ -68,28 +70,17 @@ class NotifierTests(unittest.TestCase):
         launcher_dir = self.root / "launcher-bin"
         launcher_dir.mkdir()
         launcher = launcher_dir / "systemd-run"
-        monitor = """import os
-import subprocess
-import sys
-from pathlib import Path
-code = 127
-try:
-    code = subprocess.run(sys.argv[2:], check=False).returncode
-finally:
-    Path(sys.argv[1], 'run-exit-' + str(os.getpid())).write_text(str(code))
-"""
+        # The caller installs the inherited ownership marker before launch.
+        # set -m starts the monitor shell in its own process group on Linux and macOS; $! is its pid and group.
         _ = launcher.write_text(
             "\n".join((
-                "#!/usr/bin/env python3",
-                "import subprocess, os",
-                "from pathlib import Path",
-                "import sys",
-                "# The caller installs the inherited ownership marker before launch.",
-                f"monitor = {monitor!r}",
-                f"child = subprocess.Popen([sys.executable, '-c', monitor, {str(self.root)!r}, *sys.argv[sys.argv.index('--') + 1:]], "
-                + "stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, "
-                + "stderr=subprocess.DEVNULL, start_new_session=True)",
-                f"with Path({str(self.launch_pids)!r}).open('a') as marker: marker.write(str(child.pid) + '\\n')",
+                "#!/bin/sh",
+                "set -m",
+                'while [ "$1" != -- ]; do shift; done',
+                "shift",
+                """/bin/sh -c '"$@"; code=$?; printf %s "$code" > "$0/run-exit-$$"' """
+                + f'{shlex.quote(str(self.root))} "$@" </dev/null >/dev/null 2>&1 &',
+                f'printf "%s\\n" "$!" >> {shlex.quote(str(self.launch_pids))}',
             )) + "\n"
         )
         launcher.chmod(0o755)
@@ -151,14 +142,13 @@ finally:
         pending.mkdir()
         launched = self.root / "drain.argv"
         launcher = self.launcher_dir / "systemd-run"
-        _ = launcher.write_text("#!/usr/bin/env python3\nimport json,sys\nfrom pathlib import Path\n"
-            + f"Path({str(launched)!r}).write_text(json.dumps(sys.argv[1:]))\n")
+        _ = launcher.write_text(f'#!/bin/sh\nprintf "%s\\n" "$@" > {shlex.quote(str(launched))}\n')
         config = self.root / "selected.conf"
         with mock.patch.dict(os.environ, {"NOTIFIER_REPEAT_STATE": str(pending),
                                          "SEND_REPEAT_CONFIG": str(config), "XDG_STATE_HOME": str(self.root / "xdg")}):
             _ = self.successful("tick")
             _ = self.successful("tick")
-        arguments = cast(list[str], json.loads(launched.read_text()))
+        arguments = launched.read_text().splitlines()
         self.assertIn("--no-block", arguments)
         self.assertIn("SEND_REPEAT_STATE=" + str(pending), arguments)
         self.assertIn("SEND_REPEAT_CONFIG=" + str(config), arguments)
@@ -179,18 +169,32 @@ finally:
     def run_cli(self, *args: str, now: int = NOW, send_rc: int = 0) -> subprocess.CompletedProcess[str]:
         owned = OwnedTestProcesses()
         command = ["zsh", str(SCRIPT), *args]
+        environment = self.owned.environment({
+            **os.environ,
+            "NOTIFIER_STATE_DIR": str(self.state_dir),
+            "NOTIFIER_SESSIONS_DIR": str(self.sessions_dir),
+            "NOTIFIER_SEND": str(self.fake_send),
+            "NOTIFIER_NOW_EPOCH": str(now),
+            "FAKE_SEND_ARGS": str(self.send_args),
+            "FAKE_SEND_RC": str(send_rc),
+            "PATH": f"{self.launcher_dir}{os.pathsep}{os.environ['PATH']}",
+        })
+        if not process_boundary_for_case(self) and "SHOWN_ZONE" not in environment:
+            config = environment.get("USER_ZONE_CONF") or str(
+                Path(user_zone.__file__).resolve().parents[2] / "config/user_zone.conf")
+            if not Path(config).is_absolute():
+                config = str(Path.cwd() / config)
+            try:
+                with mock.patch.object(user_zone, "CONF", config):
+                    zone = invoke_cli(user_zone, user_zone.main, [], environment, self.root)
+            except Exception:
+                # The shell ignores helper failures and uses the machine zone.
+                environment["SHOWN_ZONE"] = ""
+            else:
+                environment["SHOWN_ZONE"] = zone.stdout.rstrip("\n") if zone.returncode == 0 else ""
         child = subprocess.Popen(
             command,
-            env=self.owned.environment({
-                **os.environ,
-                "NOTIFIER_STATE_DIR": str(self.state_dir),
-                "NOTIFIER_SESSIONS_DIR": str(self.sessions_dir),
-                "NOTIFIER_SEND": str(self.fake_send),
-                "NOTIFIER_NOW_EPOCH": str(now),
-                "FAKE_SEND_ARGS": str(self.send_args),
-                "FAKE_SEND_RC": str(send_rc),
-                "PATH": f"{self.launcher_dir}{os.pathsep}{os.environ['PATH']}",
-            }),
+            env=environment,
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=True,
         )
         owned.track(child, group=True)
@@ -334,6 +338,7 @@ finally:
         _ = self.successful("tick", now=MINUTE + 180)
         self.assertEqual(len(self.lines()), 1)
 
+    @process_boundary
     def test_aligned_schedule_lands_on_the_clock(self) -> None:
         def at(zone: str, hour: int, minute: int) -> int:
             return int(datetime(2026, 10, 5, hour, minute, 30, tzinfo=ZoneInfo(zone)).timestamp())
@@ -389,6 +394,7 @@ finally:
         _ = self.successful("tick", now=NOW + 600)
         self.assertEqual(self.state()["PAUSED"], "1")
 
+    @process_boundary
     def test_due_tick_send_arguments_and_log_format(self) -> None:
         _ = self.new("--from", "sender", "--timeout", "7")
         _ = self.successful("tick", now=MINUTE + 120)
@@ -722,46 +728,35 @@ finally:
         """Install a fake launchctl that, like macOS 27, starts a submitted job only on kickstart."""
         launcher = self.launcher_dir / "launchctl"
         _ = launcher.write_text(
-            """#!/usr/bin/env python3
-import json
-import os
-from pathlib import Path
-import subprocess
-import sys
-import time
-
-state = Path(os.environ["FAKE_LAUNCHCTL_STATE"])
-action = sys.argv[1]
-if action == "submit":
-    label = sys.argv[sys.argv.index("-l") + 1]
-    (state / "submitted").write_text(label)
-    (state / f"{label}.command").write_text(json.dumps(sys.argv[sys.argv.index("--") + 1:]))
-elif action == "kickstart":
-    target = sys.argv[2]
-    (state / "kickstarted").write_text(target)
-    kickstart_rc = int(os.environ["FAKE_LAUNCHCTL_KICKSTART_RC"])
-    if kickstart_rc:
-        sys.exit(kickstart_rc)
-    label = target.split("/", 2)[2]
-    command = json.loads((state / f"{label}.command").read_text())
-    job = subprocess.Popen(
-        [sys.executable, __file__, "loop", label, *command],
-        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL, start_new_session=True,
-    )
-    (state / "pid.tmp").write_text(str(job.pid))
-    os.replace(state / "pid.tmp", state / "pid")
-elif action == "loop":
-    label = sys.argv[2]
-    removed = state / f"{label}.removed"
-    while not removed.exists():
-        subprocess.run(sys.argv[3:], check=False)
-        time.sleep(0.05)
-elif action == "remove":
-    label = sys.argv[2]
-    fire_log = Path(os.environ["FAKE_LAUNCHCTL_FIRE"])
-    result = "after-fire" if fire_log.exists() and "run exit 7" in fire_log.read_text() else "before-fire"
-    (state / f"{label}.removed").write_text(result)
+            """#!/usr/bin/env -S zsh -f
+zmodload -F zsh/files b:zf_mv
+zmodload zsh/zselect
+state=$FAKE_LAUNCHCTL_STATE
+case $1 in
+  submit)
+    label=${@[${@[(i)-l]}+1]}
+    print -rn -- $label > $state/submitted
+    print -r -- ${(qq)@[${@[(i)--]}+1,-1]} > $state/$label.command ;;
+  kickstart)
+    print -rn -- $2 > $state/kickstarted
+    (( FAKE_LAUNCHCTL_KICKSTART_RC )) && exit $FAKE_LAUNCHCTL_KICKSTART_RC
+    label=${2#*/*/}
+    command=(${(Q)${(z)"$(<$state/$label.command)"}})
+    # zsh cannot start a job group without a terminal; /bin/sh set -m can on Linux and macOS.
+    /bin/sh -c 'set -m; "$@" </dev/null >/dev/null 2>&1 & echo $!' sh $0 loop $label $command > $state/pid.tmp
+    zf_mv $state/pid.tmp $state/pid ;;
+  loop)
+    label=$2
+    shift 2
+    while [[ ! -e $state/$label.removed ]]; do
+      "$@"
+      zselect -t 5
+    done ;;
+  remove)
+    result=before-fire
+    [[ -e $FAKE_LAUNCHCTL_FIRE && "$(<$FAKE_LAUNCHCTL_FIRE)" == *"run exit 7"* ]] && result=after-fire
+    print -rn -- $result > $state/$2.removed ;;
+esac
 """
         )
         launcher.chmod(0o755)

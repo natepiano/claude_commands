@@ -24,7 +24,7 @@ from unittest import mock
 from zoneinfo import ZoneInfo
 
 
-from scripts.aws_target import admin_secrets, aws_target, box, config as aws_config, deploy, gate_box, gate_trial, gpu_size_trial, ledger, remote
+from scripts.aws_target import admin_secrets, aws_cli, aws_target, box, config as aws_config, deploy, gate_box, gate_trial, gpu_size_trial, ledger, remote
 from scripts.aws_target.ledger_test_support import CostFixture, account_reply, text_setting
 from scripts.aws_target.measurement_test_support import DAY, narrow
 from scripts.aws_target.test_box import SYSTEM, FakeTailnet, write_aws_claim
@@ -526,7 +526,7 @@ class DeploymentTests(CostFixture):
         self.set_clock(self.now)
         if self._testMethodName not in self.process_tests:
             process = SimpleNamespace(**{**cast(Mapping[str, object], vars(subprocess)), 'run': FixtureExecutor(self.root).run})
-            _ = self.enterContext(mock.patch.object(aws_target, 'subprocess', process))
+            _ = self.enterContext(mock.patch.object(aws_cli, 'subprocess', process))
 
     # These tests retain child processes for environment, timeout, exit, and redaction checks.
     process_tests: ClassVar[frozenset[str]] = frozenset({

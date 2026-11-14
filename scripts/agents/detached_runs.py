@@ -863,7 +863,7 @@ def command_supervise(args: argparse.Namespace) -> int:
 def command_record_exit(args: argparse.Namespace) -> int:
     """Save the command status before its orphan record is completed."""
     path = Path(str(getattr(args, "record", "")))
-    caller = os.getppid()
+    caller = int(getattr(args, "pid", 0)) or os.getppid()
     with record_lock(path):
         record = _read_record(path)
         if record["status"] != "running" or record.get("command_pid") != caller:
@@ -897,6 +897,7 @@ def main(argv: list[str] | None = None) -> int:
     _ = supervise.add_argument("record")
     supervise.set_defaults(handler=command_supervise)
     record_exit = verbs.add_parser("record-exit", help="save a command status without completing its run")
+    _ = record_exit.add_argument("--pid", type=int, default=0)
     _ = record_exit.add_argument("record")
     _ = record_exit.add_argument("exit_code", type=int, choices=range(256))
     record_exit.set_defaults(handler=command_record_exit)

@@ -28,8 +28,9 @@ from typing import cast, final
 from uuid import uuid4
 
 
-from scripts.aws_target import admin_secrets, box, ledger, remote, teardown
+from scripts.aws_target import admin_secrets, box, hana_box, hana_spend, ledger, remote, teardown
 from scripts.aws_target.aws_target import AwsCli, AwsExecutor, AwsUnavailable, control_lock, execute_command, fetch_spot_prices, spot_quota, largest_gate_vcpus as largest_gate_vcpus
+from scripts.aws_target.hana_provider import AwsHanaProvider
 from scripts.aws_target.config import BudgetNotificationAddress, DeploymentSettings, money, read_budget_notification_address, deployment_record, gate_deployment, gate_regions, read_deployment_settings, read_settings
 from scripts.aws_target.terminal_table import aligned_table
 from scripts.lib import conf, user_zone
@@ -38,6 +39,7 @@ from scripts.build_targets import target_config
 from scripts.lib.atomic_file import write_bytes_atomic, write_text_atomic
 
 TEMPLATE = Path(__file__).resolve().parents[2] / 'docs/plans/builds-aws/cloudformation.json'
+HANA_TEMPLATE = TEMPLATE.with_name('hana-cloudformation.json')
 CLOSED_QUOTA_REQUEST_STATUSES = frozenset(('APPROVED', 'DENIED', 'CASE_CLOSED', 'NOT_APPROVED', 'INVALID_REQUEST'))
 
 
@@ -429,6 +431,152 @@ class Deployment:
         _ = self._guard()
         self._confirm_preparation(settings, parameters)
 
+    def prepare_hana(self) -> PreparedDeployment:
+        """Save local preparation without accessing AWS or changing placement."""
+        admin_secrets.refuse_plain_admin(self.settings_path)
+        with control_lock(self.directory):
+            settings, parameters, template = self._hana_inputs()
+            decision = self._guard()
+            prepared = self._hana_output()._write_preparation(settings, parameters, template, decision)
+            path = self.directory / 'hana' / 'setup.json'
+            if not path.exists():
+                write_text_atomic(path, json.dumps({'version': 1, 'deployment': parameters['DeploymentId'],
+                    'stack': settings.stack_name, 'region': settings.region}, sort_keys=True) + '\n')
+            return prepared
+
+    def hana_setup(self, *, approve_resources: bool = False) -> bool:
+        """Deploy one retained Spot box and confirm its stopped state before registration."""
+        workload = conf.read_or_repository('hana_aws')
+        limits = hana_spend.read_settings(workload)
+        print(f'Hana plan: separate stack; {limits.instance_type}; persistent Spot; interruption stop')
+        print(f'Hana plan: root {limits.root_gib} GiB; data {limits.data_gib} GiB; compute ceiling ${limits.spot_max_usd_per_hour}/hour')
+        print('Hana resources: instance, retained data disk, launch template, security group, private control bucket, scaler policy')
+        print('Hana placement remains disabled')
+        if not approve_resources:
+            return False
+        self._authorize(True)
+        child = self._hana_output()
+        with control_lock(self.directory):
+            settings, parameters, template = self._hana_inputs()
+            now = int(self.clock())
+            child.confirm_preparation_evidence(settings, parameters, template)
+            _ = self._guard()
+            api = self._api(settings)
+            with step('hana-setup', 'checking the image and subnet', self.settings_path):
+                self._validate_inputs(settings, parameters)
+            path = self.directory / 'hana' / 'setup.json'
+            saved = remote.read_record(path)
+            book = ledger.CostLedger(self.directory)
+            spending = hana_spend.HanaSpending(book, self.settings_path, limits)
+            if 'generation' not in saved:
+                # Explicit setup approval reserves resources without enabling command admission.
+                reservation = spending.reserve_setup(now, now + limits.permit_max_seconds)
+                if isinstance(reservation, hana_spend.PermitRefused):
+                    raise DeploymentRefused(reservation.reason)
+                saved['generation'] = reservation.exposure.generation
+                saved['template_sha256'] = sha256(template).hexdigest()
+                saved['parameters_sha256'] = sha256(json.dumps(parameters, sort_keys=True).encode()).hexdigest()
+                write_text_atomic(path, json.dumps(saved, sort_keys=True) + '\n')
+            elif (saved.get('template_sha256') != sha256(template).hexdigest()
+                    or saved.get('parameters_sha256') != sha256(json.dumps(parameters, sort_keys=True).encode()).hexdigest()):
+                raise DeploymentRefused('The approved Hana template changed; review the saved deployment')
+            # Resume existing resources through reads before another stack mutation.
+            outputs = child._stack(settings) if 'generation' in saved and saved.get('requested') else {}
+            if not outputs:
+                active = [row for row in book.read_snapshot().hana_compute
+                    if row.generation == saved['generation'] and isinstance(row.state, ledger.HanaExposureOpen)]
+                if not active or int(self.clock()) >= active[0].expires:
+                    raise DeploymentRefused('The Hana setup reservation expired; reconcile the separate stack before retry')
+                saved['requested'] = True
+                write_text_atomic(path, json.dumps(saved, sort_keys=True) + '\n')
+                # CloudFormation deploy uses its existing stack waiter and private admin executor.
+                with step('hana-setup', 'updating the separate Hana stack', self.settings_path):
+                    _ = api.call('deploy', '--stack-name', settings.stack_name,
+                        '--template-file', str(child.output / 'template.json'), '--capabilities', 'CAPABILITY_NAMED_IAM',
+                        '--no-fail-on-empty-changeset', '--parameter-overrides',
+                        *[f'{key}={value}' for key, value in parameters.items()], service='cloudformation',
+                        timeout_s=conf.read(self.settings_path).whole('stack_wait_timeout_s'))
+                outputs = child._stack(settings)
+            instance, bucket = outputs['Instance'], outputs['ControlBucket']
+            if saved.get('instance', instance) != instance or saved.get('data_volume', outputs['DataVolume']) != outputs['DataVolume']:
+                raise DeploymentRefused('Hana resource identities changed; review replacement before setup')
+            observed = api.observe(instance, int(self.clock()))
+            reply = api.call('describe-instances', '--instance-ids', instance)
+            instances = [row for group in ledger.rows(reply, 'Reservations') for row in ledger.rows(group, 'Instances')]
+            if len(instances) != 1 or instances[0].get('InstanceId') != instance:
+                raise DeploymentRefused('Hana instance confirmation differs')
+            request = ledger.text(instances[0], 'SpotInstanceRequestId')
+            requests = ledger.rows(api.call('describe-spot-instance-requests', '--spot-instance-request-ids', request), 'SpotInstanceRequests')
+            if (len(requests) != 1 or requests[0].get('InstanceId') != instance
+                    or requests[0].get('Type') != 'persistent'
+                    or requests[0].get('InstanceInterruptionBehavior') != 'stop'):
+                raise DeploymentRefused('Hana requires a persistent Spot request with stop behavior')
+            saved.update(instance=instance, spot_request=request, bucket=bucket, data_volume=outputs['DataVolume'])
+            write_text_atomic(path, json.dumps(saved, sort_keys=True) + '\n')
+            with step('hana-setup', 'confirming the idle stop', self.settings_path):
+                if observed.state not in ('stopped', 'stopping'):
+                    _ = api.call('stop-instances', '--instance-ids', instance)
+                _ = api.call('wait', 'instance-stopped', '--instance-ids', instance)
+                confirmed = api.observe(instance, int(self.clock()))
+                if confirmed.state != 'stopped':
+                    raise DeploymentRefused('Hana stop confirmation is incomplete; repeat approved setup')
+                spending.reconcile(int(self.clock()), 'stopped', generation=ledger.instant(saved, 'generation'))
+        provider = AwsHanaProvider.from_settings(self.settings_path, self.directory, conf.path('hana_aws'))
+        hana_box.HanaController(self.directory, self.settings_path, conf.path('hana_aws'), provider,
+            clock=self.clock).register(hana_box.DeploymentIdentity(parameters['DeploymentId'], instance, request, settings.region))
+        print('Hana setup complete: the box is stopped; placement remains disabled')
+        return True
+
+    def _hana_inputs(self) -> tuple[DeploymentSettings, dict[str, str], bytes]:
+        """Share the existing deployment validation and use only Hana sizes and prices."""
+        workload = conf.read_or_repository('hana_aws')
+        limits = hana_spend.read_settings(workload)
+        names = {key: workload.text(key) for key in ('stack_name', 'availability_zone', 'ami_id', 'ami_owner_id', 'vpc_id', 'subnet_id')}
+        if not all(names.values()):
+            raise DeploymentRefused('Configure the reviewed Hana image, owner, VPC, and subnet before prepare')
+        settings = replace(read_deployment_settings(self.settings_path, self.directory), **names,
+            region=limits.region, instance_type=limits.instance_type, root_volume_gib=limits.root_gib,
+            data_volume_gib=limits.data_gib, spot_max_usd_per_hour=limits.spot_max_usd_per_hour,
+            existing_data_volume_id='', timeout_s=workload.whole('aws_timeout_s'))
+        if settings.stack_name == conf.read(self.settings_path).text('stack_name'):
+            raise DeploymentRefused('The Hana stack must differ from the gate stack')
+        if not settings.availability_zone.startswith(settings.region):
+            raise DeploymentRefused('The Hana zone must belong to its region')
+        identity_path = self.directory / 'hana' / 'setup.json'
+        saved = remote.read_record(identity_path) if identity_path.exists() else {}
+        identity = ledger.text(saved, 'deployment') if saved else uuid4().hex
+        if saved and saved.get('stack') != settings.stack_name:
+            raise DeploymentRefused('The saved Hana stack differs; review replacement before setup')
+        parameters = {
+            'DeploymentId': identity, 'Image': settings.ami_id, 'InstanceType': limits.instance_type,
+            'AvailabilityZone': settings.availability_zone, 'VpcId': settings.vpc_id, 'SubnetId': settings.subnet_id,
+            'RootDevice': settings.root_device_name, 'RootGiB': str(limits.root_gib), 'DataGiB': str(limits.data_gib),
+            'SpotMaxPrice': str(limits.spot_max_usd_per_hour), 'ScalerUser': settings.scaler_user_name,
+        }
+        return settings, parameters, HANA_TEMPLATE.read_bytes()
+
+    def _hana_output(self) -> Deployment:
+        """Use separate preparation files with the existing deployment helper."""
+        child = Deployment(self.settings_path, self.directory, self.output / 'hana',
+            execute=self.execute, clock=self.clock, pause=self.pause, notify=self.notify)
+        child.admin = self.admin
+        return child
+
+    def _write_preparation(self, settings: DeploymentSettings, parameters: dict[str, str], template: bytes,
+                           decision: ledger.SpendingAllowed, resources: tuple[ledger.PricedResource, ...] = ()) -> PreparedDeployment:
+        prepared = PreparedDeployment(int(self.clock()), fingerprint(settings, parameters, template), parameters)
+        self.output.mkdir(parents=True, exist_ok=True)
+        write_text_atomic(self.output / 'template.json', template.decode())
+        write_text_atomic(self.output / 'parameters.json', json.dumps([
+            {'ParameterKey': key, 'ParameterValue': value} for key, value in parameters.items()
+        ], sort_keys=True) + '\n')
+        write_text_atomic(self.output / 'preflight.json', json.dumps({
+            'at': prepared.at, 'fingerprint': prepared.fingerprint,
+            'decision': ledger.decision_record(decision),
+            'inventory': [{'name': resource.name, 'usd_per_month': str(resource.usd_per_month)} for resource in resources],
+        }, sort_keys=True) + '\n')
+        return prepared
+
     def prepare(self) -> PreparedDeployment:
         admin_secrets.refuse_plain_admin(self.settings_path)
         with control_lock(self.directory):
@@ -443,18 +591,7 @@ class Deployment:
                 book.record_inventory(ledger.ResourceInventory(now, resources, 'Budget foundation', builder_removed=True))
             decision = self._guard()
             template = TEMPLATE.read_bytes()
-            prepared = PreparedDeployment(now, fingerprint(settings, parameters, template), parameters)
-            self.output.mkdir(parents=True, exist_ok=True)
-            write_text_atomic(self.output / 'template.json', template.decode())
-            write_text_atomic(self.output / 'parameters.json', json.dumps([
-                {'ParameterKey': key, 'ParameterValue': value} for key, value in parameters.items()
-            ], sort_keys=True) + '\n')
-            write_text_atomic(self.output / 'preflight.json', json.dumps({
-                'at': prepared.at, 'fingerprint': prepared.fingerprint,
-                'decision': ledger.decision_record(decision),
-                'inventory': [{'name': resource.name, 'usd_per_month': str(resource.usd_per_month)} for resource in resources],
-            }, sort_keys=True) + '\n')
-            return prepared
+            return self._write_preparation(settings, parameters, template, decision, resources)
 
     def _stack(self, settings: DeploymentSettings) -> dict[str, str]:
         try:
@@ -711,11 +848,16 @@ class Deployment:
         current = read_deployment_settings(self.settings_path, self.directory)
         notification = BudgetNotificationAddress(parameters['NotificationEmail'])
         current_parameters = self._parameters(current, notification)
+        self.confirm_preparation_evidence(settings, parameters, TEMPLATE.read_bytes(), renew=renew,
+            current_fingerprint=fingerprint(current, current_parameters, TEMPLATE.read_bytes()))
+
+    def confirm_preparation_evidence(self, settings: DeploymentSettings, parameters: dict[str, str], template: bytes,
+                                    *, renew: bool = False, current_fingerprint: str = '') -> None:
+        """Verify saved preparation before either workload can create resources."""
         preflight = remote.read_record(self.output / 'preflight.json')
         at = ledger.instant(preflight, 'at')
-        template = TEMPLATE.read_bytes()
-        expected = fingerprint(current, current_parameters, template)
-        if ((not renew and not 0 <= int(self.clock()) - at <= current.preflight_max_age_s)
+        expected = current_fingerprint or fingerprint(settings, parameters, template)
+        if ((not renew and not 0 <= int(self.clock()) - at <= settings.preflight_max_age_s)
                 or preflight.get('fingerprint') != expected
                 or fingerprint(settings, parameters, template) != expected
                 or (self.output / 'template.json').read_bytes() != template):
@@ -1379,10 +1521,10 @@ def main() -> int:
         with step('gate-trial', 'running the trial', settings_path):
             return gate_trial.main(sys.argv[2:], settings_path, target_config.ssh_target_state_directory('aws'))
     parser = argparse.ArgumentParser(description=__doc__)
-    _ = parser.add_argument('command', choices=('gpu-size-trial', 'secrets', 'up', 'down', 'remove-builder', 'remove-images', 'prices', 'spot-table', 'quota-request', 'quota-status', 'prepare', 'apply'))
+    _ = parser.add_argument('command', choices=('gpu-size-trial', 'secrets', 'up', 'down', 'remove-builder', 'remove-images', 'prices', 'spot-table', 'quota-request', 'quota-status', 'prepare', 'hana-setup', 'apply'))
     _ = parser.add_argument('trial_action', nargs='?', choices=('run',))
     _ = parser.add_argument('--trial-folder', type=Path)
-    _ = parser.add_argument('--workload', choices=('merge-gates',), default='merge-gates')
+    _ = parser.add_argument('--workload', choices=('merge-gates', 'hana'), default='merge-gates')
     _ = parser.add_argument('--settings', type=Path)
     _ = parser.add_argument('--directory', type=Path)
     _ = parser.add_argument('--output', type=Path)
@@ -1414,8 +1556,10 @@ def main() -> int:
             return 0 if deploy.quota_request() else 1
         elif args.command == 'quota-status':
             return 0 if deploy.quota_status() else 1
+        elif args.command == 'hana-setup':
+            return 0 if deploy.hana_setup(approve_resources=args.approve_resources) else 1
         elif args.command == 'prepare':
-            prepared = deploy.prepare()
+            prepared = deploy.prepare_hana() if args.workload == 'hana' else deploy.prepare()
             print(json.dumps({'at': prepared.at, 'fingerprint': prepared.fingerprint, 'output': str(args.output)}))
         else:
             print(json.dumps(deploy.apply(approve_resources=args.approve_resources), sort_keys=True))

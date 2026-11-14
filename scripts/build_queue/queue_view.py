@@ -27,7 +27,7 @@ from scripts.build_queue.queue_lines import Line, Span, age, clip, cut_tail, pla
 from scripts.lib.terminal_cells import pad_left, pad_right, terminal_width
 from scripts.lib import cargo_target_config, conf
 from scripts.lib.atomic_file import write_text_atomic
-from scripts.lib.build_steps import StepNames, read_step_names
+from scripts.lib.build_steps import RECORDED_STEP_NAMES, StepNames, read_step_names
 from scripts.build_queue import admission_records
 from scripts.lint import memory_admit as gate
 from scripts.message.unit_labels import UnitLabels
@@ -74,6 +74,9 @@ class MacBuildOrigin(Enum):
     UNKNOWN = "unknown"
 
 
+UNRECORDED_OWNER = UnitLabels("")
+
+
 @dataclass(frozen=True)
 class MacBuild:
     pid: int
@@ -88,6 +91,8 @@ class MacBuild:
     recorded_unit: str = ""
     session: str = ""
     origin: MacBuildOrigin = MacBuildOrigin.UNKNOWN
+    ci_runner: str = ""
+    ci_job: str = ""
 
 
 @dataclass(frozen=True)
@@ -112,7 +117,8 @@ def mac_command_jobs(command: str) -> int | MacJobsUnavailable:
     return int(match[1]) if match and int(match[1]) > 0 else MacJobsUnavailable()
 
 
-def mac_step_name(build: MacBuild) -> str:
+def mac_step_name(build: MacBuild, *, names: StepNames = RECORDED_STEP_NAMES,
+                  identity: UnitLabels = UNRECORDED_OWNER) -> str:
     try:
         words = shlex.split(build.command)
     except ValueError:
@@ -145,7 +151,9 @@ def mac_step_name(build: MacBuild) -> str:
         if word.startswith("-p") and len(word) > 2:
             package = word[2:]
             break
-    return " ".join(part for part in (package or build.repository, step) if part)
+    current_name = " ".join(part for part in (package or build.repository, step) if part)
+    return names.for_owner(step, identity.unit if identity.unit != "—" else "", identity.role,
+                           ci=build.origin is MacBuildOrigin.CI, current_name=current_name)
 
 
 def mac_build_record(build: MacBuild) -> dict[str, object]:
@@ -156,7 +164,8 @@ def mac_build_record(build: MacBuild) -> dict[str, object]:
             "resident_bytes": build.resident_bytes if isinstance(build.resident_bytes, int) else -1,
             "counter": {"phase": build.counter.phase, "done": build.counter.done, "total": build.counter.total}
                 if isinstance(build.counter, progress_profile.ProgressCounter) else {},
-            "recorded_unit": build.recorded_unit, "session": build.session, "origin": build.origin.value}
+            "recorded_unit": build.recorded_unit, "session": build.session, "origin": build.origin.value,
+            "ci_runner": build.ci_runner, "ci_job": build.ci_job}
 
 
 def mac_build_from_record(row: dict[str, object]) -> MacBuild:
@@ -173,7 +182,8 @@ def mac_build_from_record(row: dict[str, object]) -> MacBuild:
                     command, str(row["repository"]), stage,
                     resident if resident >= 0 else MacMemoryUnavailable(), mac_command_jobs(command), counter,
                     str(row["recorded_unit"]), str(row["session"]),
-                    MacBuildOrigin(str(row.get("origin", MacBuildOrigin.UNKNOWN.value))))
+                    MacBuildOrigin(str(row.get("origin", MacBuildOrigin.UNKNOWN.value))),
+                    str(row.get("ci_runner", "")), str(row.get("ci_job", "")))
 
 
 def read_mac_builds() -> MacBuildReading:
@@ -348,7 +358,7 @@ def repository_name(folder):
 
 
 def process_environment(pid):
-    """Read only Cargo path settings from the Mac process environment."""
+    """Read only Cargo paths and CI labels from the Mac environment."""
     if sys.platform != "darwin":
         return {}
     try:
@@ -370,7 +380,7 @@ def process_environment(pid):
 
 
 def cargo_environment(data):
-    """Discard all environment fields except Cargo path settings."""
+    """Keep only Cargo paths and CI labels from the environment."""
     if len(data) < 4:
         return {}
     argc = struct.unpack_from("i", data)[0]
@@ -388,7 +398,8 @@ def cargo_environment(data):
         if not field:
             break
         key, separator, value = field.partition(b"=")
-        if separator and key in (b"CARGO_TARGET_DIR", b"CARGO_BUILD_TARGET_DIR", b"CARGO_HOME", b"HOME"):
+        if separator and key in (b"CARGO_TARGET_DIR", b"CARGO_BUILD_TARGET_DIR", b"CARGO_HOME", b"HOME",
+                                 b"RUNNER_NAME", b"GITHUB_JOB"):
             selected[os.fsdecode(key)] = os.fsdecode(value)
     return selected
 
@@ -512,6 +523,7 @@ def read_builds():
             origin = build_origin(pid, processes)
         except Exception:
             origin = "unknown"
+        ci_environment = process_environment(pid) if origin == "ci" else {}
         try:
             folder = str(Path(folder).resolve())
         except OSError:
@@ -524,7 +536,8 @@ def read_builds():
                            resident_bytes=sum(processes[member]["resident_bytes"] for member in members),
                            progress_tail=tail, repository=repository,
                            recorded_unit=record["recorded_unit"], session=record["session"],
-                           origin=origin))
+                           origin=origin, ci_runner=ci_environment.get("RUNNER_NAME", ""),
+                           ci_job=ci_environment.get("GITHUB_JOB", "")))
     return sorted(builds, key=lambda build: (build["started_at"], build["pid"]))
 
 

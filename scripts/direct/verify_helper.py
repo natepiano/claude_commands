@@ -2,7 +2,6 @@
 """Run synchronous verify helpers in one process."""
 from __future__ import annotations
 
-import ast
 import ctypes
 from contextlib import ExitStack
 from dataclasses import dataclass
@@ -11,6 +10,7 @@ import importlib.util
 import inspect
 import os
 from pathlib import Path
+import re
 import select
 import signal
 import stat
@@ -23,6 +23,8 @@ from typing import BinaryIO, Callable, cast
 
 PARENT_CHECK_INTERVAL_SECONDS = 1
 PR_SET_PDEATHSIG = 1
+# A top-level main marks a program that the helper runs inside the helper process.
+TOP_LEVEL_MAIN = re.compile(rb"^def main\(", re.MULTILINE)
 
 
 @dataclass(frozen=True)
@@ -73,12 +75,8 @@ def read_call(source: BinaryIO) -> HelperCall:
 
 def load_program(path: str) -> LoadedProgram | SeparateProcess:
     # Shell fixtures and scripts without main retain their original entry point.
-    source = Path(path).read_bytes()
-    try:
-        syntax = ast.parse(source, filename=path)
-    except (SyntaxError, ValueError):
-        return SeparateProcess()
-    if not any(isinstance(node, ast.FunctionDef) and node.name == "main" for node in syntax.body):
+    # A text search costs far less than a parse of each program at each run.
+    if TOP_LEVEL_MAIN.search(Path(path).read_bytes()) is None:
         return SeparateProcess()
     name = "verify_helper_" + hashlib.sha256(os.fsencode(path)).hexdigest()
     specification = importlib.util.spec_from_file_location(name, path)
@@ -91,6 +89,15 @@ def load_program(path: str) -> LoadedProgram | SeparateProcess:
     if inspect.signature(main).parameters:
         return LoadedProgram(module, lambda: main(sys.argv[1:]))
     return LoadedProgram(module, main)
+
+
+def replace_environment(values: dict[str, str]) -> None:
+    """Make os.environ equal values; change only the names that differ."""
+    for name in [name for name in os.environ if name not in values]:
+        del os.environ[name]
+    for name, value in values.items():
+        if os.environ.get(name) != value:
+            os.environ[name] = value
 
 
 def run_call(call: HelperCall, programs: dict[str, LoadedProgram | SeparateProcess]) -> tuple[str, str, str]:
@@ -113,8 +120,7 @@ def run_call(call: HelperCall, programs: dict[str, LoadedProgram | SeparateProce
                 if not (stat.S_ISFIFO(mode) or stat.S_ISSOCK(mode) or stat.S_ISCHR(mode)):
                     raise OSError("the helper cannot share this stderr stream")
                 stderr_output = live
-            os.environ.clear()
-            os.environ.update(call.environment)
+            replace_environment(call.environment)
             os.chdir(call.directory)
             tempfile.tempdir = None
             sys.argv = [call.program, *call.arguments]
@@ -155,8 +161,7 @@ def run_call(call: HelperCall, programs: dict[str, LoadedProgram | SeparateProce
             sys.stdin, sys.stdout, sys.stderr = streams
             sys.argv, sys.path[:] = arguments, search
             os.chdir(directory)
-            os.environ.clear()
-            os.environ.update(environment)
+            replace_environment(environment)
             tempfile.tempdir = temporary_parent
         _ = stdout.seek(0)
         _ = stderr.seek(0)
@@ -164,8 +169,7 @@ def run_call(call: HelperCall, programs: dict[str, LoadedProgram | SeparateProce
     if status != "fallback" and (trace := call.environment.get("VERIFY_PY_TRACE")):
         try:
             with open(trace + ".calls", "a") as target:
-                argument = call.arguments[0] if call.arguments else ""
-                _ = target.write(f"{Path(call.program).name}\t{argument}\n")
+                _ = target.write("\t".join([Path(call.program).name, *call.arguments]) + "\n")
         except OSError:
             pass
     return status, output, errors

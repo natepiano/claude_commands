@@ -1442,7 +1442,6 @@ def run_suites(repo: Path, type_dirs: Sequence[str] = (),
     hold = BuildHoldWait() if shared else None
     if hold is not None:
         hold.wait_until_free()
-    initial_hold_seconds = hold.seconds if hold is not None else 0.0
     suites = sorted({suite for suite, _ in modules})
     ledger: PassedTreeLedger | None = None
     required: FullSuite | NoFullRunRequired = NoFullRunRequired()
@@ -1518,13 +1517,10 @@ def run_suites(repo: Path, type_dirs: Sequence[str] = (),
     largest_module = ""
     starting_load = one_minute_load()
     maximum_load = starting_load
-    began = time.monotonic()
-    started_at = datetime.now(UTC).timestamp()
     python = os.environ.get("MERGE_GATE_PYTHON", str(python_shim(repo)))
     reason = selection.reason if isinstance(selection, FullSuite) and not reused else ""
     elapsed = 0.0
     time_limit_report = ""
-    deadline = began + time_limit.seconds if isinstance(time_limit, gate_record.GateTimeLimit) else float("inf")
 
     def can_retry_memory_stop(result: GateJobResult) -> bool:
         return (result.memory_stopped and result.returncode != 0 and not result.tripwire_tripped
@@ -1555,6 +1551,11 @@ def run_suites(repo: Path, type_dirs: Sequence[str] = (),
           ExitStack() as module_folders,
           (gate_reservation(repo, temporary, hold, type_dirs=type_dirs, mode=mode) if hold is not None else nullcontext(None)) as reservation,
           (shared_cpu_pool() if shared else nullcontext(NoSharedCPU())) as cpu_pool):
+        # The wall time and the time limit start here, after the queue admits the gate.
+        began = time.monotonic()
+        started_at = datetime.now(UTC).timestamp()
+        deadline = began + time_limit.seconds if isinstance(time_limit, gate_record.GateTimeLimit) else float("inf")
+        initial_hold_seconds = hold.seconds if hold is not None else 0.0
         environment = {**os.environ, "TMPDIR": str(temporary), "BUILDLOG_CALLER": mode.value}
         _ = environment.pop("PYTHONPATH", None)
         types_python = typecheck_python() if type_dirs else ""

@@ -277,6 +277,7 @@ class Holder:
     # The fixed staff ID, or the text given for a holder outside staff.
     key: str
     keep: tuple[ProcessIdentity, ...] = ()
+    start_recorded: bool = True
 
 
 @dataclass(frozen=True)
@@ -747,7 +748,7 @@ def read_holder(path: Path) -> Holder:
     except FileNotFoundError:
         raise
     except (OSError, UnicodeError):
-        return Holder(path.name, fallback, "unreadable holder file", UnknownReleaseEta(), path.name)
+        return Holder(path.name, fallback, "unreadable holder file", UnknownReleaseEta(), path.name, start_recorded=False)
     try:
         raw = cast(object, json.loads(content))
         if isinstance(raw, dict):
@@ -774,11 +775,12 @@ def read_holder(path: Path) -> Holder:
         pass
     match = INSTANT.search(content)
     if match is None:
-        return Holder(path.name, fallback, content, UnknownReleaseEta(), path.name)
+        return Holder(path.name, fallback, content, UnknownReleaseEta(), path.name, start_recorded=False)
     try:
         since = aware_instant(match.group())
     except ValueError:
-        since = fallback
+        return Holder(path.name, fallback, content[match.end():].lstrip(" ,;:-").strip(), UnknownReleaseEta(), path.name,
+                      start_recorded=False)
     return Holder(path.name, since, content[match.end():].lstrip(" ,;:-").strip(), UnknownReleaseEta(), path.name)
 
 

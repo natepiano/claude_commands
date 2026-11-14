@@ -837,6 +837,11 @@ def head_wait_text(reason: HeadAdmissionStatus, zone: ZoneInfo) -> str:
 
 
 @dataclass(frozen=True)
+class PackageNotRecorded:
+    """The queue record predates the package field. An empty package means workspace scope."""
+
+
+@dataclass(frozen=True)
 class WaitingStep:
     pid: int
     session_id: str
@@ -849,6 +854,7 @@ class WaitingStep:
     unit: str = ""
     project: str = ""
     run: LiveBuildRun | NoLiveBuildRun = field(default=NoLiveBuildRun(), kw_only=True)
+    package: str | PackageNotRecorded = field(default=PackageNotRecorded(), kw_only=True)
 
 
 @dataclass(frozen=True)
@@ -866,6 +872,7 @@ class RunningStep:
     project: str = ""
     execution: placement.ExecutionEvidence = placement.ExecutionNotStarted()
     assignment_host: str = ""
+    package: str | PackageNotRecorded = field(default=PackageNotRecorded(), kw_only=True)
 
 
 def execution_host(step: RunningStep, local_host: str) -> str:

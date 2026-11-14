@@ -70,18 +70,13 @@ from scripts.mac_test.eligibility import (
     SshConnectionSettings,
     OffloadConfig,
     IneligibleMacStep,
+    step_kind as step_kind,
 )
 from scripts.lib import build_folders
 
 
 # Version the mirrored repository's development shell exports on the Mac.
 MACOSX_DEPLOYMENT_TARGET = "14.0"
-
-
-def step_kind(verb: str) -> str:
-    """Map a command verb to its recorded step kind."""
-    return {"test": "nextest", "mend-check": "mend"}.get(verb, verb)
-
 
 
 MacDeclineReason = NonBusyMacDeclineReason | Literal["busy"]

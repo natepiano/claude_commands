@@ -1355,14 +1355,60 @@ From builds (not the user), 2026-11-13, urgent: phase 69 broke the Mac reading a
 3. No folder rule and no config key: the phase 69 ancestry rule alone marks the CI row as CI. From builds (not the user), 2026-11-13.
 4. Landed alone as 4c434349d, on main as f3e703de9, ahead of the phase 70 repair. The live Mac reading has the CI row and no error.
 
-### Phase 71 — Every row names its unit and showrunner · status: todo
+### Phase 71 — Every row names its unit and showrunner · status: done
 
-From the user (via builds), 2026-11-13: "it's working but i can't tell who is the showrunner for hana nextest running on the mac - it needs to show the showrunner in small text underneath and it should show the {unit} {step} above - if it is a showrunner run thing then it should say showrunner nextest and still show the name of the showrunner before it. the showrunner and the unit should be on every hoverable tooltip so i don't have to guess". Screenshot: /tmp/claude/scratch/user-shot-mac-showrunner-names.png. <!-- allow-banned: user quote --> From builds (not the user), 2026-11-13: items 1-5.
+From the user (via builds), 2026-11-13, with screenshots /tmp/claude/scratch/user-shot-mac-showrunner-names.png, user-shot-done-duration-gap.png and user-shot-mac-ci-unattributed.png: show the unit and step on top and the showrunner in small text under it, name both in every tooltip, make the column gaps equal, and rename Machine to Target and Duration to Dur. From builds (not the user): the item list and the Mac CI case.
 
-1. Every row on every machine (natedev, Mac, AWS), Running and Queued, has the top line "{unit} {step}". A showrunner run reads "showrunner {step}".
-2. The small text under it is the showrunner name, for example "hana".
-3. A CI row has no unit or showrunner: the top line is "CI {step}", and the small text is the current ci_label (hana CI · runner · job).
-4. Every hover tooltip on the page names the showrunner and the unit, or CI.
-5. Proof: before and after shots of the Mac CI row (pid 90082 in the shot) and one tooltip.
-6. From the user (via builds), 2026-11-13: "space between columns Done and Duration should be consistent - there is too much space between these two column headers that could be used". Screenshot: /tmp/claude/scratch/user-shot-done-duration-gap.png. From builds (not the user): every column gap in the Running and Queued tables has the same width, the Waiting header included. The freed space goes to the Unit column, so "owner not recorded" shows in full. Proof: before and after shots of both tables.
-7. From the user (via builds), 2026-11-13: "rename Machine column header to Target - rename Duration to Dur - this should give a couple of chars back in many circumstances". From builds (not the user): rename both headers in the Running and Queued tables and anywhere else the page uses them. The freed space goes to Unit.
+#### As-built
+
+- New `owned.*` keys in `config/build_steps.conf`: `owned.default={unit} {step}`, `owned.showrunner-default=showrunner {step}` and `owned.ci-default=CI {step}`. `StepNames.for_owner` reads them through the one phase 70 naming path. An unknown owner keeps its current name.
+- Every Running and Queued row on natedev, the Mac and AWS uses these names. The small text is the showrunner name, or the CI label for a CI row.
+- A CI row's Unit cell reads "CI" (director decision). A missing CI field (runner, job) is left out, so a live Mac CI row reads "hana CI": the Mac script cannot read the runner environment (director decision).
+- Every tooltip, swap tooltips included, names the showrunner and the unit, or CI. The custom and native tooltips share one owner field list.
+- Column gaps are equal in both tables. The headers read Target and Dur, and the freed space goes to Unit.
+- Proof: before and after shots of both tables, a Mac CI row and its tooltip, an owner tooltip and a 600px view. A live read rendered Mac CI pid 69040 as "CI nextest" over "hana CI".
+- Repair (merge test red, from builds): `test_memory_hover.py` expects the phase 71 text and checks the owner lines in each tooltip. Its page data supplies `walk`, `waiters` and `swap_by`, as the live feed does. The page does not change.
+
+**Files:** `config/build_steps.conf`; `scripts/lib/build_steps.py`; `scripts/build_queue/memory_feed.py`, `memory_live.html`, `memory_page_proof.mjs`, `queue_view.py`, `test_memory_feed.py`, `test_queue_view.py`, `test_memory_hover.py`.
+
+### Phase 72 — AWS rows name their owner · status: done
+
+From builds (not the user), 2026-11-13: AWS rows on the Builds page read "owner not recorded" (user shot /tmp/claude/scratch/user-shot-done-duration-gap.png). A gate worker and a paired-trial worker start as a `systemd-run` unit without the caller's session id or unit.
+
+#### As-built
+
+- `cloud_gate.service_command` forwards `CODEX_THREAD_ID`, `CLAUDE_CODE_SESSION_ID`, `CLAUDE_SESSION_NAME` and `BUILDLOG_UNIT` with `--setenv`, each only when the caller sets it. An empty value stays empty.
+- The gate worker and the paired-trial worker both use `service_command`, so `gate_trial.py` does not change.
+- The existing `admission_records.waiter_identity` reads the forwarded values. The worker's step record names its session and unit, and the AWS row reads "{unit} {step}" over the showrunner name.
+- The AWS `UnsetEnvironment` list does not change, and no new credential data is read. A hold owned by another session still refuses the worker (exit 10).
+- `memory_page_proof.mjs --cloud-owner` saves before and after shots of an AWS row and its tooltip.
+- aws-unit's conditions are met. A live check of the owner on the next gate worker and paired-trial worker goes to builds.
+
+**Files:** `scripts/aws_target/cloud_gate.py`, `test_cloud_gate.py`; `scripts/build_queue/memory_page_proof.mjs`.
+
+### Phase 73 — The Builds page shows each block and hold · status: done
+
+From the user (via builds), 2026-11-13, with user shot /tmp/claude/scratch/user-shot-mac-block-banner.png: "this design is not quite what i had in mind although it does tell me that the mac is idle - although it should say that it is blocked. i want you to ask that whoever implements showing the mac block should do an astra design review to make it more beautiful than what we're currently doing". No AWS hold exists, so the page has no AWS row (director decision).
+
+#### As-built
+
+- `target_availability.py` reads `targets.target_snapshots()` once for each page reading. `availability_rows` gives one row for each Mac block ("Blocked") and each natedev hold ("Held"), with holder, unit, showrunner, reason, since and until. An unreachable or unreadable target gives an "Unavailable" row. A free or busy target has no row.
+- The "Target availability" card on the Builds page shows these rows. A narrow view puts the reason, owner, since and until in that order.
+- `MacRoutes.line` gives the "Mac: ..." tooltip line for natedev rows and waiters: kind not offloaded, natedev only, excluded (policy), blocked, busy, unreachable, state unreadable, or no recorded block or claim. It reads `build_targets.step_policy` once for each (folder, package, kind) in a reading. Backoff and unreadable state are not policy; the state line names them.
+- Cost: `step_policy` runs local git reads, 5–25 ms for each repository in each 3 s reading. Accepted, because a cache across readings would hide a config change.
+- `ssh_target_snapshot` puts a block before a failed probe, running jobs and backoff. `read_backoff(strict=True)` returns `UnreadableBackoff`; the non-strict read does not change.
+- The idle alert says "MAC BLOCKED by ...". When the card shows the block, the page omits the block sentence from the alert (`BlockText.OMITTED`); admission diagnostics stay.
+- The astra design review came before the build. Its findings and rulings are in the phase notice to builds.
+- `memory_page_proof.mjs --blocks` saves before and after shots with the user shot's values, a narrow view with two natedev holders, and one tooltip for each Mac line form.
+
+### Phase 74 — Every row hover names who ran it · status: done
+
+From the user (via builds), 2026-11-13, with user shot /tmp/claude/scratch/until-2026-11-16T0500Z-hover-shot-a361af/user-hover-identity.png: "this hover panel is going in the right direction - i want to make sure we non-redundantly indentify the showrunner: {showrunner} unit : {unit} worker : {worker} if the showrunner is the only thing that ran it, then it should say showrunner: {showrunner} unit : this run is from the showrunner and don't show the unit similarly if it is something run from the unit it should be showrunner: {showrunner} unit : {unit} worker : this run is from the unit director This should be a standard at the beginning of each hover over every running and queued row". From builds (not the user), 2026-11-13: a showrunner run has no worker line; use the user's label texts exactly; one shared block from one place in the code; a run with no recorded owner keeps "owner not recorded"; a showrunner's worker shows "unit: this run is from the showrunner".
+
+#### As-built
+
+- `unit_labels.Runner` records who ran the step: showrunner, unit director, worker, or unknown. `make_labels` sets it through `runner_of`. It is the only place that builds labels from the relationships, so the fast and full readers agree.
+- `memory_feed.page_owner_labels` sends `runner` and `worker` on every running and queued row. Cloud rows use it too. A CI row sends runner unknown and keeps its CI line.
+- `identityHtml` on the Builds page is the one place for the block. Every walk and waiter hover, Mac rows included, starts with it: showrunner, unit, then worker, with the user's label texts. The labels are lowercase and the colons align.
+- Row headings and the local row body no longer repeat the owner that the block names. A hover with the block is up to 24rem wide, so the values do not wrap.
+- `memory_page_proof.mjs --identity` saves before and after shots of the Mac row hover, plus one showrunner-run row and one unit-director-run row.

@@ -599,7 +599,8 @@ class MergeGateFixture(unittest.TestCase):
         while True:
             try:
                 state = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[0]
-            except FileNotFoundError:
+            # A process reaped between the open and the read is gone, so it is stopped.
+            except (FileNotFoundError, ProcessLookupError):
                 return
             if state == "Z":
                 return

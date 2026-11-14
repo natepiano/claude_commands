@@ -1516,5 +1516,35 @@ class OffloadCommandTests(OffloadCommandFixture):
         self.assertFalse(self.result_path.exists())
 
 
+
+class BackoffReadTests(unittest.TestCase):
+    def test_strict_read_names_an_unreadable_backoff_and_the_default_read_ignores_it(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "unreachable_until"
+            with mock.patch.object(eligibility, "backoff_path", return_value=path):
+                self.assertIs(eligibility.read_backoff(100, strict=True), eligibility.NO_BACKOFF)
+                for text, reason in (("soon", "could not convert string to float: 'soon'"), ("inf", "backoff time is not finite")):
+                    with self.subTest(text=text):
+                        _ = path.write_text(text, encoding="utf-8")
+                        self.assertEqual(eligibility.read_backoff(100, strict=True), eligibility.UnreadableBackoff(reason))
+                        self.assertIs(eligibility.read_backoff(100), eligibility.NO_BACKOFF)
+                _ = path.write_text("200", encoding="utf-8")
+                self.assertIs(eligibility.read_backoff(100, strict=True), eligibility.ACTIVE_BACKOFF)
+
+    def test_a_passed_backoff_decides_eligibility_without_a_read(self) -> None:
+        config = eligibility.OffloadConfig(True, eligibility.SshConnectionSettings("dummy", 1, 1), 1, 1, 1, "1",
+                                       {"linux_only.hana": ""})
+        cases: tuple[tuple[eligibility.BackoffState, eligibility.KnownRepository | eligibility.IneligibleMacStep], ...] = (
+            (eligibility.UnreadableBackoff("bad"), eligibility.IneligibleMacStep("state")),
+            (eligibility.ACTIVE_BACKOFF, eligibility.IneligibleMacStep("backoff")),
+            (eligibility.NO_BACKOFF, HANA),
+        )
+        with mock.patch.object(eligibility, "repository_identity", return_value=HANA), \
+             mock.patch.object(eligibility, "read_backoff", side_effect=AssertionError("backoff was passed")):
+            for backoff, expected in cases:
+                with self.subTest(backoff=type(backoff).__name__):
+                    self.assertEqual(eligibility.mac_step_eligibility(config, Path("/fixture/hana"), "hana", "nextest",
+                                                                  backoff=backoff), expected)
+
 if __name__ == "__main__":
     _ = unittest.main()

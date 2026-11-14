@@ -291,8 +291,8 @@ class StatusTests(IsolatedBuildTargetTest):
     def test_mac_idle_alert_prints_first_with_red_only_on_a_terminal(self) -> None:
         _ = write_idle_alert(self.root / "mac-idle", NOW.timestamp())
         config = self.write_config("targets=natedev\nkind.natedev=local\nplatform.natedev=linux\n")
-        expected = ("MAC IDLE 10 min: 7 steps wait for the Mac. Blocked by research since "
-                    "13:50 (P15 F11 L0 run); /build:mac unblock clears it.")
+        expected = ("MAC BLOCKED by research since 13:50 (P15 F11 L0 run): 7 steps wait for the Mac, "
+                    "idle 10 min; /build:mac unblock clears it.")
         with mock.patch.dict(os.environ, {"CONF_DIR": str(config.parent)}), \
              mock.patch.object(time, "time", return_value=NOW.timestamp()):
             for terminal in (False, True):
@@ -1502,6 +1502,33 @@ class WaitLocalTests(IsolatedBuildTargetTest):
             self.assertIn("positive", errors.getvalue())
         self.assertFalse((self.root / "registration").exists())
 
+
+
+class RecordedStepKindTests(unittest.TestCase):
+    def test_queue_step_names_map_to_offload_kinds(self) -> None:
+        cases = (("nextest", "test"), ("clippy", "lint"), ("mend", "lint"), ("check", "check"), ("doc", "doc"),
+                 ("build", "build"))
+        for step, kind in cases:
+            with self.subTest(step=step):
+                self.assertEqual(build_targets.recorded_step_kind(step), kind)
+        for step in ("fmt", "taplo", "sweep", "test", "mend-check"):
+            with self.subTest(step=step):
+                self.assertEqual(build_targets.recorded_step_kind(step), build_targets.KindNotOffloaded())
+
+    def test_step_policy_passes_the_snapshot_backoff_to_each_remote_kind(self) -> None:
+        target = targets.SshTarget("mac", "macos", Path("/fixture/mac.conf"))
+        unreadable = eligibility.UnreadableBackoff("bad")
+        config = eligibility.OffloadConfig(True, eligibility.SshConnectionSettings("dummy", 1, 1), 1, 1, 1, "1", {})
+        with mock.patch.object(eligibility, "read_config", return_value=config), \
+             mock.patch.object(eligibility, "mac_step_eligibility", return_value=eligibility.KnownRepository("hana")) as checks:
+            result = build_targets.step_policy(target, Path("/fixture/hana"), "hana", "final", backoff=unreadable)
+        self.assertEqual(result, eligibility.KnownRepository("hana"))
+        self.assertEqual([call.kwargs["kind"] for call in checks.call_args_list], ["check", "test"])
+        self.assertTrue(all(call.kwargs["backoff"] is unreadable for call in checks.call_args_list))
+        with mock.patch.object(eligibility, "read_config", return_value=config), \
+             mock.patch.object(eligibility, "mac_step_eligibility", return_value=eligibility.IneligibleMacStep("state")):
+            self.assertEqual(build_targets.step_policy(target, Path("/fixture/hana"), "hana", "check", backoff=unreadable),
+                             targets.ExcludedTarget(target, "state"))
 
 if __name__ == "__main__":
     _ = unittest.main()

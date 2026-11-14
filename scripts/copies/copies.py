@@ -66,6 +66,18 @@ class CopyError(Exception):
     exit_code: int = 2
 
 
+# Git's exit status when `git remote get-url` names no configured remote.
+NO_SUCH_REMOTE = 2
+
+
+class GitExit(CopyError):
+    """A git command ended with a nonzero status."""
+
+    def __init__(self, message: str, returncode: int) -> None:
+        super().__init__(message)
+        self.returncode: int = returncode
+
+
 @dataclass(frozen=True)
 class StaffOwner:
     """A fixed staff row owns the copy."""
@@ -442,7 +454,7 @@ def git(repo: Path, *arguments: str, data: bytes | None = None) -> bytes:
     if result.returncode:
         detail = "\n".join(part.decode(errors="replace").strip() for part in (result.stdout, result.stderr)
                            if part.strip()) or f"exit {result.returncode}"
-        raise CopyError(f"git {' '.join(arguments)} in {repo}: {detail}")
+        raise GitExit(f"git {' '.join(arguments)} in {repo}: {detail}", result.returncode)
     return result.stdout
 
 
@@ -466,16 +478,23 @@ def caller_owner() -> str:
 
 def origin_url(source: Path) -> str | None:
     """Read the origin URL when the repository has one."""
-    if "origin" in git(source, "remote").decode().splitlines():
+    try:
         return git(source, "remote", "get-url", "origin").decode().strip()
-    return None
+    except GitExit as error:
+        # Git exits 2 when no remote of that name is configured.
+        if error.returncode == NO_SUCH_REMOTE:
+            return None
+        raise
 
 
 def main_checkout(source: Path) -> Path:
     """Read the main checkout, including repositories with separate Git metadata."""
-    common, current, bare = git(source, "rev-parse", "--path-format=absolute",
-                                "--git-common-dir", "--git-dir", "--is-bare-repository").decode().splitlines()
+    # --show-cdup prints a line only inside a work tree: the path from source to its top.
+    common, current, bare, *cdup = git(source, "rev-parse", "--path-format=absolute", "--git-common-dir",
+                                       "--git-dir", "--is-bare-repository", "--show-cdup").decode().splitlines()
     if common == current and bare == "false":
+        if cdup:
+            return (source / cdup[0]).resolve()
         return Path(git(source, "rev-parse", "--show-toplevel").decode().strip())
     first = git(source, "worktree", "list", "--porcelain").decode().splitlines()[0]
     checkout = Path(first.removeprefix("worktree "))
@@ -749,6 +768,7 @@ def refresh_remotes(tree: Path, source: Path) -> None:
     source_references = references(source, refs, "refs/heads")
     current_refs = references(tree, "refs/remotes/origin", "refs/remotes/source")
     mappings: list[str] = []
+    stale_heads: list[str] = []
     for remote, remote_url, source_refs in (("origin", url, refs), ("source", str(source), "refs/heads")):
         mapping = f"+{source_refs}/*:refs/remotes/{remote}/*"
         for key, value in ((f"remote.{remote}.url", remote_url),
@@ -761,9 +781,12 @@ def refresh_remotes(tree: Path, source: Path) -> None:
         current = {name.removeprefix(prefix): value.strip()
                    for name, value in current_refs.items() if name.startswith(prefix)}
         if current != expected:
-            # Pruning keeps symbolic HEAD refs. Remove them before copying the source's refs.
-            _ = git(tree, "update-ref", "--no-deref", "-d", prefix + "HEAD")
+            stale_heads.append(prefix + "HEAD")
             mappings.append(mapping)
+    if stale_heads:
+        # Pruning keeps symbolic HEAD refs. Remove them before copying the source's refs.
+        _ = git(tree, "update-ref", "--no-deref", "--stdin",
+                data="".join(f"delete {ref}\n" for ref in stale_heads).encode())
     if mappings:
         _ = git(tree, "fetch", "-q", "--prune", "--", str(source), *mappings)
 

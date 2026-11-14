@@ -41,14 +41,15 @@ Tool setup runs after the guard and requires the bounded data mount.
 A failed setup or missing disk cannot prevent the guard from requesting poweroff.
 The mount bounds both device discovery and mount execution through `mount_timeout_seconds`.
 
-Phase C supplies `/run/hana-aws/work-permit.json` and `/run/hana-aws/generation` as private, root-owned files.
+Phase D must deliver `/run/hana-aws/work-permit.json` and `/run/hana-aws/generation` as private, root-owned files.
 The permit fields are `expires_at` (UTC epoch seconds), `generation`, and `boot_id`.
 The boot ID must match `/proc/sys/kernel/random/boot_id`.
 The guard and watchdog only read the permit and identity files.
 Missing, unreadable, malformed, expired, or mismatched permits grant no permission.
 `permit_max_seconds=1800` bounds one renewal window.
 A permit beyond that window grants no permission.
-Phase C renews permission for longer steps through `write_permit()`.
+Phase C reserves permission for longer steps.
+Phase D must deliver renewals through `write_permit()`.
 The writer uses a private temporary file and atomic rename.
 
 On the first read, safety records the permit's boot-clock deadline in `/run/hana-aws/permit-deadline.json`.
@@ -78,6 +79,199 @@ The initial limits are 4 vCPUs and 24 GiB RAM.
 Phase F2 must use this command path after checking the actual data mount.
 `test_hana_guest.py` tests the decisions with injected clocks and verifies rendered units when `systemd-analyze` exists.
 No safety test needs AWS or a running systemd manager.
+
+## Hana spending permits
+
+`scripts/aws_target/hana_spend.py` reserves spending before it returns a guest permit.
+`HanaSpending` uses the account ledger lock for starts, renewals, lifecycle observations, and storage deletion.
+It makes no AWS call and delivers no permit to a guest.
+Phase D must deliver permits and schedule lifecycle reconciliation without an active caller.
+Placement remains disabled.
+
+`reserve_storage()` reserves the root and data volumes before provisioning.
+It checks current account caps and the Hana budget before returning a saved reservation.
+`issue()` reserves compute through the deadline at the configured bid ceiling.
+It includes retained storage when no storage reservation exists.
+Each issued permit has an increasing generation.
+A renewal must name the current generation and extend an unexpired deadline.
+A refused renewal leaves the saved deadline unchanged.
+The guest watchdog then stops the box when its existing permit expires.
+
+The shared ledger checks account policy, account evidence, gate exposure, bills, and the existing daily and monthly caps.
+The account daily limit remains USD 35.
+The Hana daily budget includes Hana compute and storage within that account limit.
+Open compute exposure remains reserved after permit expiry until a lifecycle observation confirms `stopped` or `terminated`.
+Storage remains reserved after stop and termination until volume deletion is confirmed.
+Storage estimates use a 30-day month.
+The ledger reserves the remaining storage cost for every day that a permit reaches.
+`reconcile()` records an automatic restart even when Hana placement is disabled.
+It reserves the boot guard interval and retains exposure until a confirmed stop.
+Unknown lifecycle state releases no exposure.
+Each lifecycle observation names the generation that the observer read before its request.
+An observation for an older generation changes no exposure or observation time.
+The ledger saves `hana_lifecycle_fence` with the latest accepted observation or permit issue time.
+An older observation cannot close a newer permit or replace a later running observation.
+The fence survives controller restarts.
+Observations at the same time as the fence leave exposure unchanged.
+
+The existing `cost-ledger.json` version remains 1.
+The optional `hana_compute` and `hana_storage` collections hold Hana exposure records.
+Older records have no Hana exposure when these collections are absent.
+A missing `hana_lifecycle_fence` remains absent until a fresh observation arrives.
+The first stop confirmation saves the missing fence and retains the compute exposure.
+A newer confirmation for the same generation can then close that exposure without a running observation.
+Missing fields within a Hana exposure record make that record unusable.
+The reader never invents a zero price or deadline.
+Account guards and gate reservations include Hana exposure.
+Ledger estimates include accrued Hana compute and storage.
+
+| New setting | Value | Reason |
+| --- | --- | --- |
+| `region` | `us-east-2` | Use Ohio for the box and retained storage. |
+| `instance_type` | `m7a.2xlarge` | Provide 32 GiB of memory. |
+| `spot_max_usd_per_hour` | `0.15` | Bound reserved compute exposure. |
+| `root_gib` | `40` | Reserve the retained root volume. |
+| `data_gib` | `300` | Reserve the retained data volume. |
+| `daily_budget_usd` | `6` | Bound Hana spending within the account limit. |
+| `gp3_usd_per_gib_month` | `0.08` | Price standard gp3 storage without extra performance. |
+
+The account configuration has storage totals, but no shared gp3 price per GiB.
+The new rate therefore belongs to the Hana configuration.
+`test_hana_spend.py` uses private files and fake lifecycle observations.
+
+## Hana lifecycle controller
+
+`aws_target.py serve` supervises bounded `tick` child processes for the existing `aws-target.service`.
+Each child attempts Hana lifecycle recovery before account charge refresh.
+Either operation can fail without suppressing the other operation.
+The supervisor continues after a failed or timed-out child.
+It releases all child-owned locks when the child exits.
+
+`hana_box.HanaController` stores its journal in `hana/lifecycle.json` beneath the account directory.
+`controller_lock.py` holds the existing `controller.lock` implementation.
+`aws_target.control_lock` remains available through the same import.
+Claims, lifecycle decisions, and operation intents take that lock before any ledger lock.
+The controller releases both locks before each provider call.
+It checks the saved deployment identity and operation token before applying the response.
+Each tick performs at most one provider step.
+
+The journal stores these lifecycle states:
+
+| State | Meaning |
+| --- | --- |
+| Unprovisioned | No setup has registered a deployment. |
+| Idle-stopped | A deliberate idle stop permits a later demand start. |
+| Interrupted | Only EC2 can restart the interrupted Spot instance. |
+| Stopped-unknown | An unknown stop cause forbids a manual restart. |
+| Starting | A committed claim owns the unresolved demand start. |
+| Ready | A verified boot can accept a permit for its current claim. |
+| Stopping | A saved stop intent blocks new claims. |
+| Replacement-pending | A terminated instance needs the later replacement path. |
+
+The journal records deployment, instance, Spot request, operation, boot, generation, and execution identities.
+A claim records whether work is committed incoming work or active work.
+The initial controller allows one claim.
+A caller timeout retains an unresolved start claim.
+The controller refuses claim release while a start or provider operation remains unresolved.
+Idle stop and claim creation use the same lock.
+A committed claim prevents idle stop.
+A saved idle-stop intent refuses a later claim until stop confirmation.
+A confirmed interruption takes priority over a pending idle stop.
+The controller records `INTERRUPTED` and refuses a manual restart.
+
+Phase C reserves compute before the next boot identity exists through `reserve_start()`.
+`check_start()` rechecks current caps before bootstrap, start, and permit publication.
+A cap refusal preserves the pending mutation and its token until the provider confirms the outcome.
+The controller calls the read-only `HanaProvider.recover()` when spending refuses another mutation attempt.
+Recovery continues after a cap refusal or reservation expiry.
+`MutationUnresolved` means the original request can still complete.
+Its stopped observation cannot close the compute exposure or replace the pending mutation.
+`MutationSettled` confirms that the original request cannot produce further changes.
+A settled stopped observation can close exposure and permit claim release.
+An unknown stop cause still forbids a manual restart.
+Recovery records exposure for a running box before it schedules a stop.
+Recovery never starts the box or publishes a permit.
+Each bootstrap, start, or publication attempt still needs accepted spending.
+`bind_start()` checks spending after the provider verifies the boot identity.
+A publication includes the expected prior generation and the current execution identity.
+Command permission requires a current active claim, verified boot, acknowledged permit, and accepted spending.
+Renewal retains the execution identity and advances the permit generation.
+A refused or lost publication does not extend the guest deadline.
+The controller reserves exposure until stop confirmation through the Phase C ledger.
+It reconciles automatic restarts without a caller, including while placement is disabled.
+An automatic restart cannot reuse an interrupted execution's boot challenge.
+
+`HanaProvider.step()` defines the typed provider boundary.
+A provider must bound its calls and use the saved operation tokens.
+Its `recover()` method reads status without repeating a mutation.
+It must distinguish a completed request from an unresolved request before reporting `MutationSettled`.
+The provider refreshes bootstrap access before a demand start.
+It must verify root receiver responses against deployment and demand-start identities.
+It must install a renewed generation and permit together before acknowledging publication.
+`hana_provider.AwsHanaProvider` supplies the concrete AWS provider.
+The controller constructs it with the scaler profile and a sanitized credential environment.
+An unprovisioned tick makes no provider call.
+`Deployment.prepare_hana` and `Deployment.hana_setup` in `deploy.py` prepare and provision a separate Hana stack through the existing deployment helpers.
+The user runs `prepare --workload hana`, then `hana-setup --approve-resources`.
+Without approval, `hana-setup` prints only its local plan.
+The existing preparation writer, preflight verifier, encrypted admin executor, stack waiter, and progress display serve both workloads.
+The separate template is `docs/plans/builds-aws/hana-cloudformation.json`.
+It creates a retained data volume, retained root disk, launch template, persistent Spot instance, security group, private control bucket, and scaler policy.
+Its Spot interruption behavior is `stop`.
+Setup uses Hana sizes and prices from `config/hana_aws.conf`.
+It reserves setup costs within both account and workload limits before the stack request.
+`reserve_setup()` permits only approved resource setup while placement remains disabled.
+It does not permit demand starts or guest command admission.
+Setup resumes an existing stack through reads before another mutation.
+It refuses changed resource inputs or an expired reservation before another stack request.
+It registers the deployment only after the Spot request and stopped state match.
+Setup adds no route, target, or slot capacity.
+
+The provider maps every remote operation through `PROVIDER_OPERATIONS`.
+A policy test derives its required IAM actions from that mapping.
+Start and stop actions require this deployment's Hana instance tags.
+User-data changes also require `ec2:Attribute=userData`.
+EC2 describe actions use the required wildcard resource.
+Object reads and writes apply only to this deployment's control prefix.
+No guest instance role or SSH key is created.
+Every provider AWS request uses the configured `aws_timeout_s` bound.
+Provider errors expose safe action names rather than cloud identifiers or signed URLs.
+
+The provider persists its operation before dispatch and holds a separate mutation lock.
+Recovery takes that lock without blocking an active mutation.
+Recovery fences an operation that has not reached dispatch.
+A late worker cannot dispatch that fenced operation.
+A successful remote response remains saved when the controller response is lost.
+Recovery verifies lost bootstrap writes through `DescribeInstanceAttribute`.
+A lost start remains unresolved while the observed instance is stopped.
+A pending, running, or stopping instance confirms that the start reached EC2.
+Permit recovery remains unresolved until the permit deadline passes.
+No recovery call starts the instance or publishes another permit.
+
+The root receiver reads signed control objects and writes scoped acknowledgements.
+Each demand start has new signed URLs and a separate control prefix.
+The provider writes those URLs only into private runtime files and EC2 user data.
+The root receiver verifies the deployment, demand start, current boot, prior generation, and permit deadline.
+It acknowledges only an installed permit.
+The guest shutdown fence rejects renewals.
+The image must deny non-root IMDS access because user data contains runtime signed URLs.
+The image must install the guard, watchdog, data mount, receiver, and runtime settings before setup.
+The Natedev owner must provide that reviewed image through the separate `/etc/nixos` workflow.
+The empty image and network settings prevent setup before that image review.
+
+| New setting | Value | Reason |
+| --- | --- | --- |
+| `idle_stop_seconds` | `600` | Retain short bursts before a deliberate idle stop. |
+| `start_timeout_seconds` | `120` | Bound caller waiting while retaining unresolved claims. |
+| `tick_interval_s` | `5` | Reconcile before the independent boot guard expires. |
+| `controller_tick_timeout_s` | `45` | Bound each supervisor child and failed provider step. |
+
+The controller validates these intervals against the guest guard and permit windows.
+Renewal starts with enough margin for two bounded steps and three tick intervals.
+Tests use private journals, injected clocks, and a fake provider.
+They verify that neither the controller lock nor the ledger lock remains held during provider work.
+Regression tests cover expired bootstrap, start, and publication recovery.
+They also cover stale recovery responses, concurrent cap refusals, and interruptions during idle stops.
 
 ## Removed builder: 2026-11-04
 
@@ -556,3 +750,20 @@ The service uses no new signal handler.
 It includes the GPU driver, runtime, archive extraction, and two test runs.
 The service reserves the configured maximum compute cost plus `gpu_size_trial_box_extra_usd` for each box.
 The default extra is USD0.05.
+
+
+### Hana setup configuration
+
+Existing configuration values remain unchanged.
+
+| New key | Value | Reason |
+| --- | --- | --- |
+| `stack_name` | `hana-build` | Keep Hana resources separate from gate resources. |
+| `availability_zone` | `us-east-2b` | Keep the retained disk in one zone. |
+| `ami_id` | Empty | Require the reviewed Hana safety image. |
+| `ami_owner_id` | Empty | Require the reviewed image owner. |
+| `vpc_id` | Empty | Require an explicit network. |
+| `subnet_id` | Empty | Require an explicit public subnet in the disk zone. |
+| `aws_timeout_s` | `10` | Bound each provider and receiver request. |
+| `control_url_seconds` | `3600` | Bound signed access for one boot. |
+| `control_poll_seconds` | `1` | Read current permission before the watchdog interval ends. |

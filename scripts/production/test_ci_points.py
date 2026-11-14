@@ -14,7 +14,7 @@ import tempfile
 import textwrap
 import unittest
 from pathlib import Path
-from typing import TypedDict, cast, final, override
+from typing import ClassVar, TypedDict, cast, final, override
 from unittest.mock import patch
 
 from scripts.production import ci_points
@@ -134,9 +134,41 @@ class CiPointsTests(unittest.TestCase):
     doc: Path = Path()
     log: Path = Path()
     env: dict[str, str] = {}
+    fixture_root: ClassVar[Path]
+    fixture_seed: ClassVar[Path]
+    fixture_environment: ClassVar[dict[str, str]]
+
+    @classmethod
+    @override
+    def setUpClass(cls) -> None:
+        super().setUpClass()
+        builder = cls(methodName="runTest")
+        cls.addClassCleanup(builder.doCleanups)
+        builder.build_fixture()
+        cls.fixture_root = builder.root
+        cls.fixture_environment = dict(builder.env)
+        seed_root = Path(cls.enterClassContext(tempfile.TemporaryDirectory(prefix="ci-points-seed-")))
+        cls.fixture_seed = seed_root / "case"
+        _ = shutil.copytree(builder.root, cls.fixture_seed, symlinks=True)
+        shutil.rmtree(builder.root)
 
     @override
     def setUp(self) -> None:
+        self.root = self.fixture_root
+        self.addCleanup(shutil.rmtree, self.root)
+        _ = shutil.copytree(self.fixture_seed, self.root, symlinks=True)
+        self.home = self.root / "home"
+        self.origin = self.root / "origin.git"
+        self.checkout = self.root / "checkout"
+        self.state = self.root / "state"
+        self.stub_state = self.root / "stub-state"
+        self.bin = self.root / "bin"
+        self.doc = self.root / "tool-based-ui-production.md"
+        self.log = self.checkout / "production.log"
+        self.env = dict(self.fixture_environment)
+        _ = self.git("update-index", "--refresh")
+
+    def build_fixture(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         self.home = self.root / "home"
         self.home.mkdir()

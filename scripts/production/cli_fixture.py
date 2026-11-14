@@ -16,7 +16,6 @@ import subprocess
 import sys
 import unittest
 from types import ModuleType
-from typing import cast
 from unittest.mock import patch
 
 from scripts.lib.git_test_support import write_fixture_git_config
@@ -82,9 +81,32 @@ def production_paths(environment: Mapping[str, str]) -> Generator[None]:
 
 
 @contextmanager
+def _exact_environment(environment: Mapping[str, str]) -> Generator[None]:
+    """Make `os.environ` equal `environment`; restore the caller's values on exit.
+
+    `patch.dict(clear=True)` removes one key at a time and copies the key list for each
+    removal. This swap reads `os.environ` once and changes only the keys that differ.
+    """
+    caller = dict(os.environ)
+    try:
+        _replace_environment(caller, dict(environment))
+        yield
+    finally:
+        _replace_environment(dict(os.environ), caller)
+
+
+def _replace_environment(current: dict[str, str], values: dict[str, str]) -> None:
+    for key in current.keys() - values.keys():
+        del os.environ[key]
+    for key, value in values.items():
+        if current.get(key) != value:
+            os.environ[key] = value
+
+
+@contextmanager
 def locked_environment(environment: Mapping[str, str], lock: AbstractContextManager[object]) -> Generator[None]:
     """Keep environment changes outside a private service loop's reads."""
-    change = cast(AbstractContextManager[object], patch.dict(os.environ, environment, clear=True))
+    change = _exact_environment(environment)
     with lock:
         _ = change.__enter__()
     try:
@@ -121,8 +143,8 @@ def invoke_cli(module: ModuleType, main: Callable[[], int], arguments: list[str]
     try:
         with ExitStack() as scope:
             environment_scope = (locked_environment(environment, environment_lock) if environment_lock is not None
-                                 else cast(AbstractContextManager[object], patch.dict(os.environ, environment, clear=True)))
-            _ = scope.enter_context(environment_scope)
+                                 else _exact_environment(environment))
+            scope.enter_context(environment_scope)
             _ = scope.enter_context(patch.object(sys, "argv", [str(module.__file__), *arguments]))
             _ = scope.enter_context(patch.object(sys, "path", sys.path.copy()))
             _ = scope.enter_context(redirect_stdout(stdout))
@@ -183,4 +205,7 @@ class ImmutableGitSeed:
         _ = shutil.copytree(self.checkout, checkout)
         _ = shutil.copytree(self.origin, origin)
         config = checkout / ".git/config"
-        _ = config.write_text(config.read_text().replace(str(self.origin), str(origin)))
+        config_text = config.read_text()
+        if str(self.origin) not in config_text:
+            raise ValueError(f"Cannot replace seed origin {self.origin} with {origin} in {config}")
+        _ = config.write_text(config_text.replace(str(self.origin), str(origin)))

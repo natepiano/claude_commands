@@ -41,6 +41,27 @@ class FileOnlyLabelTests(unittest.TestCase):
                 self.assertIs(unit_labels.make_labels("owner", showrunner, director).role, expected)
         self.assertIs(unit_labels.UnitLabels("builds", "builds").role, unit_labels.OwnerRole.UNKNOWN)
 
+    def test_make_labels_names_who_ran_the_step(self) -> None:
+        from scripts.message import unit_labels
+
+        runner = unit_labels.Runner
+        for showrunner, director, expected in (
+            (unit_labels.RunsProduction("builds"), unit_labels.NoDirector(), runner.SHOWRUNNER),
+            (unit_labels.UnderShowrunner("sdlc", "sdlc", ""), unit_labels.DirectsUnit("panes"), runner.UNIT_DIRECTOR),
+            (unit_labels.ProductionWithoutRunningShowrunner("sdlc"), unit_labels.DirectsUnit("panes"),
+             runner.UNIT_DIRECTOR),
+            (unit_labels.UnderShowrunner("sdlc", "sdlc", ""), unit_labels.UnderDirector("panes", "panes", ""),
+             runner.WORKER),
+            (unit_labels.ProductionWithoutRunningShowrunner("sdlc"), unit_labels.UnitWithoutRunningDirector("panes"),
+             runner.WORKER),
+            (unit_labels.UnderShowrunner("builds", "builds", ""), unit_labels.NoDirector(), runner.WORKER),
+            (unit_labels.ProductionWithoutRunningShowrunner("builds"), unit_labels.NoDirector(), runner.UNKNOWN),
+            (unit_labels.NoShowrunner(), unit_labels.NoDirector(), runner.UNKNOWN),
+        ):
+            with self.subTest(showrunner=showrunner, director=director):
+                self.assertIs(unit_labels.make_labels("owner", showrunner, director).runner, expected)
+        self.assertIs(unit_labels.UnitLabels("builds").runner, runner.UNKNOWN)
+
     def test_recorded_owner_without_a_parent_shows_its_session_name(self) -> None:
         from scripts.message import unit_labels
         from scripts.production.staff_test_support import fixture_member, isolated_staff_file
@@ -62,7 +83,7 @@ class FileOnlyLabelTests(unittest.TestCase):
             with mock.patch.object(unit_labels, "newest_sessions", return_value=[]):
                 labels = unit_labels.unit_labels_for([unit.current_session], {})
             self.assertEqual(labels[unit.current_session], unit_labels.UnitLabels(
-                "demo", "hana", "demo", unit_labels.OwnerRole.UNIT))
+                "demo", "hana", "demo", unit_labels.OwnerRole.UNIT, unit_labels.Runner.UNIT_DIRECTOR))
 
     def test_docless_holder_labels_stay_silent_across_repeated_reads(self) -> None:
         from scripts.message import unit_labels
@@ -334,6 +355,7 @@ print(json.dumps({
         self.assertEqual(result.returncode, 0, result.stderr)
         observed = cast(dict[str, object], json.loads(result.stdout))
         self.assertEqual(observed["labels"], {
-            "51e7edcb-739e-4f5c-a614-c06f4945a3dd": {"session": "", "showrunner": "—", "unit": "—", "role": "unknown"},
+            "51e7edcb-739e-4f5c-a614-c06f4945a3dd": {"session": "", "showrunner": "—", "unit": "—", "role": "unknown",
+                                                     "runner": "unknown"},
         })
         self.assertEqual(observed["herdr_modules"], [])

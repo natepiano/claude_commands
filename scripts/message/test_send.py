@@ -68,7 +68,7 @@ from scripts.agents.test_support import ShutdownTestCase
 from scripts.lib.user_zone import user_zone
 from scripts.notify.user_action import REFUSED_BEFORE_SENDING, ActionRequired, NoActionRequired
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
-from scripts.message.repeat_guard_test_support import install_guard_test_budget
+from scripts.message.repeat_guard_test_support import install_guard_test_budget, run_guard_in_process
 from scripts.accounts.home_test_support import scratch_accounts_config
 from scripts.production.staff_test_support import fixture_member, fixture_worker, fixture_runtime_id, fixture_session
 
@@ -76,6 +76,7 @@ from scripts.production.staff_test_support import fixture_member, fixture_worker
 def setUpModule() -> None:
     install_signal_pid_guard()
     install_guard_test_budget()
+    run_guard_in_process()
     notice_sender = mock.patch.object(failed_lookup, "send_notice")
     _ = notice_sender.start()
     unittest.addModuleCleanup(notice_sender.stop)
