@@ -37,23 +37,28 @@ The showrunner's order on 2026-11-13 19:4x EST: "Start the switch phase now: the
 
 ### Phase 1 — Status and Workers read the census (schema 1)  · status: done
 
-#### Work Order
+#### As-built
 
-**Goal:** `/showrunner:units` shows Status and Workers from one `cargo-handler census --json` read. The table no longer observes worker panes or run records for these cells.
+- `scripts/production/census.py` runs `cargo-handler census --json` once per run within `units_census_seconds`. `parse` accepts schema 1 and 2 and returns `Census(machines, directors, workers)` of typed records (`CensusMachine`, `CensusDirector`, `CensusWorker`, `CensusRun`, `CensusPass` or `NoPass`). A time-out, a failed run, unreadable output, bad JSON, another schema or a bad field returns `CensusFailed(reason)`.
+- `unit_phases.main` submits `census.read` first in its thread pool. `table()` takes `census_read: Census | CensusFailed` and has no `pane_rows` argument.
+- Status (`census_status`): the census director's `status`, or `—` when it is null. A unit that the census does not list shows `exited` only when its machine (`unit.machine` or the local machine) is a reachable census machine; otherwise `—`.
+- Workers (`census_workers`, `workers_cell`): a phase row lists the census workers whose `pass.phase` is that phase's instance id; another row lists all workers of the unit. `running` → `<name> waiting on run: <label> <elapsed>`, `finished_queued` → `<name> result queued: <label>`, `missing` → `<name> run gone: <label>`. A busy or starting worker without a run shows `<name> working`; a waiting one shows `<name> waiting`; idle workers add `+<n> idle`.
+- A census failure shows `—` in Status and Workers for every unit and sends one anomaly line through `session_staff.report_anomaly`. There is no fallback to pane observation.
+- `scripts/direct/worker_runs.py` is now `scripts/direct/phase_waits.py` and keeps only `phase_waits` for Notes.
 
-**Spec:**
-1. **Reader.** New `scripts/production/census.py` runs `cargo-handler census --json` once per run, with the time limit `units_census_seconds` in `config/production.conf`. It parses schema 1 into typed records (`CensusDirector`, `CensusWorker`, `CensusRun`) and accepts schema 1 and 2. A failed run, a time-out, bad JSON or another schema returns `CensusFailed(reason)`.
-2. **Overlap.** `unit_phases.main` starts the census in its existing thread pool at the start of the reads, so its time overlaps the staff, plan and history reads. Name the measured total in the phase report.
-3. **Status.** The unit's Status is the census director's `status` for its staff id. A unit that the census does not list shows `exited`. A null status shows `—`. Status keeps its words: `busy`, `starting`, `waiting`, `idle`, `paused`, `exited`.
-4. **Workers.** The unit's Workers cell lists the census workers whose `parent_staff_id` is the unit. A phase row lists only workers whose `pass.phase` is that phase. Run states map to the current text: `running` → `<name> waiting on run: <label> <elapsed>`, `finished_queued` → `<name> result queued: <label>`, `missing` → `<name> run gone: <label>`. A busy worker without a run shows `<name> working`. Idle workers add `+<n> idle`.
-5. **Failure.** When the census fails, Status and Workers show `—` for every unit, and the run prints one anomaly line with the reason. No fallback to the old observation.
-6. **Retire.** Remove the table's use of `worker_runs.observe_pane_rows`, `worker_runs.phase_workers`, `worker_runs.pane_worker_rows` and the `pane_rows` argument. Delete each function that has no other consumer. Keep `phase_waits` for Notes.
-7. **Tests** inject census JSON. No test runs `cargo-handler` or reads a live pane.
-8. **Docs.** Update `commands/showrunner/units.md` and the units section of `docs/as-built/showrunner-automation.md` in the same commit.
+**Files:**
+- `scripts/production/census.py` — the census reader and its records.
+- `scripts/production/unit_phases.py` — Status and Workers from the census.
+- `scripts/direct/phase_waits.py` — the Notes phase waits.
+- `config/production.conf` — `units_census_seconds`.
+- `commands/showrunner/units.md`, `docs/as-built/showrunner-automation.md`, `docs/as-built/staff-accessors.md` — the rules.
 
-**Files:** `scripts/production/census.py` (new), `scripts/production/unit_phases.py`, `scripts/direct/worker_runs.py` (renamed `phase_waits.py`), `config/production.conf`, `docs/as-built/staff-accessors.md`, their tests, `commands/showrunner/units.md`, `docs/as-built/showrunner-automation.md`.
+**Binds later work:** `census.parse` is the place that reads the schema 2 `sessions` list. `unit_phases.census_status` is the Status lookup that schema 2 can replace.
 
-**Acceptance:** the sdlc table shows the same Status words as the handler tiles for every listed unit. A census failure shows `—` and one anomaly line. The full production test modules pass. basedpyright reports 0/0/0.
+**Gotchas:**
+- One census takes 2.6 s to 3.8 s on natedev, and more than 10 s under heavy load. It is the critical path of `/showrunner:units`, so the land waits for the handler census speed fix (target about 1 s).
+- `pass.phase` is the phase instance id, not the plan phase number.
+- A test that builds the table without a census read reads live data; every test injects a `Census`.
 
 ### Phase 2 — Take census schema 2  · status: todo
 
@@ -61,4 +66,16 @@ The showrunner's order on 2026-11-13 19:4x EST: "Start the switch phase now: the
 
 **Goal:** the reader takes schema 2 when the handler sends its hash (handler Phase 10, ETA 22:30 EST).
 
-**Spec:** read the top-level `sessions` list into a typed record. Use it where it replaces a staff lookup in Status. Drop schema 1 support once the installed handler prints schema 2. Tests and docs as in phase 1.
+**Spec:**
+1. `census.parse` reads the top-level `sessions` list into a typed record.
+2. Use it where it replaces a staff lookup in `unit_phases.census_status`.
+3. Drop schema 1 support once the installed handler prints schema 2.
+4. Tests inject census records as in phase 1. Update the docs in the same commit.
+
+**Files:**
+- `scripts/production/census.py`
+- `scripts/production/test_census.py`
+- `scripts/production/unit_phases.py`
+- `scripts/production/test_unit_phases.py`
+- `commands/showrunner/units.md`
+- `docs/as-built/showrunner-automation.md`
