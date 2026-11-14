@@ -326,6 +326,10 @@ The flag survives state reloads and suppresses repeated ON notices during the sa
 Normal recovery takes about two to three minutes plus reading, restoration, and broadcast time.
 This interval is not a fixed reset-to-notice deadline; stale readings, failed moves, or interrupted jobs can delay OFF.
 Pane workers move under their dispatch lock with fresh pane evidence.
+A worker whose source account is the target returns `already on <target>` with exit 0; the move closes and starts nothing.
+`pane_moves._own_policy` keeps the worker's family from its staff backend and reads that family's role row with `worker_panes.launch_policy(role, family)`.
+`worker_panes.kept_settings` then keeps the model, effort and service tier of the saved launch. The resume and the rollback both use this policy.
+So a change of the role's assigned family never moves a worker to another family.
 An idle worker closes its pane through the shared `worker_panes.can_close` check.
 `worker_panes.close` repeats that check under its worker lock before it closes the pane.
 Held dispatch locks, live launchers, and unfinished submitted passes keep the pane open.

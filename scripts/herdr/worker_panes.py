@@ -841,10 +841,11 @@ def can_close(worker: OpenWorker | StoppedWorker | ClosedWorker, *,
     return completion
 
 
-def launch_policy(role: WorkerRole) -> LaunchPolicy:
+def launch_policy(role: WorkerRole, family: Literal["claude", "codex", "assigned"] = "assigned") -> LaunchPolicy:
+    """Read the role's launch policy; a named family reads that family's row instead of the assigned one."""
     from scripts.astra import design_roles
     section, key = ("design_roles", role.removeprefix("astra-")) if role.startswith("astra-") else ("direct", role)
-    settings = models_registry.launch_settings(section, key)
+    settings = models_registry.launch_settings(section, key, family)
     sandbox = READ_ONLY_SANDBOX if role in ("review", "astra-reviewer") else WORKER_SANDBOX
     if role == "astra-designer":
         sandbox = design_roles.DESIGNER_SANDBOX
@@ -893,6 +894,19 @@ def _policy_arguments(policy: LaunchPolicy) -> list[str]:
         if settings.effort and settings.effort != "unset":
             arguments += ["--effort", settings.effort]
     return arguments + _turn_end_arguments(settings.kind)
+
+
+def kept_settings(settings: models_registry.LaunchSettings, arguments: Sequence[str]) -> models_registry.LaunchSettings:
+    """Keep the model, effort and tier that a saved launch passed; a launch without a model keeps the given settings."""
+    recorded = {"--model": "", "--effort": "", "model_reasoning_effort": "", "service_tier": ""}
+    for flag, value in zip(arguments, arguments[1:]):
+        name, _, setting = value.partition("=") if flag == "-c" else (flag, "", value)
+        if name in recorded:
+            recorded[name] = setting.strip('"')
+    if not recorded["--model"]:
+        return settings
+    return settings._replace(model=recorded["--model"], effort=recorded["--effort"] or recorded["model_reasoning_effort"],
+                             service_tier=recorded["service_tier"])
 
 
 def launch_arguments(policy: LaunchPolicy, identity: str, directory: Path | str) -> list[str]:

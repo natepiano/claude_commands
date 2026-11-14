@@ -8438,12 +8438,13 @@ class PaneWorkerMoveTests(unittest.TestCase):
 
         def fail_target(parent: staff.StaffId, name: staff.WorkerName, role: staff.WorkerRole | worker_panes.WorkerRoleUnavailable, *,
                         account: worker_panes.ConfiguredWorkerAccount | worker_panes.DestinationWorkerAccount,
-                        lock: worker_panes.WorkerLockHold | worker_panes.WorkerLockAtUse) -> worker_panes.WorkerStart:
+                        lock: worker_panes.WorkerLockHold | worker_panes.WorkerLockAtUse,
+                        policy: worker_panes.UseRolePolicy | worker_panes.LaunchPolicy) -> worker_panes.WorkerStart:
             assert isinstance(account, worker_panes.DestinationWorkerAccount)
             assert isinstance(role, str)
             seen.append((role, account.label))
             return (worker_panes.StartRefused(worker_panes.StartRefusal.ACCOUNT_UNAVAILABLE, "target unavailable")
-                    if account.label == "claude2" else start(parent, name, role, account=account, lock=lock))
+                    if account.label == "claude2" else start(parent, name, role, account=account, lock=lock, policy=policy))
 
         with patch.object(worker_panes, "start_or_resume", side_effect=fail_target):
             result = self.move("claude2")
