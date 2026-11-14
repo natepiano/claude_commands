@@ -34,6 +34,7 @@ class DiskReading(NamedTuple):
 
 
 MISSING_PROCESS_CWD = Path()
+BASH = shutil.which("bash") or "/bin/bash"
 
 
 class ToolEvent(TypedDict):
@@ -45,89 +46,133 @@ class ToolEvent(TypedDict):
     warm: bool
 
 
+# The fake tools are Bash: a Python start for each call cost most of this module's time.
 TOOL_STUB = r'''
-import json
-import os
-from pathlib import Path
-import sys
-from urllib.parse import unquote
-
-tool = Path(sys.argv[0]).name
-arguments = sys.argv[1:]
-inputs = []
-if tool == "nix":
-    for argument in arguments:
-        if "#" in argument:
-            folder = Path(unquote(argument.split("#", 1)[0].removeprefix("path:")))
-            if folder.is_dir():
-                inputs = sorted(str(path.relative_to(folder)) for path in folder.rglob("*") if path.is_file())
-event = {
-    "tool": tool, "args": arguments, "cwd": str(Path.cwd()), "inputs": inputs,
-    "environment": {key: value for key, value in os.environ.items()
-                    if key.startswith(("BUILDLOG_", "LINT_", "TEST_SHELL_", "RUSTUP_"))},
-    "warm": (Path.cwd() / "target/warm-proof").exists(),
+quote() {
+    local value=$1
+    value=${value//\\/\\\\}
+    value=${value//\"/\\\"}
+    value=${value//$'\n'/\\n}
+    value=${value//$'\r'/\\r}
+    value=${value//$'\t'/\\t}
+    REPLY="\"$value\""
 }
-with Path(os.environ["TOOL_EVENTS"]).open("a") as output:
-    output.write(json.dumps(event) + "\n")
-if tool == "nix":
-    if "print-dev-env" not in arguments:
-        raise SystemExit("Unexpected nix command")
-    print("export IN_NIX_SHELL=1\nexport TEST_SHELL_PROOF=loaded")
-    print(os.environ.get("FAKE_NIX_EXPORTS", ""))
-    raise SystemExit(int(os.environ.get("FAKE_NIX_STATUS", "0")))
-if tool == "lint":
-    target = Path(os.environ.get("CARGO_TARGET_DIR", "target"))
-    target.mkdir(parents=True, exist_ok=True)
-    (target / "warm-proof").write_text("warm\n")
-    raise SystemExit(int(os.environ.get("FAKE_LINT_STATUS", "0")))
-if tool == "df":
-    if "-g" in arguments:
-        raise SystemExit("Linux must not use df -g")
-    free = int(os.environ.get("FAKE_FREE_GIB", "100"))
-    if any("G" in argument for argument in arguments if argument.startswith("-")):
-        available = str(free) + "G"
-    elif "-B1" in arguments:
-        available = str(free * 1024 ** 3)
-    else:
-        available = str(free * 1024 ** 2)
-    print("Filesystem Blocks Used Available Use% Mounted on")
-    print("fixture 999999999 0 " + available + " 1% /")
-    raise SystemExit(0)
-if tool == "rustc":
-    assert arguments == ["-V"]
-    print("rustc " + os.environ.get("TEST_SHELL_TOOL_VERSION", "fixture"))
-    raise SystemExit(0)
-if tool == "rustup":
-    assert arguments == ["toolchain", "install", "--no-self-update", "--no-update"]
-    if os.environ.get("FAKE_RUSTUP_FAIL"):
-        print("error: toolchain download failed", file=sys.stderr)
-        raise SystemExit(1)
-    raise SystemExit(0)
-if tool in ("cargo", "cargo-nextest", "cargo-mend"):
-    if tool == "cargo" and arguments == ["metadata", "--format-version", "1", "--no-deps"]:
-        if (os.environ.get("FAKE_CARGO_NEEDS_TOOLCHAIN") and not os.environ.get("RUSTUP_TOOLCHAIN")
-                and not any(Path(name).is_file() for name in ("rust-toolchain", "rust-toolchain.toml"))):
-            print("error: rustup could not choose a version of cargo to run", file=sys.stderr)
-            raise SystemExit(1)
-        if os.environ.get("FAKE_RUSTUP_FAIL"):
-            print("error: toolchain is not installed", file=sys.stderr)
-            raise SystemExit(1)
-        print(json.dumps({"workspace_root": str(Path.cwd()), "target_directory": str(Path.cwd() / "target")}))
-        raise SystemExit(0)
-    assert arguments in (["nextest", "--version"], ["mend", "--version"])
-    if arguments[0] == "nextest" and "TEST_NEXTEST_VERSION" in os.environ:
-        print(os.environ["TEST_NEXTEST_VERSION"])
-    else:
-        print(arguments[0] + " " + os.environ.get("TEST_SHELL_TOOL_VERSION", "fixture"))
-    raise SystemExit(0)
-if tool == "hostname":
-    print("fake-linux")
-    raise SystemExit(0)
-if tool == "rm":
-    if os.environ.get("FAKE_RM_FAIL") == "1" and any(argument.endswith("/target") for argument in arguments):
-        raise SystemExit(9)
-    os.execv(os.environ["TEST_REAL_RM"], ["rm", *arguments])
-raise SystemExit("Unexpected fake tool: " + tool)
+has_argument() {
+    local wanted=$1 argument
+    shift
+    for argument in "$@"; do [[ $argument == "$wanted" ]] && return 0; done
+    return 1
+}
+tool=${0##*/}
+cd -P . || exit 1
+arguments="" separator=""
+for argument in "$@"; do quote "$argument"; arguments+="$separator$REPLY"; separator=", "; done
+inputs=""
+if [[ $tool == nix ]]; then
+    for argument in "$@"; do
+        [[ $argument == *"#"* ]] || continue
+        folder=${argument%%#*}
+        folder=${folder#path:}
+        printf -v folder '%b' "${folder//%/\\x}"
+        folder=${folder%/}
+        [[ -d $folder ]] || continue
+        inputs="" separator=""
+        while IFS= read -r -d '' file; do
+            [[ -f $file ]] || continue
+            quote "${file#"$folder"/}"
+            inputs+="$separator$REPLY"
+            separator=", "
+        done < <(find "$folder" \( -type f -o -type l \) -print0 | LC_ALL=C sort -z)
+    done
+fi
+environment="" separator=""
+for name in ${!BUILDLOG_@} ${!LINT_@} ${!TEST_SHELL_@} ${!RUSTUP_@}; do
+    quote "$name"
+    environment+="$separator$REPLY: "
+    quote "${!name}"
+    environment+=$REPLY
+    separator=", "
+done
+warm=false
+[[ -e target/warm-proof ]] && warm=true
+quote "$tool"
+event="{\"tool\": $REPLY, \"args\": [$arguments], "
+quote "$PWD"
+event+="\"cwd\": $REPLY, \"inputs\": [$inputs], \"environment\": {$environment}, \"warm\": $warm}"
+printf '%s\n' "$event" >> "$TOOL_EVENTS"
+case $tool in
+nix)
+    has_argument print-dev-env "$@" || { echo "Unexpected nix command" >&2; exit 1; }
+    printf 'export IN_NIX_SHELL=1\nexport TEST_SHELL_PROOF=loaded\n%s\n' "${FAKE_NIX_EXPORTS-}"
+    exit "${FAKE_NIX_STATUS:-0}"
+    ;;
+lint)
+    target=${CARGO_TARGET_DIR:-target}
+    mkdir -p "$target" || exit 1
+    printf 'warm\n' > "$target/warm-proof"
+    exit "${FAKE_LINT_STATUS:-0}"
+    ;;
+df)
+    has_argument -g "$@" && { echo "Linux must not use df -g" >&2; exit 1; }
+    free=${FAKE_FREE_GIB:-100}
+    available=$((free * 1024 * 1024))
+    has_argument -B1 "$@" && available=$((free * 1024 * 1024 * 1024))
+    for argument in "$@"; do
+        [[ $argument == -*G* ]] && available=${free}G
+    done
+    printf 'Filesystem Blocks Used Available Use%% Mounted on\nfixture 999999999 0 %s 1%% /\n' "$available"
+    ;;
+rustc)
+    [[ $# == 1 && $1 == -V ]] || { echo "Unexpected rustc arguments: $*" >&2; exit 1; }
+    printf 'rustc %s\n' "${TEST_SHELL_TOOL_VERSION-fixture}"
+    ;;
+rustup)
+    [[ "$*" == "toolchain install --no-self-update --no-update" && $# == 4 ]] \
+        || { echo "Unexpected rustup arguments: $*" >&2; exit 1; }
+    if [[ -n ${FAKE_RUSTUP_FAIL-} ]]; then
+        echo "error: toolchain download failed" >&2
+        exit 1
+    fi
+    ;;
+cargo|cargo-nextest|cargo-mend)
+    if [[ $tool == cargo && "$*" == "metadata --format-version 1 --no-deps" && $# == 4 ]]; then
+        if [[ -n ${FAKE_CARGO_NEEDS_TOOLCHAIN-} && -z ${RUSTUP_TOOLCHAIN-} \
+              && ! -f rust-toolchain && ! -f rust-toolchain.toml ]]; then
+            echo "error: rustup could not choose a version of cargo to run" >&2
+            exit 1
+        fi
+        if [[ -n ${FAKE_RUSTUP_FAIL-} ]]; then
+            echo "error: toolchain is not installed" >&2
+            exit 1
+        fi
+        quote "$PWD"
+        workspace=$REPLY
+        quote "$PWD/target"
+        printf '{"workspace_root": %s, "target_directory": %s}\n' "$workspace" "$REPLY"
+        exit 0
+    fi
+    [[ $# == 2 && $2 == --version && ($1 == nextest || $1 == mend) ]] \
+        || { echo "Unexpected $tool arguments: $*" >&2; exit 1; }
+    if [[ $1 == nextest && -n ${TEST_NEXTEST_VERSION+set} ]]; then
+        printf '%s\n' "$TEST_NEXTEST_VERSION"
+    else
+        printf '%s %s\n' "$1" "${TEST_SHELL_TOOL_VERSION-fixture}"
+    fi
+    ;;
+hostname)
+    echo fake-linux
+    ;;
+rm)
+    if [[ ${FAKE_RM_FAIL-} == 1 ]]; then
+        for argument in "$@"; do [[ $argument == */target ]] && exit 9; done
+    fi
+    exec -a rm "$TEST_REAL_RM" "$@"
+    ;;
+*)
+    echo "Unexpected fake tool: $tool" >&2
+    exit 1
+    ;;
+esac
 '''
 
 
@@ -217,7 +262,7 @@ class LinuxShellTests(unittest.TestCase):
 
     def write_tool(self, path: Path) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
-        _ = path.write_text(f"#!{sys.executable}\n" + TOOL_STUB)
+        _ = path.write_text(f"#!{BASH}\n" + TOOL_STUB)
         path.chmod(0o755)
 
     def write_input(self, name: str, contents: str) -> None:
@@ -349,16 +394,16 @@ class LinuxShellTests(unittest.TestCase):
         self.environment["FAKE_NIX_EXPORTS"] = "\n".join(
             "export " + name + "=shell-value"
             for name in (*values, "CLICOLOR", "HANA_TARGET_ONLY", "LC_TERMINAL"))
-        capture = self.mirror / "received-environment.json"
+        capture = self.mirror / "received-environment"
         lint = self.root / ".claude/scripts/lint/lint"
         original = lint.read_text()
-        _ = lint.write_text(original.replace("tool = Path(sys.argv[0]).name",
-            "Path(" + repr(str(capture)) + ").write_text(json.dumps(dict(os.environ)))\n"
-            + "tool = Path(sys.argv[0]).name"))
+        _ = lint.write_text(original.replace("tool=${0##*/}\n",
+            "for name in $(compgen -e); do printf '%s=%s\\0' \"$name\" \"${!name}\"; done > "
+            + shlex.quote(str(capture)) + "\ntool=${0##*/}\n"))
         request = replace(self.request(), environment=tuple(values.items()))
         result = self.execute(request)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        observed = cast(dict[str, str], json.loads(capture.read_text()))
+        observed = dict(entry.split("=", 1) for entry in capture.read_text().split("\0") if entry)
         self.assertEqual({name: observed[name] for name in values}, values)
         self.assertNotIn("CLICOLOR", observed)
         self.assertNotIn("HANA_TARGET_ONLY", observed)
