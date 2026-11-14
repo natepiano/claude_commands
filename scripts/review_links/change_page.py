@@ -400,10 +400,13 @@ def document(content: str) -> bytes:
 <title>Changes to review</title><style>
 :root{color-scheme:light dark;font:17px/1.55 system-ui,sans-serif}
 body{margin:0}main{max-width:680px;margin:auto;padding:40px 16px 64px}
-.id{opacity:.7;font-size:14px}.kind{font-weight:600}
 h1{font-size:26px;line-height:1.25;margin:0 0 16px}section h1,h2{font-size:20px;line-height:1.3}
 h2{margin:16px 0}p{white-space:pre-wrap;margin:16px 0}main{overflow-wrap:anywhere}
-section h2{font-size:17px}section details{margin:16px 0}.secondary-actions{margin-top:8px}
+section h2{font-size:17px}section details{margin:16px 0}
+.answer-actions{display:flex;flex-wrap:wrap;gap:8px}.answer-actions button{margin:0}
+@media (max-width:480px){.answer-actions{gap:6px}.answer-actions button{font-size:15px;padding:6px 8px}}
+.change-details{display:grid;grid-template-columns:max-content 1fr;column-gap:1ch;margin:16px 0 0;font:14px/1.45 ui-monospace,monospace;opacity:.8}
+.change-details dd{margin:0}
 ul,ol{margin:16px 0;padding-left:28px;overflow-wrap:anywhere}
 pre{white-space:pre-wrap;overflow-wrap:anywhere;border:1px solid #8886;border-radius:6px;padding:12px;font:14px/1.45 ui-monospace,monospace}
 section+section{border-top:1px solid #8886;margin-top:36px;padding-top:28px}
@@ -441,14 +444,40 @@ def answer_form(page: ReviewPage, notice: AnswerNotice, feedback_rows: int) -> s
 <label for="feedback-{row_id}">Comment, question or feedback</label>
 <textarea id="feedback-{row_id}" name="feedback" rows="{feedback_rows}">
 {html.escape(notice.feedback)}</textarea>
-<div>{"".join(buttons[:2])}</div><div class="secondary-actions"><div>{"".join(buttons[2:3])}</div><div class="feedback-actions">{"".join(buttons[3:])}</div></div></form>'''
+<div class="answer-actions">{"".join(buttons)}</div></form>'''
+
+
+_COMMIT = re.compile(r"^[0-9a-f]{7,40}$")
+_ADDED = re.compile(r"^(\d{4}-\d{2}-\d{2})(?: (\d{2}:\d{2}))?$")
+
+
+@dataclass(frozen=True)
+class ChangeDetails:
+    """The facts shown under a change's buttons; an empty value is unknown."""
+    change: str
+    date: str
+    time: str
+    commit: str
+    kind: str
+
+    @classmethod
+    def read(cls, row: dict[str, str], key: str) -> ChangeDetails:
+        """Split the Merged cell `<date>[ <HH:MM>][ · <commit>]` into its parts."""
+        parts = [part.strip() for part in row.get("Merged", "").split(" · ")]
+        added = _ADDED.match(parts[0])
+        commit = parts[-1] if len(parts) > 1 and _COMMIT.match(parts[-1]) else ""
+        return cls(key, added[1] if added else "", (added[2] or "") if added else "", commit, row.get(change_review.KIND, ""))
+
+    def lines(self) -> list[tuple[str, str]]:
+        return [(label, value) for label, value in (("change", self.change), ("date", self.date), ("time", self.time),
+                                                    ("commit", self.commit), ("kind", self.kind)) if value]
 
 
 def change_details(row: dict[str, str], key: str) -> str:
-    """Keep change metadata inside one closed disclosure."""
-    return ('<details><summary>Details</summary>'
-            + f'<div class="id">{html.escape(key)} · {html.escape(row.get("Merged", ""))}</div>'
-            + f'<p class="kind">{html.escape(row.get(change_review.KIND) or "Kind not recorded")}</p></details>')
+    """Show the change's facts as aligned lines, always open."""
+    return ('<dl class="change-details">'
+            + "".join(f"<dt>{label}:</dt><dd>{html.escape(value)}</dd>" for label, value in ChangeDetails.read(row, key).lines())
+            + "</dl>")
 
 
 def fallback_answer(page: ReviewPage, notice: AnswerNotice) -> bytes:
@@ -580,9 +609,9 @@ def render(page: ReviewPage, delivery: DeliveryStatus, notice: AnswerNotice = NO
         sections.append(f'''<section id="{row_id}">
 {alert}
 <h1>{html.escape(row["Change"])}</h1>
-{change_details(row, change_review.display_id(row, route_owner(page, row).tab))}
 <h2>{proof_title}</h2>{review_text_html(row[change_review.CHECK], "pre")}
-{question_html(question)}{answer}</section>''')
+{question_html(question)}{answer}
+{change_details(row, change_review.display_id(row, route_owner(page, row).tab))}</section>''')
     if notice.reason and not notice.row:
         sections.insert(0, f'<p role="alert">Not saved: {html.escape(notice.reason)}</p>')
     queue = next_item.change_queue(page.production)

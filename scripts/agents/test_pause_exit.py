@@ -18,10 +18,15 @@ from scripts.message import sessions
 from scripts.production import live_units, staff, unit_lookup, worker
 from scripts.lib.resume_message import BusyPass, NoOwnPass
 from scripts.production.cli_fixture import invoke_cli
+from scripts.lib.state_home_test_support import isolate_state_home
 from scripts.production.staff_test_support import CHECKOUT, StaffTestCase, fixture_member, fixture_session
 from scripts.agents import restart_support, shutdown, stop_resume, remote
 from scripts.agents.stop_resume import stop as stop_session
 from scripts.agents.stop_results import ClaudeStartState, StopResult
+
+
+def setUpModule() -> None:
+    isolate_state_home()
 
 
 @final
