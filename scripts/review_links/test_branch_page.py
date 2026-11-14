@@ -159,6 +159,11 @@ def scratch_branches() -> Generator[ScratchBranches, None, None]:
         _ = document.write_text("- **Merge branch:** `TEST-production`\n", encoding="utf-8")
         rows.append(staff.StaffRow(production_id, "showrunner", "production", staff.STAFF_ROOT, current_session=production_id,
                                    doc=staff.LiveDoc("natedev", document)))
+        # A producer's launch folder is not a checkout; the listing reads no branch from it.
+        producer_id = staff.StaffId(str(uuid5(NAMESPACE_URL, str(root / "producer-folder"))))
+        (root / "producer-folder").mkdir()
+        rows.append(staff.StaffRow(producer_id, "producer", "TEST-producer", staff.STAFF_ROOT, current_session=producer_id,
+                                   worktree=staff.PresentWorktree("natedev", root / "producer-folder")))
         history_document = repository / "docs/plans/former-production.md"
         history_document.parent.mkdir(parents=True)
         _ = history_document.write_text(

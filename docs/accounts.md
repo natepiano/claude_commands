@@ -515,6 +515,8 @@ Run `~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py role worker
 A swap reads both usage windows and the credits before it changes the role.
 An unknown usage reading prints one anomaly and permits the move.
 Pane workers move under their worker locks.
+A worker already on the target account is not moved, and its pane stays as it is.
+A move changes only the account. The worker keeps its family and the model, effort and tier of its saved launch.
 An idle worker closes its pane only when the shared close check allows it.
 The check keeps the pane open for a held dispatch lock or a live launcher.
 An account move stops and resumes a worker with a live detached run on the target account, including an idle worker.
@@ -756,7 +758,7 @@ Legacy stored `default` values read as numbers on their next normal write.
 Historical move entries use evidence recorded at the time, or show `home account unresolved`.
 Setup creates `~/.codexN` when no home holds that account.
 
-`codex_credit_accounts` in `config/accounts.conf` names the Codex accounts that may spend paid credits. Every other Codex account is off. With off, an exhausted weekly or 5-hour window makes the account unavailable even with credits. At weekly 0%, workers first move to another Codex account with room when no workers entry is queued. With credits on, workers move only to included usage, and that move sends no alert. When no account has included usage left, workers use paid credits, with one phone notice and hourly forecasts. Each pass checks for included usage again. A move to that usage closes the paid episode with no alert. With credits off, workers prefer included usage, then another account using its own credits. When neither is available or the move fails, Codex assignments move to Claude until the earliest refill. Only the first forecast goes to the phone. See `docs/quota_alerts.md` for delivery retries and unknown forecasts.
+`codex_credit_accounts` in `config/accounts.conf` names the Codex accounts that may spend paid credits. Every other Codex account is off. With off, an exhausted weekly or 5-hour window makes the account unavailable even with credits. At weekly 0%, workers first move to another Codex account with room when no workers entry is queued. With credits on, workers move only to included usage, and that move sends no alert. When no account has included usage left, workers use paid credits, with one phone notice and hourly forecasts. Each pass checks for included usage again. A move to that usage closes the paid episode with no alert. With credits off, workers prefer included usage, then another account using its own credits. When neither is available or the move fails, Codex assignments move to Claude until the earliest refill, no-worker mode goes on, and the Codex workers stop. When the setting names the account again and it has a credit balance, the assignments return and no-worker mode goes off. Only the first forecast goes to the phone. See `docs/quota_alerts.md` for delivery retries and unknown forecasts.
 
 Account notes use numbered filenames such as `claude1.md` and `codex2.md`.
 Each note has a `role` list and a `sessions` count from the current roster.

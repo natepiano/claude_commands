@@ -3330,11 +3330,11 @@ class WorkerCommandTests(unittest.TestCase):
                 "staff_id": opened.row.id if name == opened.row.name else fixture_runtime_id("another-worker"),
                 "status": status, "pid": pid, "label": label}))
         for alive, hold, expected, location, activity in (
-                (True, "", "waiting", "known", "idle"), (False, "", "idle", "known", "idle"),
+                (True, "", "busy", "known", "idle"), (False, "", "idle", "known", "idle"),
                 (True, "pause", "paused", "known", "idle"), (True, "exit", "exited", "known", "idle"),
-                (True, "", "starting", "known", "starting"), (False, "", "starting", "known", "starting"),
+                (True, "", "busy", "known", "starting"), (False, "", "busy", "known", "starting"),
                 (True, "pause", "paused", "known", "starting"), (True, "exit", "exited", "known", "starting"),
-                (True, "", "waiting", "saved dispatch", "idle")):
+                (True, "", "busy", "saved dispatch", "idle")):
             self.fixture.world.locations[opened.pane]["agent_status"] = activity
             if location == "saved dispatch":
                 outside = self.fixture.root / "private" / "saved-dispatch"

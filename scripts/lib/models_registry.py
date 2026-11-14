@@ -162,17 +162,22 @@ def claude_arguments(arguments: Sequence[str], environment: Mapping[str, str]) -
     return resolved
 
 
-def launch_settings(section: str, key: str) -> LaunchSettings:
-    """Read launch settings through the existing shell resolver."""
-    configuration = LaunchModelConfiguration(*_snapshot(os.environ, OPERATION_ENVIRONMENT[0], registry_path()))
-    resolver = 'agents_resolve "$2.$3"'
-    producer_arguments: list[str] = []
+def launch_settings(section: str, key: str, family: Literal["claude", "codex", "assigned"] = "assigned", *,
+                    configuration: LaunchModelConfiguration | None = None) -> LaunchSettings:
+    """Read launch settings through the existing shell resolver.
+
+    A named family reads that family's row; a writer passes its candidate text.
+    """
+    if configuration is None:
+        configuration = LaunchModelConfiguration(*_snapshot(os.environ, OPERATION_ENVIRONMENT[0], registry_path()))
+    resolver = 'agents_resolve "$2.$3"' if family == "assigned" else '_agents_resolve_in_family "$2.$3" "$4"'
+    resolver_arguments: list[str] = [] if family == "assigned" else [family]
     if section == "producers":
         value = next((row.value for row in reversed(configuration.rows)
                       if row.section == section and row.key == key), "")
         match value.split(":"):
-            case ["claude" | "codex" as family, model, effort] if model and effort:
-                producer_arguments = [family, f"{model}:{effort}"]
+            case ["claude" | "codex" as producer_family, model, effort] if model and effort:
+                resolver_arguments = [producer_family, f"{model}:{effort}"]
             case _:
                 raise ValueError(f"invalid producer settings for {key}; expected <family>:<model>:<effort>")
         resolver = ('AGENT_FAMILY="$4"; _agents_validate_pair "$2.$3" "$4" "$5" && '
@@ -182,7 +187,7 @@ def launch_settings(section: str, key: str) -> LaunchSettings:
          + '{ ' + resolver + '; } && '
          + 'printf "%s\\n%s\\n%s\\n%s\\n" "$AGENT_FAMILY" "$AGENT_MODEL" "$AGENT_EFFORT" "$AGENT_SERVICE_TIER"',
          "launch-settings", str(Path(__file__).resolve().parents[1] / "agents/models_config.sh"), section, key,
-         *producer_arguments],
+         *resolver_arguments],
         input=configuration_shell(configuration), text=True, capture_output=True, check=False,
         env={**os.environ, "MODELS_CONFIG_TIER_ONLY": "1"})
     values = result.stdout.splitlines()
@@ -559,6 +564,27 @@ def store_registry(registry: Path, before: str, after: str, description: str, *,
                 # Preserve formatting when no concurrent edit intervenes.
                 write_text_atomic(path, after if latest == before and not additive_catalog else result)
         return registry_text(path)
+
+
+def _producer_candidate(name: str, family: str, model: str, effort: str) -> tuple[Path, str, str, LaunchSettings]:
+    path = registry_path()
+    before = registry_text(path)
+    after = _replay(before, [RowChange("producers", name, f"{name}={family}:{model}:{effort}")], False)
+    settings = launch_settings("producers", name,
+                               configuration=LaunchModelConfiguration(path, after, tuple(_records(after))))
+    return path, before, after, settings
+
+
+def producer_settings(name: str, family: str, model: str, effort: str) -> LaunchSettings:
+    """Validate one producer's candidate settings without a write."""
+    return _producer_candidate(name, family, model, effort)[3]
+
+
+def store_producer(name: str, family: str, model: str, effort: str) -> LaunchSettings:
+    """Validate one producer's settings, then publish its row; an equal row changes nothing."""
+    path, before, after, settings = _producer_candidate(name, family, model, effort)
+    _ = store_registry(path, before, after, f"{name} producer uses {family}:{model}:{effort}")
+    return settings
 
 
 @final
