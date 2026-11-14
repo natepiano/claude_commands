@@ -1137,9 +1137,9 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
                     ci_name = "hana CI"
                     description = memory.diagnostic
                 else:
-                    description = "Memory the compiler cache holds outside the build queue."
+                    description = "Memory the compiler cache holds outside the build queue"
             else:
-                description = "Memory these processes hold outside the build queue."
+                description = "Memory these processes hold outside the build queue"
             row: RunRow = {"name": name, "showrunner": "", "unit": unit, "state": state, "pid": (step.run.pid if isinstance(step.run, LiveBuildRun) else step.pid), "detail": detail, "used": gib(memory.bytes),
                            "counted": 0.0, "reserved": 0.0, "started_at": step.started_at,
                            "age": queue_view.leftover_age(age(step.started_at, explanation.now)) if step.started_at else "not recorded",
@@ -1164,7 +1164,7 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
         amount = sum(row["used"] for row in members if isinstance(row["used"], float))
         walk.append({"name": f"{name} ({len(members)})", "showrunner": "", "unit": "", "state": "", "pid": admission_records.PidNotRecorded(), "detail": "each under 0.5 GiB",
                      "used": amount, "counted": 0.0, "reserved": 0.0, "started_at": 0,
-                     "queued": False, "keep_text": "Memory these processes hold outside the build queue.",
+                     "queued": False, "keep_text": "Memory these processes hold outside the build queue",
                      "progress": {"kind": "NoProgress", "reason": "group has no admission counter"},
                      "group": name, "ci": False, "parts": [{"who": row["detail"], "pid": row["pid"],
                          "gib": row["used"], "age": row.get("age", "")}

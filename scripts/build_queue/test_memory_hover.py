@@ -205,6 +205,20 @@ class MemoryHoverTests(unittest.TestCase):
         self.assertEqual([(cell.text) for cell in root[1].findall("dt")], ["CI"])
         self.assertEqual(field_values(root[1]), ["hana CI · runner-1"])
 
+    def test_a_running_row_hover_ends_the_memory_text_before_the_source_sentence(self) -> None:
+        for keep_text, queued, expected in (
+            ("need 11.3 GiB\nfull need: no matching anonymous profile", True,
+             "full need: no matching anonymous profile. The queue holds this memory for the run."),
+            ("Memory the compiler cache holds outside the build queue", False,
+             "Memory the compiler cache holds outside the build queue. Host free memory already accounts for this use."),
+            ("", False, "It reserves no memory. Host free memory already accounts for this use."),
+        ):
+            with self.subTest(keep_text=keep_text, queued=queued):
+                hover = cast(list[str], self.page_expression("tipText('row:0', data)", {"walk": [{
+                    "name": "fixture nextest", "unit": "fixture", "showrunner": "fixture-production", "used": 1,
+                    "reserved": 0, "counted": 1, "queued": queued, "keep_text": keep_text}]}))
+                self.assertTrue(hover[1].endswith(expected), hover[1])
+
     def test_cloud_hover_shows_the_progress_and_reservation(self) -> None:
         for status, counter, expected in (
             ("7 of 12 modules", progress.ProgressCounter("modules", 7, 12), "testing · 7 of 12 modules · 58.3% done"),

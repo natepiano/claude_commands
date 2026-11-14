@@ -1423,3 +1423,14 @@ From builds (not the user), 2026-11-13 23:46: align the colons in the who-ran-it
 - `test_memory_hover.field_values` reads value cells without the colon cells; the who-ran-it test checks one aria-hidden colon per label.
 - `memory_page_proof.mjs --identity` measures each colon's left edge. It captures `before-` and `after-colons-mac-row` and `-queued-row` shots, and requires one edge on the after page and on the showrunner row.
 - Checkpoint 1bd7b8067.
+
+### Phase 76 — The running-row hover closes its memory sentence · status: todo
+
+From builds (not the user), 2026-11-14 00:06: "running-row wait text: 'full need: no matching anonymous profile The queue holds this memory for the run.' A period is missing before 'The'. Find where those two strings join; fix it at that join for every case, with a test. Small phase, land alone."
+
+From builds (not the user), 2026-11-14 00:08: "keep_text is a data field; the page owns the sentence. Add the period always at the join, with no 'has no end mark' check. If any feed writer puts an end mark in keep_text, name it to me; do not handle both forms."
+
+1. `rawTipText` joins the row's memory text and the source sentence. At that join, the page always adds a period after `keep_text`. The use and reserve text (`res`) is page text and keeps its own periods.
+2. The feed's three keep_text descriptions that ended with a period lose it, so keep_text has one form.
+3. A hover test covers a feed keep_text, a feed description and the use and reserve text.
+4. Run every build_queue module before the checkpoint.

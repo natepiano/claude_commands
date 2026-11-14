@@ -604,7 +604,7 @@ function rawTipText(key, d) {
       return [`${r.name} · ${f1(r.used)} GiB`, `${how} ${r.detail ? r.detail + ". " : ""}By run: ${parts}.`];
     }
     const detail = !r.queued || r.between_steps ? visibleDetail(r) : "";
-    return [`${r.name}${detail ? " · " + detail : ""}`, `${when}${!recorded(r.used) ? res + " " : ""}${r.keep_text || res} ${src}${progressTip(r)}`];
+    return [`${r.name}${detail ? " · " + detail : ""}`, `${when}${!recorded(r.used) ? res + " " : ""}${r.keep_text ? r.keep_text + "." : res} ${src}${progressTip(r)}`];
   }
   if (kind === "wait") {
     const w = d.waiters[+i];
